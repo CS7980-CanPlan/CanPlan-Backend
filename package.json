@@ -1,0 +1,38 @@
+{
+  "name": "canplan-backend",
+  "version": "1.0.0",
+  "description": "CanPlan 2.0 backend — AWS CDK, Lambda, DynamoDB, AppSync",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "lint": "eslint 'src/**/*.ts' 'infrastructure/**/*.ts' 'scripts/**/*.ts'",
+    "format": "prettier --write 'src/**/*.ts' 'infrastructure/**/*.ts' 'scripts/**/*.ts'",
+    "cdk:synth": "cdk synth",
+    "cdk:deploy:dev": "cdk deploy --context env=dev",
+    "cdk:destroy:dev": "cdk destroy --context env=dev",
+    "cdk:deploy:sandbox": "cdk deploy --context env=sandbox",
+    "cdk:destroy:sandbox": "cdk destroy --context env=sandbox",
+    "cdk:deploy:prod": "cdk deploy --context env=prod"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.140",
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.19.42",
+    "@typescript-eslint/eslint-plugin": "^7.13.0",
+    "@typescript-eslint/parser": "^7.13.0",
+    "aws-cdk": "^2.147.0",
+    "aws-cdk-lib": "^2.147.0",
+    "constructs": "^10.3.0",
+    "esbuild": "^0.28.0",
+    "eslint": "^8.57.0",
+    "jest": "^29.7.0",
+    "prettier": "^3.3.2",
+    "ts-jest": "^29.1.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}
