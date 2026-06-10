@@ -27,6 +27,8 @@ canplan-backend/
 ├── .github/
 │   └── workflows/
 │       └── ci.yml              # Lint, test, build on every PR and push
+├── docs/
+│   └── API.md                  # Frontend API reference (operations, examples)
 ├── graphql/
 │   └── schema.graphql          # AppSync GraphQL schema
 ├── infrastructure/
@@ -118,6 +120,16 @@ This project authenticates via **AWS SSO** — no long-lived IAM user keys.
    aws sso login --profile canplan-sandbox
    export AWS_PROFILE=canplan-sandbox
    ```
+
+   > 💡 **Set `AWS_PROFILE` once instead of passing `--profile` every time.**
+   > CDK and the AWS CLI don't remember a profile between commands, so without
+   > this they fall back to the `default` profile and you'd have to append
+   > `--profile canplan-sandbox` to every `cdk` / `aws` call. The `export` above
+   > sets it for the **whole terminal session**, so subsequent commands need no
+   > flag. It only lasts for that terminal — to make it permanent, add
+   > `export AWS_PROFILE=canplan-sandbox` to your `~/.zshrc`, or use
+   > [direnv](https://direnv.net/) with a project-local `.envrc` so it activates
+   > automatically in this repo.
 
 2. **Verify you're authenticated against the right account:**
    ```bash
@@ -231,7 +243,8 @@ your machine — see [Deploying to an AWS Sandbox](#deploying-to-an-aws-sandbox)
 - DynamoDB table `CanPlanTasks-<env>` with pay-per-request billing
 - S3 bucket for future media storage
 - `createTask` Lambda with input validation
-- AppSync GraphQL API with a `createTask` mutation and `healthCheck` query
+- `askAi` Lambda calling a Claude model on Amazon Bedrock via the Converse API (currently Claude 3 Haiku — configurable via `BEDROCK_MODEL_ID`)
+- AppSync GraphQL API with `createTask` + `askAi` mutations and a `healthCheck` query
 - CloudWatch log retention (7 days)
 - Jest unit tests with DynamoDB mocked
 - ESLint + Prettier configuration

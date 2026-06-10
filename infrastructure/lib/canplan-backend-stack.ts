@@ -1,6 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
 import * as appsync from 'aws-cdk-lib/aws-appsync';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
@@ -65,6 +66,45 @@ export class CanPlanBackendStack extends cdk.Stack {
     // Least-privilege: Lambda can only put items — not read or delete
     tasksTable.grantWriteData(createTaskFn);
 
+    // ── Lambda — askAi (Amazon Bedrock) ───────────────────────────────────────
+    // Default is Claude 3 Haiku. The org SCP (p-nnv8kbbh) on this account denies
+    // bedrock:InvokeModel for newer models (Sonnet 4.6 / inference profiles) but
+    // allows Haiku 3 on-demand in ca-central-1. Override once the SCP is widened:
+    //   --context bedrockModelId=global.anthropic.claude-sonnet-4-6
+    // (or set the BEDROCK_MODEL_ID env var on the function).
+    const bedrockModelId =
+      this.node.tryGetContext('bedrockModelId') ?? 'anthropic.claude-3-haiku-20240307-v1:0';
+
+    const askAiFn = new NodejsFunction(this, 'AskAiFunction', {
+      functionName: `canplan-askAi-${envName}`,
+      entry: path.join(__dirname, '../../src/lambdas/askAi/handler.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      environment: {
+        BEDROCK_MODEL_ID: bedrockModelId,
+        BEDROCK_MAX_TOKENS: '1024',
+        AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
+      },
+      logRetention: logs.RetentionDays.ONE_WEEK,
+      // AppSync waits at most 30s for a Lambda resolver — stay just under it.
+      timeout: cdk.Duration.seconds(29),
+      memorySize: 256,
+    });
+
+    // Invoke any Anthropic foundation model or inference profile in this account.
+    // Broad enough that changing BEDROCK_MODEL_ID needs no IAM change; the org
+    // SCP is the real guardrail on which models are actually allowed. The Lambda
+    // authenticates to Bedrock with this execution role — no API key needed.
+    askAiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['bedrock:InvokeModel'],
+        resources: [
+          'arn:aws:bedrock:*::foundation-model/anthropic.*',
+          `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
+        ],
+      }),
+    );
+
     // ── AppSync GraphQL API ───────────────────────────────────────────────────
     const api = new appsync.GraphqlApi(this, 'CanPlanApi', {
       name: `canplan-api-${envName}`,
@@ -93,6 +133,14 @@ export class CanPlanBackendStack extends cdk.Stack {
       fieldName: 'createTask',
     });
 
+    // Wire askAi mutation → Bedrock Lambda data source
+    const askAiDs = api.addLambdaDataSource('AskAiDataSource', askAiFn);
+
+    askAiDs.createResolver('AskAiResolver', {
+      typeName: 'Mutation',
+      fieldName: 'askAi',
+    });
+
     // healthCheck query — returns a static string, no data source needed
     const noneDs = api.addNoneDataSource('NoneDataSource');
     noneDs.createResolver('HealthCheckResolver', {
@@ -106,5 +154,6 @@ export class CanPlanBackendStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'GraphQLApiUrl', { value: api.graphqlUrl });
     new cdk.CfnOutput(this, 'GraphQLApiKey', { value: api.apiKey ?? '' });
     new cdk.CfnOutput(this, 'TasksTableName', { value: tasksTable.tableName });
+    new cdk.CfnOutput(this, 'BedrockModelId', { value: bedrockModelId });
   }
 }
