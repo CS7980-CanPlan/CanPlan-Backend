@@ -35,24 +35,35 @@ canplan-backend/
 │   ├── bin/
 │   │   └── app.ts              # CDK entry point
 │   └── lib/
-│       └── canplan-backend-stack.ts   # All AWS resources defined here
+│       ├── canplan-backend-stack.ts   # Composition: wires constructs + outputs
+│       └── constructs/
+│           ├── database.construct.ts  # DynamoDB table
+│           ├── storage.construct.ts   # S3 media bucket
+│           ├── functions.construct.ts # Lambda functions + IAM
+│           ├── api.construct.ts       # AppSync GraphQL API + resolvers
+│           └── ai.construct.ts        # Bedrock model config
 ├── scripts/
 │   └── seed-dev.ts             # Seed sample tasks into DynamoDB
 ├── src/
 │   ├── lambdas/
-│   │   └── createTask/
-│   │       ├── handler.ts      # Lambda function logic
+│   │   ├── createTask/
+│   │   │   ├── handler.ts      # Lambda function logic
+│   │   │   └── handler.test.ts # Unit tests
+│   │   └── askAi/
+│   │       ├── handler.ts      # Bedrock (Converse) Lambda logic
 │   │       └── handler.test.ts # Unit tests
 │   └── shared/
 │       ├── dynamodb.ts         # Shared DynamoDB client
+│       ├── bedrock.ts          # Shared Bedrock client + model config
 │       ├── response.ts         # Shared error types
 │       └── types.ts            # Shared TypeScript types
 ├── .env.example
 ├── cdk.json
 ├── jest.config.js
 ├── package.json
-├── tsconfig.json
-└── tsconfig.test.json     # Test-only TS config (adds jest types)
+├── tsconfig.json              # Editor/type-check config (includes tests)
+├── tsconfig.build.json        # Build config (emits, excludes tests)
+└── tsconfig.test.json         # ts-jest config (adds jest types)
 ```
 
 ---
