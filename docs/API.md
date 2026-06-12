@@ -164,9 +164,10 @@ mutation CreateTask($input: CreateTaskInput!) {
 ### `askAi` — mutation
 
 Sends user text to a **Claude model on Amazon Bedrock** and returns the model's
-reply as a single string, plus token usage. The model is configurable
-(`BEDROCK_MODEL_ID`); it's currently **Claude 3 Haiku** because the AWS org policy
-on this account only permits that model — see the note below. This is a
+reply as a single string, plus token usage. The default model is **Claude Sonnet
+4.6** via the US cross-region inference profile (`us.anthropic.claude-sonnet-4-6`),
+configurable through `BEDROCK_MODEL_ID`. Inference runs in **`us-east-1`** (set via
+`BEDROCK_REGION`) while the rest of the backend stays in `ca-central-1`. This is a
 synchronous, non-streaming call — the whole response comes back in one shot.
 
 > **Latency:** model calls typically take a few seconds. The backend caps the wait
@@ -185,7 +186,7 @@ synchronous, non-streaming call — the whole response comes back in one shot.
 | Field | Type | Notes |
 |---|---|---|
 | `text` | `String!` | The model's reply |
-| `model` | `String!` | Bedrock model/inference-profile id used (e.g. `anthropic.claude-3-haiku-20240307-v1:0`) |
+| `model` | `String!` | Bedrock model/inference-profile id used (e.g. `us.anthropic.claude-sonnet-4-6`) |
 | `inputTokens` | `Int` | Prompt tokens consumed (may be `null`) |
 | `outputTokens` | `Int` | Generated tokens (may be `null`) |
 
@@ -215,7 +216,7 @@ mutation AskAi($input: AskAiInput!) {
   "data": {
     "askAi": {
       "text": "CanPlan is a cloud-based task management app that helps you capture, organize, and track your to-dos.",
-      "model": "anthropic.claude-3-haiku-20240307-v1:0",
+      "model": "us.anthropic.claude-sonnet-4-6",
       "inputTokens": 14,
       "outputTokens": 27
     }
@@ -223,11 +224,12 @@ mutation AskAi($input: AskAiInput!) {
 }
 ```
 
-> **Model note:** the deployed account's AWS organization SCP currently permits
-> only Claude 3 Haiku for Bedrock; newer models (Sonnet 4.6 etc.) are denied at
-> the org level. The backend defaults to Haiku so the endpoint works today.
-> Switching to a stronger model is a one-line config change (`BEDROCK_MODEL_ID`)
-> once the org policy is widened — no API contract change.
+> **Model note:** the backend calls Bedrock in `us-east-1` using the US inference
+> profile `us.anthropic.claude-sonnet-4-6`. The deployed account's AWS organization
+> SCP has historically denied newer Claude models / inference profiles — if calls
+> fail with an access-denied error, the SCP must be widened to allow this profile
+> and its underlying foundation model. The model and region are config-only
+> (`BEDROCK_MODEL_ID` / `BEDROCK_REGION`) — no API contract change.
 
 **Errors** — a blank prompt returns:
 

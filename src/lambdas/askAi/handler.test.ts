@@ -4,7 +4,7 @@ import { bedrock } from '../../shared/bedrock';
 // Mock the Bedrock client so tests never hit AWS.
 jest.mock('../../shared/bedrock', () => ({
   bedrock: { send: jest.fn() },
-  BEDROCK_MODEL_ID: 'anthropic.claude-3-haiku-20240307-v1:0',
+  BEDROCK_MODEL_ID: 'us.anthropic.claude-sonnet-4-6',
   BEDROCK_MAX_TOKENS: 1024,
 }));
 
@@ -35,7 +35,7 @@ describe('askAi handler', () => {
     const result = await handler(makeEvent({ prompt: 'Say hi' }));
 
     expect(result.text).toBe('Hello there!');
-    expect(result.model).toBe('anthropic.claude-3-haiku-20240307-v1:0');
+    expect(result.model).toBe('us.anthropic.claude-sonnet-4-6');
     expect(result.inputTokens).toBe(10);
     expect(result.outputTokens).toBe(5);
     expect(mockSend).toHaveBeenCalledTimes(1);

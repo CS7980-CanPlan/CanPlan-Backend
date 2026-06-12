@@ -38,11 +38,12 @@ export class CanPlanBackendStack extends cdk.Stack {
     // AI config (Bedrock model selection)
     const ai = new Ai(this, 'Ai');
 
-    // Compute — Lambdas depend on the table and the resolved Bedrock model id
+    // Compute — Lambdas depend on the table and the resolved Bedrock config
     const functions = new Functions(this, 'Functions', {
       envName,
       tasksTable: database.tasksTable,
       bedrockModelId: ai.bedrockModelId,
+      bedrockRegion: ai.bedrockRegion,
     });
 
     // GraphQL API — resolvers depend on the Lambdas; Cognito is the primary authorizer
@@ -62,5 +63,6 @@ export class CanPlanBackendStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'AwsRegion', { value: this.region });
     new cdk.CfnOutput(this, 'TasksTableName', { value: database.tasksTable.tableName });
     new cdk.CfnOutput(this, 'BedrockModelId', { value: ai.bedrockModelId });
+    new cdk.CfnOutput(this, 'BedrockRegion', { value: ai.bedrockRegion });
   }
 }

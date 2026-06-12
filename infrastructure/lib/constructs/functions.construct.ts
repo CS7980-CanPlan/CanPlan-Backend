@@ -13,6 +13,8 @@ export interface FunctionsProps {
   readonly tasksTable: dynamodb.ITable;
   /** Bedrock model id passed to the askAi Lambda. */
   readonly bedrockModelId: string;
+  /** Region the askAi Lambda calls Bedrock Runtime in (e.g. us-east-1). */
+  readonly bedrockRegion: string;
 }
 
 /** Lambda functions backing the GraphQL resolvers. */
@@ -23,7 +25,7 @@ export class Functions extends Construct {
   constructor(scope: Construct, id: string, props: FunctionsProps) {
     super(scope, id);
 
-    const { envName, tasksTable, bedrockModelId } = props;
+    const { envName, tasksTable, bedrockModelId, bedrockRegion } = props;
 
     // ── createTask ────────────────────────────────────────────────────────────
     this.createTaskFn = new NodejsFunction(this, 'CreateTaskFunction', {
@@ -49,6 +51,10 @@ export class Functions extends Construct {
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_20_X,
       environment: {
+        // Bedrock runs in its own region (us-east-1) — the rest of the backend
+        // stays in ca-central-1. The Bedrock client keys off BEDROCK_REGION, not
+        // the Lambda's AWS_REGION, so inference is routed to the US profile.
+        BEDROCK_REGION: bedrockRegion,
         BEDROCK_MODEL_ID: bedrockModelId,
         BEDROCK_MAX_TOKENS: '1024',
         AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
@@ -59,14 +65,22 @@ export class Functions extends Construct {
       memorySize: 256,
     });
 
-    // Invoke any Anthropic foundation model or inference profile in this account.
-    // The Lambda authenticates to Bedrock with this execution role — no API key.
+    // Invoke Claude via Bedrock (Converse + raw Invoke, sync + streaming). The
+    // Lambda authenticates to Bedrock with this execution role — no API key.
+    // A cross-region inference profile needs permission on BOTH the profile and
+    // the underlying foundation models in every region it can route to, so the
+    // resources span all regions (`*`) for Anthropic models + account profiles.
     this.askAiFn.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ['bedrock:InvokeModel'],
+        actions: [
+          'bedrock:InvokeModel',
+          'bedrock:InvokeModelWithResponseStream',
+          'bedrock:Converse',
+          'bedrock:ConverseStream',
+        ],
         resources: [
-          'arn:aws:bedrock:*::foundation-model/anthropic.*',
           `arn:aws:bedrock:*:${cdk.Stack.of(this).account}:inference-profile/*`,
+          'arn:aws:bedrock:*::foundation-model/anthropic.*',
         ],
       }),
     );

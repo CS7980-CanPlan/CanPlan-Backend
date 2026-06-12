@@ -294,7 +294,7 @@ your machine — see [Deploying to an AWS Sandbox](#deploying-to-an-aws-sandbox)
 - DynamoDB table `CanPlanTasks-<env>` with pay-per-request billing
 - S3 bucket for future media storage
 - `createTask` Lambda with input validation
-- `askAi` Lambda calling a Claude model on Amazon Bedrock via the Converse API (currently Claude 3 Haiku — configurable via `BEDROCK_MODEL_ID`)
+- `askAi` Lambda calling Claude Sonnet 4.6 on Amazon Bedrock via the Converse API — inference runs in `us-east-1` (the US inference profile `us.anthropic.claude-sonnet-4-6`) while the rest of the stack stays in `ca-central-1`; region/model are configurable via `BEDROCK_REGION` / `BEDROCK_MODEL_ID`
 - AppSync GraphQL API with `createTask` + `askAi` mutations and a `healthCheck` query
 - Amazon Cognito User Pool (email sign-in, self sign-up, email verification, password reset) authorizing the API, with `PrimaryUser` / `SupportPerson` / `OrganizationAdmin` / `SystemAdmin` role groups — see [Authentication setup](#authentication-setup)
 - CloudWatch log retention (7 days)
