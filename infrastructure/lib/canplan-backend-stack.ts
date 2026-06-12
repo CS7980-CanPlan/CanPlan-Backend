@@ -2,6 +2,7 @@ import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import { Ai } from './constructs/ai.construct';
 import { Api } from './constructs/api.construct';
+import { Auth } from './constructs/auth.construct';
 import { Database } from './constructs/database.construct';
 import { Functions } from './constructs/functions.construct';
 import { Storage } from './constructs/storage.construct';
@@ -31,6 +32,9 @@ export class CanPlanBackendStack extends cdk.Stack {
     const database = new Database(this, 'Database', { envName, isSandbox });
     new Storage(this, 'Storage', { envName, isSandbox });
 
+    // Authentication — Cognito user pool, client, and role groups
+    const auth = new Auth(this, 'Auth', { envName, isSandbox });
+
     // AI config (Bedrock model selection)
     const ai = new Ai(this, 'Ai');
 
@@ -41,9 +45,10 @@ export class CanPlanBackendStack extends cdk.Stack {
       bedrockModelId: ai.bedrockModelId,
     });
 
-    // GraphQL API — resolvers depend on the Lambdas
+    // GraphQL API — resolvers depend on the Lambdas; Cognito is the primary authorizer
     const api = new Api(this, 'Api', {
       envName,
+      userPool: auth.userPool,
       createTaskFn: functions.createTaskFn,
       askAiFn: functions.askAiFn,
     });
@@ -51,6 +56,10 @@ export class CanPlanBackendStack extends cdk.Stack {
     // ── Outputs ───────────────────────────────────────────────────────────────
     new cdk.CfnOutput(this, 'GraphQLApiUrl', { value: api.graphqlUrl });
     new cdk.CfnOutput(this, 'GraphQLApiKey', { value: api.apiKey });
+    // Cognito values the frontend needs — see README "Authentication setup".
+    new cdk.CfnOutput(this, 'UserPoolId', { value: auth.userPool.userPoolId });
+    new cdk.CfnOutput(this, 'UserPoolClientId', { value: auth.userPoolClient.userPoolClientId });
+    new cdk.CfnOutput(this, 'AwsRegion', { value: this.region });
     new cdk.CfnOutput(this, 'TasksTableName', { value: database.tasksTable.tableName });
     new cdk.CfnOutput(this, 'BedrockModelId', { value: ai.bedrockModelId });
   }
