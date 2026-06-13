@@ -6,17 +6,17 @@ Cloud backend for CanPlan 2.0, a task management app. This starter repo wires to
 
 ## Tech Stack
 
-| Layer | Service |
-|---|---|
-| Infrastructure as Code | AWS CDK (TypeScript) |
-| API | AWS AppSync (GraphQL) |
-| Compute | AWS Lambda (Node.js 20) |
-| Database | Amazon DynamoDB |
-| File Storage | Amazon S3 (provisioned, ready for media) |
-| Observability | Amazon CloudWatch Logs |
-| CI/CD | GitHub Actions |
-| Testing | Jest + ts-jest |
-| Code Quality | ESLint + Prettier |
+| Layer                  | Service                                  |
+| ---------------------- | ---------------------------------------- |
+| Infrastructure as Code | AWS CDK (TypeScript)                     |
+| API                    | AWS AppSync (GraphQL)                    |
+| Compute                | AWS Lambda (Node.js 20)                  |
+| Database               | Amazon DynamoDB                          |
+| File Storage           | Amazon S3 (provisioned, ready for media) |
+| Observability          | Amazon CloudWatch Logs                   |
+| CI/CD                  | GitHub Actions                           |
+| Testing                | Jest + ts-jest                           |
+| Code Quality           | ESLint + Prettier                        |
 
 ---
 
@@ -39,6 +39,7 @@ canplan-backend/
 │       └── constructs/
 │           ├── database.construct.ts  # DynamoDB table
 │           ├── storage.construct.ts   # S3 media bucket
+│           ├── auth.construct.ts      # Cognito User Pool, client, role groups
 │           ├── functions.construct.ts # Lambda functions + IAM
 │           ├── api.construct.ts       # AppSync GraphQL API + resolvers
 │           └── ai.construct.ts        # Bedrock model config
@@ -71,6 +72,7 @@ canplan-backend/
 ## Local Setup
 
 **Prerequisites**
+
 - Node.js 20+
 - AWS CLI v2, authenticated via SSO (see [Deploying to an AWS Sandbox](#deploying-to-an-aws-sandbox))
 - No global CDK install needed — `aws-cdk` is a dev dependency, so the `npm run cdk:*` scripts use the local version
@@ -127,6 +129,7 @@ npm run cdk:destroy:sandbox
 This project authenticates via **AWS SSO** — no long-lived IAM user keys.
 
 1. **Log in to the account** (profile name comes from your AWS SSO config):
+
    ```bash
    aws sso login --profile canplan-sandbox
    export AWS_PROFILE=canplan-sandbox
@@ -143,22 +146,26 @@ This project authenticates via **AWS SSO** — no long-lived IAM user keys.
    > automatically in this repo.
 
 2. **Verify you're authenticated against the right account:**
+
    ```bash
    aws sts get-caller-identity
    ```
 
 3. **Bootstrap CDK** — one-time per account + region:
+
    ```bash
    npx cdk bootstrap
    ```
 
 4. **Deploy** — see [Deploying to an AWS Sandbox](#deploying-to-an-aws-sandbox) below
    for the full env breakdown:
+
    ```bash
    npm run cdk:deploy:sandbox
    ```
 
-   CDK will print the AppSync API URL and API key after a successful deploy.
+   CDK will print the AppSync API URL, API key, and the Cognito values after a
+   successful deploy — see [Authentication setup](#authentication-setup).
 
 ---
 
@@ -177,15 +184,17 @@ Sandbox mode is passed into the stack as `isSandbox`, which controls the removal
 policies in
 [infrastructure/lib/canplan-backend-stack.ts](infrastructure/lib/canplan-backend-stack.ts):
 
-| Resource | Sandbox (`env=sandbox`) | dev / prod |
-|---|---|---|
-| DynamoDB `CanPlanTasks-<env>` table | `DESTROY` — deleted with the stack | `RETAIN` — survives teardown |
-| S3 media bucket | `DESTROY` + auto-empty on teardown | `RETAIN` |
-| Lambda / AppSync / log groups | Deleted with the stack | Deleted with the stack |
+| Resource                            | Sandbox (`env=sandbox`)            | dev / prod                     |
+| ----------------------------------- | ---------------------------------- | ------------------------------ |
+| DynamoDB `CanPlanTasks-<env>` table | `DESTROY` — deleted with the stack | `RETAIN` — survives teardown   |
+| S3 media bucket                     | `DESTROY` + auto-empty on teardown | `RETAIN`                       |
+| Cognito `CanPlan-<env>-UserPool`    | `DESTROY` — deleted with the stack | `RETAIN` — keeps user accounts |
+| Lambda / AppSync / log groups       | Deleted with the stack             | Deleted with the stack         |
 
 > ⚠️ Only `env=sandbox` tears down its data. **`dev` and `prod` both RETAIN** the
-> DynamoDB table and S3 bucket — a `cdk destroy` there leaves those resources
-> behind (and they'll block a redeploy on the same name until removed manually).
+> DynamoDB table, S3 bucket, and Cognito User Pool — a `cdk destroy` there leaves
+> those resources behind (and they'll block a redeploy on the same name until
+> removed manually).
 
 ### Deploy
 
@@ -222,8 +231,39 @@ account — you can immediately redeploy without name conflicts.
   retry.
 - **Multiple environments coexist.** Every resource is namespaced by `env`
   (`CanPlanTasks-<env>`, `canplan-createTask-<env>`, `canplan-api-<env>`,
-  `canplan-media-<env>-…`), so `sandbox`, `dev`, and `prod` can all be deployed
-  into the same account at once without name collisions.
+  `canplan-media-<env>-…`, `CanPlan-<env>-UserPool`), so `sandbox`, `dev`, and
+  `prod` can all be deployed into the same account at once without name collisions.
+
+---
+
+## Authentication setup
+
+The API is authorized by an **Amazon Cognito User Pool** (the API key is kept only
+as a secondary mode for the unauthenticated `healthCheck` query). Frontend clients
+authenticate a user against the pool, then send the user's JWT in the
+`Authorization` header on every GraphQL request.
+
+After a deploy, CDK prints the values the mobile app and web portal need to
+configure their Cognito/AppSync client:
+
+| CDK output         | What it is                       | Frontend uses it for                                            |
+| ------------------ | -------------------------------- | --------------------------------------------------------------- |
+| `UserPoolId`       | Cognito User Pool ID             | Initializing the auth client (sign-up, sign-in, password reset) |
+| `UserPoolClientId` | App client ID (no client secret) | The public client the app authenticates through                 |
+| `AwsRegion`        | Region the pool lives in         | Required to construct the Cognito endpoint                      |
+| `GraphQLApiUrl`    | AppSync GraphQL endpoint         | Where queries/mutations are sent                                |
+
+```bash
+# Re-print the outputs for an already-deployed stack:
+aws cloudformation describe-stacks \
+  --stack-name canplan-backend-sandbox \
+  --query 'Stacks[0].Outputs' --output table
+```
+
+The pool is configured for **email-based sign-in** with **self sign-up**, **email
+verification**, and **password reset by email**. Four role groups are seeded —
+`PrimaryUser`, `SupportPerson`, `OrganizationAdmin`, and `SystemAdmin` — for
+future group-based authorization (not yet enforced on resolvers).
 
 ---
 
@@ -231,8 +271,8 @@ account — you can immediately redeploy without name conflicts.
 
 One workflow is included:
 
-| Workflow | Trigger | Purpose |
-|---|---|---|
+| Workflow | Trigger             | Purpose             |
+| -------- | ------------------- | ------------------- |
 | `ci.yml` | Push / PR to `main` | Lint → Test → Build |
 
 CI runs lint, tests, and a TypeScript build check — it does **not** touch AWS, so
@@ -254,8 +294,9 @@ your machine — see [Deploying to an AWS Sandbox](#deploying-to-an-aws-sandbox)
 - DynamoDB table `CanPlanTasks-<env>` with pay-per-request billing
 - S3 bucket for future media storage
 - `createTask` Lambda with input validation
-- `askAi` Lambda calling a Claude model on Amazon Bedrock via the Converse API (currently Claude 3 Haiku — configurable via `BEDROCK_MODEL_ID`)
+- `askAi` Lambda calling Claude Sonnet 4.6 on Amazon Bedrock via the Converse API — inference runs in `us-east-1` (the US inference profile `us.anthropic.claude-sonnet-4-6`) while the rest of the stack stays in `ca-central-1`; region/model are configurable via `BEDROCK_REGION` / `BEDROCK_MODEL_ID`
 - AppSync GraphQL API with `createTask` + `askAi` mutations and a `healthCheck` query
+- Amazon Cognito User Pool (email sign-in, self sign-up, email verification, password reset) authorizing the API, with `PrimaryUser` / `SupportPerson` / `OrganizationAdmin` / `SystemAdmin` role groups — see [Authentication setup](#authentication-setup)
 - CloudWatch log retention (7 days)
 - Jest unit tests with DynamoDB mocked
 - ESLint + Prettier configuration
@@ -264,7 +305,7 @@ your machine — see [Deploying to an AWS Sandbox](#deploying-to-an-aws-sandbox)
 
 ## What Is Not Included Yet
 
-- **Authentication** — AppSync currently uses an API key. Cognito user pool auth is the planned next step.
+- **Group-based authorization** — Cognito User Pool auth and role groups exist, but resolvers do not yet enforce per-group permissions or detailed `@auth` rules.
 - **Read queries** — `getTask` and `listTasks` resolvers are not built yet.
 - **Offline sync** — planned for a future milestone.
 - **PDF reports** — planned for a future milestone.

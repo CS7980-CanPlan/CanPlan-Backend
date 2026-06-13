@@ -1,11 +1,14 @@
 import * as cdk from 'aws-cdk-lib';
 import * as appsync from 'aws-cdk-lib/aws-appsync';
+import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import { Construct } from 'constructs';
 import * as path from 'path';
 
 export interface ApiProps {
   readonly envName: string;
+  /** Cognito User Pool used as the API's primary authorizer. */
+  readonly userPool: cognito.IUserPool;
   readonly createTaskFn: lambda.IFunction;
   readonly askAiFn: lambda.IFunction;
 }
@@ -18,20 +21,28 @@ export class Api extends Construct {
   constructor(scope: Construct, id: string, props: ApiProps) {
     super(scope, id);
 
-    const { envName, createTaskFn, askAiFn } = props;
+    const { envName, userPool, createTaskFn, askAiFn } = props;
 
     const api = new appsync.GraphqlApi(this, 'CanPlanApi', {
       name: `canplan-api-${envName}`,
       schema: appsync.SchemaFile.fromAsset(path.join(__dirname, '../../../graphql/schema.graphql')),
       authorizationConfig: {
+        // Cognito User Pool is the primary authorizer — frontend clients send a
+        // user's JWT in the Authorization header.
         defaultAuthorization: {
-          // Using API key for the proof-of-concept.
-          // TODO: Replace with Cognito user pool auth before launch.
-          authorizationType: appsync.AuthorizationType.API_KEY,
-          apiKeyConfig: {
-            expires: cdk.Expiration.after(cdk.Duration.days(365)),
-          },
+          authorizationType: appsync.AuthorizationType.USER_POOL,
+          userPoolConfig: { userPool },
         },
+        // API key is kept as a secondary mode for the unauthenticated
+        // healthCheck query and proof-of-concept tooling.
+        additionalAuthorizationModes: [
+          {
+            authorizationType: appsync.AuthorizationType.API_KEY,
+            apiKeyConfig: {
+              expires: cdk.Expiration.after(cdk.Duration.days(365)),
+            },
+          },
+        ],
       },
       logConfig: {
         fieldLogLevel: appsync.FieldLogLevel.ERROR,
