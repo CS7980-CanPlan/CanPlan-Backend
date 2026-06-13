@@ -6,3 +6,6 @@ cdk.out/
 .env
 .DS_Store
 coverage/
+
+# Local-only design docs (specs/plans) — personal reference, never pushed to the shared repo
+docs/superpowers/
