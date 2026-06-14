@@ -31,31 +31,42 @@ canplan-backend/
 │   └── API.md                  # Frontend API reference (operations, examples)
 ├── graphql/
 │   └── schema.graphql          # AppSync GraphQL schema
+├── data/
+│   └── corpus/
+│       └── seed.jsonl          # 80-passage HealthLink BC corpus (KB source)
 ├── infrastructure/
 │   ├── bin/
 │   │   └── app.ts              # CDK entry point
 │   └── lib/
-│       ├── canplan-backend-stack.ts   # Composition: wires constructs + outputs
+│       ├── canplan-backend-stack.ts   # Backend stack (ca-central-1): wires constructs + outputs
+│       ├── knowledge-base-stack.ts    # KB stack (us-east-1): cross-region Bedrock KB
 │       └── constructs/
 │           ├── database.construct.ts  # DynamoDB table
 │           ├── storage.construct.ts   # S3 media bucket
 │           ├── auth.construct.ts      # Cognito User Pool, client, role groups
 │           ├── functions.construct.ts # Lambda functions + IAM
 │           ├── api.construct.ts       # AppSync GraphQL API + resolvers
-│           └── ai.construct.ts        # Bedrock model config
+│           ├── ai.construct.ts        # Bedrock model config
+│           └── knowledge-base.construct.ts # S3 Vectors KB + titan-embed-text-v2
 ├── scripts/
-│   └── seed-dev.ts             # Seed sample tasks into DynamoDB
+│   ├── seed-dev.ts             # Seed sample tasks into DynamoDB
+│   └── build-corpus.ts         # seed.jsonl → per-passage S3 corpus files
 ├── src/
 │   ├── lambdas/
 │   │   ├── createTask/
 │   │   │   ├── handler.ts      # Lambda function logic
 │   │   │   └── handler.test.ts # Unit tests
-│   │   └── askAi/
-│   │       ├── handler.ts      # Bedrock (Converse) Lambda logic
+│   │   ├── askAi/
+│   │   │   ├── handler.ts      # Bedrock (Converse) Lambda logic
+│   │   │   └── handler.test.ts # Unit tests
+│   │   └── generateTaskSteps/
+│   │       ├── handler.ts      # KB Retrieve → Converse → cited steps
 │   │       └── handler.test.ts # Unit tests
 │   └── shared/
 │       ├── dynamodb.ts         # Shared DynamoDB client
 │       ├── bedrock.ts          # Shared Bedrock client + model config
+│       ├── kb.ts               # Shared Bedrock KB (agent-runtime) client
+│       ├── steps.ts            # Prompt build / parse / citation resolve
 │       ├── response.ts         # Shared error types
 │       └── types.ts            # Shared TypeScript types
 ├── .env.example
@@ -151,10 +162,12 @@ This project authenticates via **AWS SSO** — no long-lived IAM user keys.
    aws sts get-caller-identity
    ```
 
-3. **Bootstrap CDK** — one-time per account + region:
+3. **Bootstrap CDK** — one-time per account, in **both** regions the app deploys
+   to: the backend stack in `ca-central-1` and the Knowledge Base stack in
+   `us-east-1` (see [Step generation](#step-generation-with-a-bedrock-knowledge-base)):
 
    ```bash
-   npx cdk bootstrap
+   npx cdk bootstrap aws://<account-id>/ca-central-1 aws://<account-id>/us-east-1
    ```
 
 4. **Deploy** — see [Deploying to an AWS Sandbox](#deploying-to-an-aws-sandbox) below
@@ -203,12 +216,12 @@ policies in
 aws sso login --profile canplan-sandbox
 export AWS_PROFILE=canplan-sandbox
 
-# 2. Region is ca-central-1 (set in .env / .env.example)
+# 2. Backend region is ca-central-1; the Knowledge Base stack is in us-east-1
 
-# 3. Bootstrap once per account + region
-npx cdk bootstrap
+# 3. Bootstrap once per account — both regions
+npx cdk bootstrap aws://<account-id>/ca-central-1 aws://<account-id>/us-east-1
 
-# 4. Deploy the sandbox stack
+# 4. Deploy the sandbox stacks (backend + Knowledge Base; the npm script passes --all)
 npm run cdk:deploy:sandbox
 ```
 
@@ -267,6 +280,108 @@ future group-based authorization (not yet enforced on resolvers).
 
 ---
 
+## Step generation with a Bedrock Knowledge Base
+
+`generateTaskSteps` is a Cognito-authorized GraphQL mutation that breaks a
+daily-living task (e.g. "wash my hands") into an ordered list of simple,
+source-cited steps. It uses retrieval-augmented generation (RAG): a Bedrock
+Knowledge Base retrieves the most relevant passages from an 80-passage HealthLink
+BC corpus, and Claude Sonnet 4.6 (via the Converse API) turns them into steps —
+each step citing the corpus chunk(s) it came from.
+
+### Two-region layout
+
+As with `askAi`, all Bedrock calls run in `us-east-1` while the rest of the
+backend stays in `ca-central-1`. But a Knowledge Base is a *deployed* resource
+(not just a runtime API call), and one CDK stack deploys to one region — so the KB
+lives in its own stack pinned to `us-east-1`:
+
+| Stack | Region | Contents |
+| ----- | ------ | -------- |
+| `canplan-knowledge-base-<env>` | `us-east-1` | S3 corpus bucket, S3 Vectors store, Bedrock KB (titan-embed-text-v2), corpus data source |
+| `canplan-backend-<env>` | `ca-central-1` | DynamoDB, AppSync, Cognito, Lambdas (incl. `generateTaskSteps`) |
+
+The backend stack consumes the KB id from the KB stack via CDK cross-region
+references (`crossRegionReferences: true`), so a single `npm run cdk:deploy:sandbox`
+deploys both — the `cdk:deploy:*` npm scripts pass `--all`.
+
+### 1. Build the corpus
+
+The KB is fed from per-passage files generated from `data/corpus/seed.jsonl`.
+Each passage becomes a body file plus a sibling `.metadata.json`. Chunking is set
+to `NONE`, so one file = one chunk = one `chunk_id`, preserving a 1:1
+passage↔citation mapping:
+
+```bash
+npx ts-node scripts/build-corpus.ts
+# wrote 160 files for 80 passages → data/corpus/dist/
+```
+
+`data/corpus/dist/` is gitignored; the CDK `BucketDeployment` uploads it at deploy
+time, so build it before deploying.
+
+### 2. Deploy
+
+```bash
+aws sso login --profile canplan-sandbox
+export AWS_PROFILE=canplan-sandbox
+npm run cdk:deploy:sandbox      # deploys both the KB and backend stacks
+```
+
+The KB stack prints `KnowledgeBaseId`; the backend stack prints `GraphQLApiUrl`
+and the Cognito values.
+
+### 3. Trigger ingestion
+
+A data source must be ingested before retrieval returns anything. Look up the KB
+id and its data source id, then start the job (all in `us-east-1`):
+
+```bash
+KB_ID=$(aws cloudformation describe-stacks \
+  --stack-name canplan-knowledge-base-sandbox --region us-east-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='KnowledgeBaseId'].OutputValue" --output text)
+
+DS_ID=$(aws bedrock-agent list-data-sources \
+  --knowledge-base-id "$KB_ID" --region us-east-1 \
+  --query 'dataSourceSummaries[0].dataSourceId' --output text)
+
+aws bedrock-agent start-ingestion-job \
+  --knowledge-base-id "$KB_ID" --data-source-id "$DS_ID" --region us-east-1
+```
+
+Re-run ingestion whenever the corpus changes.
+
+### 4. Call the mutation
+
+With a signed-in Cognito user's JWT (or the AppSync console's "Run a query"):
+
+```graphql
+mutation {
+  generateTaskSteps(input: { userId: "test-user", query: "wash my hands" }) {
+    steps { text citations { chunkId title url snippet } }
+    model
+    inputTokens
+    outputTokens
+  }
+}
+```
+
+### Retrieval settings
+
+These are set as environment variables on the `generateTaskSteps` Lambda:
+
+| Env var | Default | Meaning |
+| ------- | ------- | ------- |
+| `RETRIEVAL_TOP_K` | `4` | Passages retrieved per query. Retrieval is **unscoped** — the whole corpus, no category filter. |
+| `BEDROCK_MAX_TOKENS` | `1024` | Cap on the generated step list. Raise if long lists get truncated. |
+| `BEDROCK_REGION` | `us-east-1` | Region for KB Retrieve + Converse. Must match the KB stack's region. |
+| `BEDROCK_MODEL_ID` | `us.anthropic.claude-sonnet-4-6` | Generation model (US inference profile). |
+
+The top-K and unscoped-retrieval defaults are carried over from the prototype's
+tuning; both are configurable without code changes.
+
+---
+
 ## GitHub Actions Setup
 
 One workflow is included:
@@ -295,7 +410,8 @@ your machine — see [Deploying to an AWS Sandbox](#deploying-to-an-aws-sandbox)
 - S3 bucket for future media storage
 - `createTask` Lambda with input validation
 - `askAi` Lambda calling Claude Sonnet 4.6 on Amazon Bedrock via the Converse API — inference runs in `us-east-1` (the US inference profile `us.anthropic.claude-sonnet-4-6`) while the rest of the stack stays in `ca-central-1`; region/model are configurable via `BEDROCK_REGION` / `BEDROCK_MODEL_ID`
-- AppSync GraphQL API with `createTask` + `askAi` mutations and a `healthCheck` query
+- `generateTaskSteps` Lambda — RAG over a dedicated Bedrock Knowledge Base (S3 Vectors + titan-embed-text-v2, in its own `us-east-1` stack) returning ordered, source-cited steps for a task; see [Step generation with a Bedrock Knowledge Base](#step-generation-with-a-bedrock-knowledge-base)
+- AppSync GraphQL API with `createTask`, `askAi`, and `generateTaskSteps` mutations and a `healthCheck` query
 - Amazon Cognito User Pool (email sign-in, self sign-up, email verification, password reset) authorizing the API, with `PrimaryUser` / `SupportPerson` / `OrganizationAdmin` / `SystemAdmin` role groups — see [Authentication setup](#authentication-setup)
 - CloudWatch log retention (7 days)
 - Jest unit tests with DynamoDB mocked
