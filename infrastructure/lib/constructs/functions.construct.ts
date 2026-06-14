@@ -76,7 +76,7 @@ export class Functions extends Construct {
         ],
       }),
     );
-    // KB Retrieve — scoped to the one Knowledge Base, in us-east-1.
+    // KB Retrieve — scoped to the one Knowledge Base in the Bedrock region.
     this.generateTaskStepsFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['bedrock:Retrieve'],

@@ -1,8 +1,9 @@
 import { BedrockAgentRuntimeClient } from '@aws-sdk/client-bedrock-agent-runtime';
 
-// Bedrock Knowledge Base lives in us-east-1, co-located with the Sonnet inference
-// profile and the titan embedding model. Keyed off BEDROCK_REGION (NOT AWS_REGION,
-// which is the Lambda's ca-central-1), exactly like the Bedrock Runtime client.
+// Bedrock Knowledge Base lives in the configured Bedrock region, co-located with
+// the Sonnet inference profile and titan embedding model. Keyed off
+// BEDROCK_REGION (NOT AWS_REGION, which is the Lambda's ca-central-1), exactly
+// like the Bedrock Runtime client.
 const client = new BedrockAgentRuntimeClient({ region: process.env.BEDROCK_REGION ?? 'us-east-1' });
 
 export const kb = client;

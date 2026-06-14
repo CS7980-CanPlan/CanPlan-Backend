@@ -13,32 +13,44 @@ const envName = app.node.tryGetContext('env') ?? 'dev';
 // is left billing or blocking the next deploy. dev and prod RETAIN their data.
 const isSandbox = envName === 'sandbox';
 
-// Same account for both stacks; region is pinned per-stack below.
+// Same account for both stacks; the KB region is resolved once and shared with
+// the backend Lambda config so the Retrieve target cannot drift.
 const account = process.env.CDK_DEFAULT_ACCOUNT;
+const backendRegion =
+  app.node.tryGetContext('backendRegion') ??
+  process.env.CANPLAN_BACKEND_REGION ??
+  'ca-central-1';
+const knowledgeBaseRegion =
+  app.node.tryGetContext('knowledgeBaseRegion') ??
+  app.node.tryGetContext('bedrockRegion') ??
+  process.env.CANPLAN_KNOWLEDGE_BASE_REGION ??
+  process.env.BEDROCK_REGION ??
+  'us-east-1';
 const tags = {
   Project: 'CanPlan',
   Environment: envName,
 };
 
-// Knowledge Base must live in us-east-1 (embedding-model availability + the only
-// region validated against the org SCP). Pinned here, separate from the backend.
+// Knowledge Base must live in the Bedrock region (embedding-model availability +
+// the org SCP). Keep this region in sync with the backend Lambda's Bedrock client.
 const knowledgeBaseStack = new KnowledgeBaseStack(app, `CanPlanKnowledgeBase-${envName}`, {
   stackName: `canplan-knowledge-base-${envName}`,
   envName,
   isSandbox,
-  env: { account, region: 'us-east-1' },
+  env: { account, region: knowledgeBaseRegion },
   crossRegionReferences: true,
   tags,
 });
 
 // Backend (DynamoDB/AppSync/Cognito/Lambdas) stays in ca-central-1 and takes the
-// KB id from the us-east-1 stack via a cross-region reference.
+// KB id from the Bedrock-region stack via a cross-region reference.
 new CanPlanBackendStack(app, `CanPlanBackend-${envName}`, {
   stackName: `canplan-backend-${envName}`,
   envName,
   isSandbox,
   knowledgeBaseId: knowledgeBaseStack.knowledgeBaseId,
-  env: { account, region: 'ca-central-1' },
+  bedrockRegion: knowledgeBaseRegion,
+  env: { account, region: backendRegion },
   crossRegionReferences: true,
   tags,
 });
