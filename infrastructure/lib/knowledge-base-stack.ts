@@ -17,7 +17,7 @@ export interface KnowledgeBaseStackProps extends cdk.StackProps {
  * Dedicated us-east-1 stack for the Bedrock Knowledge Base.
  *
  * A CDK stack deploys to a single region, but the KB resources
- * (CfnKnowledgeBase, S3 Vectors, titan-embed-text-v2, corpus bucket) must live
+ * (CfnKnowledgeBase, OpenSearch Serverless, titan-embed-text-v2, corpus bucket) must live
  * in us-east-1 — that's where the embedding model is available and the only
  * region validated against the org SCP. The rest of the backend stays in
  * ca-central-1, so the KB is split out here and its id is handed to the backend
@@ -31,12 +31,11 @@ export class KnowledgeBaseStack extends cdk.Stack {
 
     const { envName, isSandbox } = props;
 
-    // Corpus bucket + Bedrock KB. bedrockRegion = this stack's own region
-    // (us-east-1) so the embedding-model ARN stays self-consistent.
+    // Corpus bucket + Bedrock KB (OpenSearch Serverless vector store). The KB's
+    // embedding-model ARN resolves to this stack's region (us-east-1).
     const knowledgeBase = new KnowledgeBase(this, 'KnowledgeBase', {
       envName,
       isSandbox,
-      bedrockRegion: this.region,
     });
 
     this.knowledgeBaseId = knowledgeBase.knowledgeBaseId;

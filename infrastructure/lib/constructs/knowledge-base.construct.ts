@@ -1,26 +1,27 @@
 import * as cdk from 'aws-cdk-lib';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
-import * as s3vectors from 'aws-cdk-lib/aws-s3vectors';
-import * as iam from 'aws-cdk-lib/aws-iam';
-import * as bedrock from 'aws-cdk-lib/aws-bedrock';
+import * as oss from 'aws-cdk-lib/aws-opensearchserverless';
+import { bedrock, opensearchserverless } from '@cdklabs/generative-ai-cdk-constructs';
 import { Construct } from 'constructs';
 import * as path from 'path';
 
 export interface KnowledgeBaseProps {
   readonly envName: string;
   readonly isSandbox: boolean;
-  /** Region the KB + embedding model live in (us-east-1). */
-  readonly bedrockRegion: string;
 }
 
 /**
- * Bedrock Knowledge Base over the HealthLink BC corpus, using an S3 Vectors store
- * and titan-embed-text-v2. Chunking is NONE (one S3 object = one chunk = one
- * chunk_id), preserving the prototype's 1:1 chunk_id↔passage mapping.
+ * Bedrock Knowledge Base over the HealthLink BC corpus, backed by an Amazon
+ * OpenSearch Serverless vector collection and titan-embed-text-v2 (1024-dim).
+ * Chunking is NONE (one S3 object = one chunk = one chunk_id), preserving the
+ * prototype's 1:1 chunk_id↔passage mapping.
  *
- * Uses the first-class S3 Vectors L1 resources (aws-cdk-lib >= 2.259):
- * CfnVectorBucket + CfnIndex, bound to the KB via storageConfiguration.S3_VECTORS.
+ * Uses the AWS Labs GenAI CDK constructs (`@cdklabs/generative-ai-cdk-constructs`),
+ * which provision the OSS collection (+ encryption/network/data-access policies
+ * and the vector index, via the library's own custom resource) and the Bedrock
+ * KB + S3 data source. S3 Vectors was the original store, but its creation is
+ * denied by the org SCP in this account, so the KB uses OpenSearch Serverless.
  */
 export class KnowledgeBase extends Construct {
   public readonly knowledgeBaseId: string;
@@ -28,11 +29,9 @@ export class KnowledgeBase extends Construct {
   constructor(scope: Construct, id: string, props: KnowledgeBaseProps) {
     super(scope, id);
 
-    const { envName, isSandbox, bedrockRegion } = props;
+    const { envName, isSandbox } = props;
     const removalPolicy = isSandbox ? cdk.RemovalPolicy.DESTROY : cdk.RemovalPolicy.RETAIN;
     const account = cdk.Stack.of(this).account;
-    const embeddingModelArn = `arn:aws:bedrock:${bedrockRegion}::foundation-model/amazon.titan-embed-text-v2:0`;
-    const vectorBucketName = `canplan-kb-vectors-${envName}-${account}`;
 
     // Corpus data-source bucket + the 160 generated per-passage objects.
     const corpusBucket = new s3.Bucket(this, 'CorpusBucket', {
@@ -47,71 +46,35 @@ export class KnowledgeBase extends Construct {
       destinationBucket: corpusBucket,
     });
 
-    // IAM role Bedrock assumes to read the corpus + invoke the embedding model.
-    const kbRole = new iam.Role(this, 'KbRole', {
-      assumedBy: new iam.ServicePrincipal('bedrock.amazonaws.com'),
+    // OpenSearch Serverless vector collection (the KB's vector store). Standby
+    // replicas off in sandbox to keep OCU usage minimal; on for dev/prod.
+    const collection = new opensearchserverless.VectorCollection(this, 'VectorCollection', {
+      collectionName: `canplan-kb-${envName}`,
+      standbyReplicas: isSandbox
+        ? opensearchserverless.VectorCollectionStandbyReplicas.DISABLED
+        : opensearchserverless.VectorCollectionStandbyReplicas.ENABLED,
     });
-    corpusBucket.grantRead(kbRole);
-    kbRole.addToPolicy(
-      new iam.PolicyStatement({
-        actions: ['bedrock:InvokeModel'],
-        resources: [embeddingModelArn],
-      }),
+    // The L2 has no default CfnResource child, so apply the removal policy on
+    // the underlying CfnCollection (the L2's 'VectorCollection' child) directly.
+    (collection.node.findChild('VectorCollection') as oss.CfnCollection).applyRemovalPolicy(
+      removalPolicy,
     );
 
-    // S3 Vectors store: a vector bucket + an index sized to titan-embed-v2.
-    // dataType/distanceMetric values confirmed by `cdk synth` (Risk #2).
-    const vectorBucket = new s3vectors.CfnVectorBucket(this, 'VectorBucket', {
-      vectorBucketName,
-    });
-    vectorBucket.applyRemovalPolicy(removalPolicy);
-    const vectorIndex = new s3vectors.CfnIndex(this, 'VectorIndex', {
-      indexName: 'canplan-kb-index',
-      vectorBucketName,
-      dataType: 'float32',
-      dimension: 1024, // titan-embed-text-v2 default output dimension
-      distanceMetric: 'cosine',
-    });
-    vectorIndex.applyRemovalPolicy(removalPolicy);
-    vectorIndex.addDependency(vectorBucket);
-    kbRole.addToPolicy(
-      new iam.PolicyStatement({
-        actions: ['s3vectors:*'],
-        resources: [vectorBucket.attrVectorBucketArn, vectorIndex.attrIndexArn],
-      }),
-    );
-
-    // Bedrock Knowledge Base bound to the S3 Vectors index.
-    const cfnKb = new bedrock.CfnKnowledgeBase(this, 'KnowledgeBase', {
-      name: `canplan-kb-${envName}`,
-      roleArn: kbRole.roleArn,
-      knowledgeBaseConfiguration: {
-        type: 'VECTOR',
-        vectorKnowledgeBaseConfiguration: { embeddingModelArn },
-      },
-      storageConfiguration: {
-        type: 'S3_VECTORS',
-        s3VectorsConfiguration: {
-          indexArn: vectorIndex.attrIndexArn,
-          vectorBucketArn: vectorBucket.attrVectorBucketArn,
-        },
-      },
-    });
-    cfnKb.addDependency(vectorIndex);
-
-    // S3 data source — chunking NONE so one object = one chunk.
-    new bedrock.CfnDataSource(this, 'CorpusDataSource', {
-      name: `canplan-kb-corpus-${envName}`,
-      knowledgeBaseId: cfnKb.attrKnowledgeBaseId,
-      dataSourceConfiguration: {
-        type: 'S3',
-        s3Configuration: { bucketArn: corpusBucket.bucketArn },
-      },
-      vectorIngestionConfiguration: {
-        chunkingConfiguration: { chunkingStrategy: 'NONE' },
-      },
+    // Bedrock KB on that collection, embedding with titan-embed-text-v2 (1024).
+    // The library auto-creates the vector index inside the collection.
+    const kb = new bedrock.VectorKnowledgeBase(this, 'KnowledgeBase', {
+      embeddingsModel: bedrock.BedrockFoundationModel.TITAN_EMBED_TEXT_V2_1024,
+      vectorStore: collection,
     });
 
-    this.knowledgeBaseId = cfnKb.attrKnowledgeBaseId;
+    // S3 data source — chunking NONE so one object = one chunk = one chunk_id.
+    new bedrock.S3DataSource(this, 'CorpusDataSource', {
+      knowledgeBase: kb,
+      bucket: corpusBucket,
+      dataSourceName: `canplan-kb-corpus-${envName}`,
+      chunkingStrategy: bedrock.ChunkingStrategy.NONE,
+    });
+
+    this.knowledgeBaseId = kb.knowledgeBaseId;
   }
 }
