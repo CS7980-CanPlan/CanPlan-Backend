@@ -8,11 +8,11 @@
     "lint": "eslint 'src/**/*.ts' 'infrastructure/**/*.ts' 'scripts/**/*.ts'",
     "format": "prettier --write 'src/**/*.ts' 'infrastructure/**/*.ts' 'scripts/**/*.ts'",
     "cdk:synth": "cdk synth",
-    "cdk:deploy:dev": "cdk deploy --context env=dev",
-    "cdk:destroy:dev": "cdk destroy --context env=dev",
-    "cdk:deploy:sandbox": "cdk deploy --context env=sandbox",
-    "cdk:destroy:sandbox": "cdk destroy --context env=sandbox",
-    "cdk:deploy:prod": "cdk deploy --context env=prod"
+    "cdk:deploy:dev": "cdk deploy --all --context env=dev",
+    "cdk:destroy:dev": "cdk destroy --all --context env=dev",
+    "cdk:deploy:sandbox": "cdk deploy --all --context env=sandbox",
+    "cdk:destroy:sandbox": "cdk destroy --all --context env=sandbox",
+    "cdk:deploy:prod": "cdk deploy --all --context env=prod"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-agent-runtime": "^3.1068.0",

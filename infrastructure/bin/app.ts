@@ -2,6 +2,7 @@
 import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
 import { CanPlanBackendStack } from '../lib/canplan-backend-stack';
+import { KnowledgeBaseStack } from '../lib/knowledge-base-stack';
 
 const app = new cdk.App();
 
@@ -12,15 +13,32 @@ const envName = app.node.tryGetContext('env') ?? 'dev';
 // is left billing or blocking the next deploy. dev and prod RETAIN their data.
 const isSandbox = envName === 'sandbox';
 
+// Same account for both stacks; region is pinned per-stack below.
+const account = process.env.CDK_DEFAULT_ACCOUNT;
+const tags = {
+  Project: 'CanPlan',
+  Environment: envName,
+};
+
+// Knowledge Base must live in us-east-1 (embedding-model availability + the only
+// region validated against the org SCP). Pinned here, separate from the backend.
+const knowledgeBaseStack = new KnowledgeBaseStack(app, `CanPlanKnowledgeBase-${envName}`, {
+  stackName: `canplan-knowledge-base-${envName}`,
+  envName,
+  isSandbox,
+  env: { account, region: 'us-east-1' },
+  crossRegionReferences: true,
+  tags,
+});
+
+// Backend (DynamoDB/AppSync/Cognito/Lambdas) stays in ca-central-1 and takes the
+// KB id from the us-east-1 stack via a cross-region reference.
 new CanPlanBackendStack(app, `CanPlanBackend-${envName}`, {
   stackName: `canplan-backend-${envName}`,
   envName,
   isSandbox,
-  // CDK will use your active AWS credentials/region unless overridden here.
-  // Uncomment and set values to pin the account and region:
-  // env: { account: '123456789012', region: 'ca-central-1' },
-  tags: {
-    Project: 'CanPlan',
-    Environment: envName,
-  },
+  knowledgeBaseId: knowledgeBaseStack.knowledgeBaseId,
+  env: { account, region: 'ca-central-1' },
+  crossRegionReferences: true,
+  tags,
 });
