@@ -47,7 +47,7 @@ canplan-backend/
 │           ├── functions.construct.ts # Lambda functions + IAM
 │           ├── api.construct.ts       # AppSync GraphQL API + resolvers
 │           ├── ai.construct.ts        # Bedrock model config
-│           └── knowledge-base.construct.ts # S3 Vectors KB + titan-embed-text-v2
+│           └── knowledge-base.construct.ts # OpenSearch Serverless KB + titan-embed-text-v2
 ├── scripts/
 │   ├── seed-dev.ts             # Seed sample tasks into DynamoDB
 │   └── build-corpus.ts         # seed.jsonl → per-passage S3 corpus files
@@ -298,12 +298,19 @@ lives in its own stack pinned to `us-east-1`:
 
 | Stack | Region | Contents |
 | ----- | ------ | -------- |
-| `canplan-knowledge-base-<env>` | `us-east-1` | S3 corpus bucket, S3 Vectors store, Bedrock KB (titan-embed-text-v2), corpus data source |
+| `canplan-knowledge-base-<env>` | `us-east-1` | S3 corpus bucket, OpenSearch Serverless vector collection, Bedrock KB (titan-embed-text-v2), corpus data source |
 | `canplan-backend-<env>` | `ca-central-1` | DynamoDB, AppSync, Cognito, Lambdas (incl. `generateTaskSteps`) |
 
 The backend stack consumes the KB id from the KB stack via CDK cross-region
 references (`crossRegionReferences: true`), so a single `npm run cdk:deploy:sandbox`
 deploys both — the `cdk:deploy:*` npm scripts pass `--all`.
+
+The KB construct is built with the AWS Labs
+[`@cdklabs/generative-ai-cdk-constructs`](https://github.com/awslabs/generative-ai-cdk-constructs)
+library, which provisions the OpenSearch Serverless collection (plus its
+encryption / network / data-access policies and the vector index) and the Bedrock
+KB + data source. That library creates its index via a Docker-bundled Lambda, so
+**`cdk synth` / `cdk deploy` of the KB stack require a running Docker daemon.**
 
 ### 1. Build the corpus
 
@@ -410,7 +417,7 @@ your machine — see [Deploying to an AWS Sandbox](#deploying-to-an-aws-sandbox)
 - S3 bucket for future media storage
 - `createTask` Lambda with input validation
 - `askAi` Lambda calling Claude Sonnet 4.6 on Amazon Bedrock via the Converse API — inference runs in `us-east-1` (the US inference profile `us.anthropic.claude-sonnet-4-6`) while the rest of the stack stays in `ca-central-1`; region/model are configurable via `BEDROCK_REGION` / `BEDROCK_MODEL_ID`
-- `generateTaskSteps` Lambda — RAG over a dedicated Bedrock Knowledge Base (S3 Vectors + titan-embed-text-v2, in its own `us-east-1` stack) returning ordered, source-cited steps for a task; see [Step generation with a Bedrock Knowledge Base](#step-generation-with-a-bedrock-knowledge-base)
+- `generateTaskSteps` Lambda — RAG over a dedicated Bedrock Knowledge Base (OpenSearch Serverless + titan-embed-text-v2, in its own `us-east-1` stack) returning ordered, source-cited steps for a task; see [Step generation with a Bedrock Knowledge Base](#step-generation-with-a-bedrock-knowledge-base)
 - AppSync GraphQL API with `createTask`, `askAi`, and `generateTaskSteps` mutations and a `healthCheck` query
 - Amazon Cognito User Pool (email sign-in, self sign-up, email verification, password reset) authorizing the API, with `PrimaryUser` / `SupportPerson` / `OrganizationAdmin` / `SystemAdmin` role groups — see [Authentication setup](#authentication-setup)
 - CloudWatch log retention (7 days)
