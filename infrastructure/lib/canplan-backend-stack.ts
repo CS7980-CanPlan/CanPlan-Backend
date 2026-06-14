@@ -5,6 +5,7 @@ import { Api } from './constructs/api.construct';
 import { Auth } from './constructs/auth.construct';
 import { Database } from './constructs/database.construct';
 import { Functions } from './constructs/functions.construct';
+import { KnowledgeBase } from './constructs/knowledge-base.construct';
 import { Storage } from './constructs/storage.construct';
 
 export interface CanPlanBackendStackProps extends cdk.StackProps {
@@ -38,12 +39,20 @@ export class CanPlanBackendStack extends cdk.Stack {
     // AI config (Bedrock model selection)
     const ai = new Ai(this, 'Ai');
 
+    // Knowledge Base — corpus bucket + Bedrock KB (us-east-1) for step generation
+    const knowledgeBase = new KnowledgeBase(this, 'KnowledgeBase', {
+      envName,
+      isSandbox,
+      bedrockRegion: ai.bedrockRegion,
+    });
+
     // Compute — Lambdas depend on the table and the resolved Bedrock config
     const functions = new Functions(this, 'Functions', {
       envName,
       tasksTable: database.tasksTable,
       bedrockModelId: ai.bedrockModelId,
       bedrockRegion: ai.bedrockRegion,
+      knowledgeBaseId: knowledgeBase.knowledgeBaseId,
     });
 
     // GraphQL API — resolvers depend on the Lambdas; Cognito is the primary authorizer
@@ -52,6 +61,7 @@ export class CanPlanBackendStack extends cdk.Stack {
       userPool: auth.userPool,
       createTaskFn: functions.createTaskFn,
       askAiFn: functions.askAiFn,
+      generateTaskStepsFn: functions.generateTaskStepsFn,
     });
 
     // ── Outputs ───────────────────────────────────────────────────────────────
@@ -64,5 +74,6 @@ export class CanPlanBackendStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'TasksTableName', { value: database.tasksTable.tableName });
     new cdk.CfnOutput(this, 'BedrockModelId', { value: ai.bedrockModelId });
     new cdk.CfnOutput(this, 'BedrockRegion', { value: ai.bedrockRegion });
+    new cdk.CfnOutput(this, 'KnowledgeBaseId', { value: knowledgeBase.knowledgeBaseId });
   }
 }
