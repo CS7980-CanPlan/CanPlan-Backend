@@ -1,312 +1,229 @@
-# CanPlan 2.0 — Backend
+# CanPlan Backend
 
-Cloud backend for CanPlan 2.0, a task management app. This starter repo wires together AWS Lambda, DynamoDB, and AppSync GraphQL using AWS CDK in TypeScript.
+AWS CDK backend for CanPlan. It deploys an AppSync GraphQL API, Cognito auth,
+DynamoDB task storage, S3 buckets, Lambda resolvers, and a Bedrock Knowledge Base
+backed by OpenSearch Serverless.
 
----
+## Current API
 
-## Tech Stack
+The GraphQL schema is in [graphql/schema.graphql](graphql/schema.graphql).
 
-| Layer                  | Service                                  |
-| ---------------------- | ---------------------------------------- |
-| Infrastructure as Code | AWS CDK (TypeScript)                     |
-| API                    | AWS AppSync (GraphQL)                    |
-| Compute                | AWS Lambda (Node.js 20)                  |
-| Database               | Amazon DynamoDB                          |
-| File Storage           | Amazon S3 (provisioned, ready for media) |
-| Observability          | Amazon CloudWatch Logs                   |
-| CI/CD                  | GitHub Actions                           |
-| Testing                | Jest + ts-jest                           |
-| Code Quality           | ESLint + Prettier                        |
+| Operation | Type | Backing service |
+| --------- | ---- | --------------- |
+| `healthCheck` | Query | AppSync none data source |
+| `createTask` | Mutation | `canplan-createTask-<env>` Lambda + DynamoDB |
+| `generateTaskSteps` | Mutation | `canplan-generateTaskSteps-<env>` Lambda + Bedrock KB RAG |
 
----
+There is no standalone `askAi` mutation. AI usage is through `generateTaskSteps`:
+retrieve relevant corpus passages from the Knowledge Base, then call Bedrock
+Converse to generate cited task steps.
 
-## Directory Structure
+AppSync default authorization is Cognito User Pool auth. An API key is configured
+as an additional auth mode, but the current schema does not add `@aws_api_key`
+directives, so frontend clients should use a signed-in user's JWT.
 
-```
-canplan-backend/
-├── .github/
-│   └── workflows/
-│       └── ci.yml              # Lint, test, build on every PR and push
-├── docs/
-│   └── API.md                  # Frontend API reference (operations, examples)
-├── graphql/
-│   └── schema.graphql          # AppSync GraphQL schema
-├── infrastructure/
-│   ├── bin/
-│   │   └── app.ts              # CDK entry point
-│   └── lib/
-│       ├── canplan-backend-stack.ts   # Composition: wires constructs + outputs
-│       └── constructs/
-│           ├── database.construct.ts  # DynamoDB table
-│           ├── storage.construct.ts   # S3 media bucket
-│           ├── auth.construct.ts      # Cognito User Pool, client, role groups
-│           ├── functions.construct.ts # Lambda functions + IAM
-│           ├── api.construct.ts       # AppSync GraphQL API + resolvers
-│           └── ai.construct.ts        # Bedrock model config
-├── scripts/
-│   └── seed-dev.ts             # Seed sample tasks into DynamoDB
-├── src/
-│   ├── lambdas/
-│   │   ├── createTask/
-│   │   │   ├── handler.ts      # Lambda function logic
-│   │   │   └── handler.test.ts # Unit tests
-│   │   └── askAi/
-│   │       ├── handler.ts      # Bedrock (Converse) Lambda logic
-│   │       └── handler.test.ts # Unit tests
-│   └── shared/
-│       ├── dynamodb.ts         # Shared DynamoDB client
-│       ├── bedrock.ts          # Shared Bedrock client + model config
-│       ├── response.ts         # Shared error types
-│       └── types.ts            # Shared TypeScript types
-├── .env.example
-├── cdk.json
-├── jest.config.js
-├── package.json
-├── tsconfig.json              # Editor/type-check config (includes tests)
-├── tsconfig.build.json        # Build config (emits, excludes tests)
-└── tsconfig.test.json         # ts-jest config (adds jest types)
-```
+## Region Layout
 
----
+The app deploys two CDK stacks with `--all`.
 
-## Local Setup
+| Region | Stack | Main resources |
+| ------ | ----- | -------------- |
+| `CANPLAN_BACKEND_REGION` default `ca-central-1` | `canplan-backend-<env>` | AppSync, Cognito, DynamoDB `CanPlanTasks-<env>`, media S3 bucket, `createTask` Lambda, `generateTaskSteps` Lambda, CloudWatch logs |
+| `CANPLAN_KNOWLEDGE_BASE_REGION` default `us-east-1` | `canplan-knowledge-base-<env>` | Bedrock Knowledge Base, S3 corpus bucket, Bedrock S3 data source, OpenSearch Serverless vector collection/index |
 
-**Prerequisites**
+`generateTaskSteps` runs in `ca-central-1` by default, but calls Bedrock Agent
+Runtime and Bedrock Runtime in the Knowledge Base region. CDK passes the KB id
+across regions using `crossRegionReferences: true`, which creates CDK helper
+custom resources.
+
+The Lambda console will show different functions depending on the selected
+region:
+
+| Region | Lambda functions you should expect |
+| ------ | ---------------------------------- |
+| Backend region | `canplan-createTask-<env>`, `canplan-generateTaskSteps-<env>`, CDK cross-region reader, sandbox S3 auto-delete helper |
+| Knowledge Base region | OpenSearch index custom-resource provider, bucket deployment helper, CDK cross-region writer, sandbox S3 auto-delete helper |
+
+## Prerequisites
 
 - Node.js 20+
-- AWS CLI v2, authenticated via SSO (see [Deploying to an AWS Sandbox](#deploying-to-an-aws-sandbox))
-- No global CDK install needed — `aws-cdk` is a dev dependency, so the `npm run cdk:*` scripts use the local version
+- AWS CLI v2 authenticated with AWS SSO
+- Docker Desktop running for `cdk synth` / `cdk deploy`
+
+Docker is required because `@cdklabs/generative-ai-cdk-constructs` bundles the
+OpenSearch Serverless index custom-resource Lambda with Docker. The business
+Lambdas use local `esbuild` bundling.
+
+## Quick Setup
 
 ```bash
-# 1. Clone the repo
-git clone <repo-url>
-cd canplan-backend
-
-# 2. Install dependencies
 npm install
-
-# 3. Copy environment variables
 cp .env.example .env
-# Edit .env — set the region and (after deploy) the API URL/key.
-# Do NOT put AWS credentials here; this project authenticates via AWS SSO.
 ```
 
----
+Check `.env`:
 
-## Commands
-
-```bash
-# Run linter
-npm run lint
-
-# Run unit tests
-npm test
-
-# Build TypeScript (output → dist/)
-npm run build
-
-# Format all source files
-npm run format
-
-# Preview the CloudFormation template (no AWS calls)
-npm run cdk:synth
-
-# Deploy the dev stack to AWS
-npm run cdk:deploy:dev
-
-# Tear down the dev stack
-npm run cdk:destroy:dev
-
-# Deploy / tear down the sandbox stack (clean teardown — see below)
-npm run cdk:deploy:sandbox
-npm run cdk:destroy:sandbox
+```env
+CANPLAN_BACKEND_REGION=ca-central-1
+CANPLAN_KNOWLEDGE_BASE_REGION=us-east-1
+AWS_REGION=ca-central-1
 ```
 
----
-
-## Deploying to AWS (First Time)
-
-This project authenticates via **AWS SSO** — no long-lived IAM user keys.
-
-1. **Log in to the account** (profile name comes from your AWS SSO config):
-
-   ```bash
-   aws sso login --profile canplan-sandbox
-   export AWS_PROFILE=canplan-sandbox
-   ```
-
-   > 💡 **Set `AWS_PROFILE` once instead of passing `--profile` every time.**
-   > CDK and the AWS CLI don't remember a profile between commands, so without
-   > this they fall back to the `default` profile and you'd have to append
-   > `--profile canplan-sandbox` to every `cdk` / `aws` call. The `export` above
-   > sets it for the **whole terminal session**, so subsequent commands need no
-   > flag. It only lasts for that terminal — to make it permanent, add
-   > `export AWS_PROFILE=canplan-sandbox` to your `~/.zshrc`, or use
-   > [direnv](https://direnv.net/) with a project-local `.envrc` so it activates
-   > automatically in this repo.
-
-2. **Verify you're authenticated against the right account:**
-
-   ```bash
-   aws sts get-caller-identity
-   ```
-
-3. **Bootstrap CDK** — one-time per account + region:
-
-   ```bash
-   npx cdk bootstrap
-   ```
-
-4. **Deploy** — see [Deploying to an AWS Sandbox](#deploying-to-an-aws-sandbox) below
-   for the full env breakdown:
-
-   ```bash
-   npm run cdk:deploy:sandbox
-   ```
-
-   CDK will print the AppSync API URL, API key, and the Cognito values after a
-   successful deploy — see [Authentication setup](#authentication-setup).
-
----
-
-## Deploying to an AWS Sandbox
-
-This project targets a **shared org/company AWS sandbox account** — a real account
-with cost and cleanup guardrails. The stack is configured so a sandbox deploy
-tears down completely, leaving nothing behind to incur cost or block the next
-deploy on a name collision.
-
-### How sandbox mode works
-
-The CDK entry point ([infrastructure/bin/app.ts](infrastructure/bin/app.ts))
-reads the `env` context value and treats **only `env=sandbox`** as a sandbox.
-Sandbox mode is passed into the stack as `isSandbox`, which controls the removal
-policies in
-[infrastructure/lib/canplan-backend-stack.ts](infrastructure/lib/canplan-backend-stack.ts):
-
-| Resource                            | Sandbox (`env=sandbox`)            | dev / prod                     |
-| ----------------------------------- | ---------------------------------- | ------------------------------ |
-| DynamoDB `CanPlanTasks-<env>` table | `DESTROY` — deleted with the stack | `RETAIN` — survives teardown   |
-| S3 media bucket                     | `DESTROY` + auto-empty on teardown | `RETAIN`                       |
-| Cognito `CanPlan-<env>-UserPool`    | `DESTROY` — deleted with the stack | `RETAIN` — keeps user accounts |
-| Lambda / AppSync / log groups       | Deleted with the stack             | Deleted with the stack         |
-
-> ⚠️ Only `env=sandbox` tears down its data. **`dev` and `prod` both RETAIN** the
-> DynamoDB table, S3 bucket, and Cognito User Pool — a `cdk destroy` there leaves
-> those resources behind (and they'll block a redeploy on the same name until
-> removed manually).
-
-### Deploy
+Load `.env` before CDK/AWS CLI commands that use those variables:
 
 ```bash
-# 1. Authenticate to the sandbox account via SSO
+set -a
+. ./.env
+set +a
+```
+
+## Deploy Sandbox
+
+First deploy in an account:
+
+```bash
 aws sso login --profile canplan-sandbox
 export AWS_PROFILE=canplan-sandbox
 
-# 2. Region is ca-central-1 (set in .env / .env.example)
+set -a
+. ./.env
+set +a
 
-# 3. Bootstrap once per account + region
-npx cdk bootstrap
+aws sts get-caller-identity
 
-# 4. Deploy the sandbox stack
+npx ts-node scripts/build-corpus.ts
+
+npx cdk bootstrap \
+  aws://<account-id>/$CANPLAN_BACKEND_REGION \
+  aws://<account-id>/$CANPLAN_KNOWLEDGE_BASE_REGION
+
 npm run cdk:deploy:sandbox
 ```
 
-### Tear down (do this when you're done to avoid lingering resources)
+Normal redeploy after bootstrap:
 
 ```bash
-npm run cdk:destroy:sandbox
+export AWS_PROFILE=canplan-sandbox
+set -a
+. ./.env
+set +a
+npx ts-node scripts/build-corpus.ts
+npm run cdk:deploy:sandbox
 ```
 
-Because sandbox resources use `DESTROY` removal policies, this leaves a clean
-account — you can immediately redeploy without name conflicts.
+The deploy prints the AppSync URL, API key, Cognito values, task table name,
+Bedrock model, Bedrock region, and Knowledge Base id.
 
-### Notes
-
-- **Lambda bundling needs no Docker.** `esbuild` is a dev dependency, so
-  `NodejsFunction` bundles locally. (Without it, CDK falls back to Docker, which
-  fails if the daemon isn't running.)
-- **Sandbox credentials often rotate.** If a deploy fails with an expired-token
-  error, refresh your SSO session (`aws sso login --profile canplan-sandbox`) and
-  retry.
-- **Multiple environments coexist.** Every resource is namespaced by `env`
-  (`CanPlanTasks-<env>`, `canplan-createTask-<env>`, `canplan-api-<env>`,
-  `canplan-media-<env>-…`, `CanPlan-<env>-UserPool`), so `sandbox`, `dev`, and
-  `prod` can all be deployed into the same account at once without name collisions.
-
----
-
-## Authentication setup
-
-The API is authorized by an **Amazon Cognito User Pool** (the API key is kept only
-as a secondary mode for the unauthenticated `healthCheck` query). Frontend clients
-authenticate a user against the pool, then send the user's JWT in the
-`Authorization` header on every GraphQL request.
-
-After a deploy, CDK prints the values the mobile app and web portal need to
-configure their Cognito/AppSync client:
-
-| CDK output         | What it is                       | Frontend uses it for                                            |
-| ------------------ | -------------------------------- | --------------------------------------------------------------- |
-| `UserPoolId`       | Cognito User Pool ID             | Initializing the auth client (sign-up, sign-in, password reset) |
-| `UserPoolClientId` | App client ID (no client secret) | The public client the app authenticates through                 |
-| `AwsRegion`        | Region the pool lives in         | Required to construct the Cognito endpoint                      |
-| `GraphQLApiUrl`    | AppSync GraphQL endpoint         | Where queries/mutations are sent                                |
+To re-print backend outputs:
 
 ```bash
-# Re-print the outputs for an already-deployed stack:
 aws cloudformation describe-stacks \
   --stack-name canplan-backend-sandbox \
-  --query 'Stacks[0].Outputs' --output table
+  --region "$CANPLAN_BACKEND_REGION" \
+  --query 'Stacks[0].Outputs' \
+  --output table
 ```
 
-The pool is configured for **email-based sign-in** with **self sign-up**, **email
-verification**, and **password reset by email**. Four role groups are seeded —
-`PrimaryUser`, `SupportPerson`, `OrganizationAdmin`, and `SystemAdmin` — for
-future group-based authorization (not yet enforced on resolvers).
+## Ingest The Knowledge Base
 
----
+`scripts/build-corpus.ts` converts `data/corpus/seed.jsonl` into
+`data/corpus/dist/*.txt` and `*.metadata.json`. CDK uploads `data/corpus/dist` to
+the corpus bucket, but Bedrock retrieval will not work until the data source is
+ingested.
 
-## GitHub Actions Setup
+Run this after deploy, and again whenever the corpus changes:
 
-One workflow is included:
+```bash
+KB_ID=$(aws cloudformation describe-stacks \
+  --stack-name canplan-knowledge-base-sandbox \
+  --region "$CANPLAN_KNOWLEDGE_BASE_REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='KnowledgeBaseId'].OutputValue" \
+  --output text)
 
-| Workflow | Trigger             | Purpose             |
-| -------- | ------------------- | ------------------- |
-| `ci.yml` | Push / PR to `main` | Lint → Test → Build |
+DS_ID=$(aws bedrock-agent list-data-sources \
+  --knowledge-base-id "$KB_ID" \
+  --region "$CANPLAN_KNOWLEDGE_BASE_REGION" \
+  --query 'dataSourceSummaries[0].dataSourceId' \
+  --output text)
 
-CI runs lint, tests, and a TypeScript build check — it does **not** touch AWS, so
-no repository secrets are required.
+aws bedrock-agent start-ingestion-job \
+  --knowledge-base-id "$KB_ID" \
+  --data-source-id "$DS_ID" \
+  --region "$CANPLAN_KNOWLEDGE_BASE_REGION"
+```
 
-### Deploys
+## Commands
 
-There is no automated deploy workflow. Because this project authenticates via
-**AWS SSO** (no long-lived keys for GitHub Actions to use), deploys are run from
-your machine — see [Deploying to an AWS Sandbox](#deploying-to-an-aws-sandbox).
+| Command | Purpose |
+| ------- | ------- |
+| `npm run build` | TypeScript build |
+| `npm test` | Jest tests |
+| `npm run lint` | ESLint |
+| `npm run format` | Prettier write |
+| `npm run cdk:synth` | CDK synth; requires `data/corpus/dist` and Docker |
+| `npm run cdk:deploy:sandbox` | Deploy both sandbox stacks |
+| `npm run cdk:destroy:sandbox` | Destroy both sandbox stacks |
+| `npm run cdk:deploy:dev` | Deploy both dev stacks |
+| `npm run cdk:destroy:dev` | Destroy dev stacks, retaining protected data resources |
+| `npm run cdk:deploy:prod` | Deploy both prod stacks |
 
-> Want CI/CD deploys? Add a workflow using GitHub OIDC (`role-to-assume`)
-> federation rather than static access keys.
+There is intentionally no `cdk:destroy:prod` script.
 
----
+## Environment Behavior
 
-## What Is Included
+The CDK app reads `--context env=...`; only `env=sandbox` is treated as sandbox.
 
-- DynamoDB table `CanPlanTasks-<env>` with pay-per-request billing
-- S3 bucket for future media storage
-- `createTask` Lambda with input validation
-- `askAi` Lambda calling Claude Sonnet 4.6 on Amazon Bedrock via the Converse API — inference runs in `us-east-1` (the US inference profile `us.anthropic.claude-sonnet-4-6`) while the rest of the stack stays in `ca-central-1`; region/model are configurable via `BEDROCK_REGION` / `BEDROCK_MODEL_ID`
-- AppSync GraphQL API with `createTask` + `askAi` mutations and a `healthCheck` query
-- Amazon Cognito User Pool (email sign-in, self sign-up, email verification, password reset) authorizing the API, with `PrimaryUser` / `SupportPerson` / `OrganizationAdmin` / `SystemAdmin` role groups — see [Authentication setup](#authentication-setup)
-- CloudWatch log retention (7 days)
-- Jest unit tests with DynamoDB mocked
-- ESLint + Prettier configuration
-- GitHub Actions CI workflow (lint, test, build)
-- Dev seed script (`scripts/seed-dev.ts`)
+| Resource | Sandbox destroy | Dev/prod destroy |
+| -------- | --------------- | ---------------- |
+| DynamoDB task table | Deleted | Retained |
+| Media S3 bucket | Emptied and deleted | Retained |
+| Cognito User Pool | Deleted | Retained |
+| KB corpus S3 bucket | Emptied and deleted | Retained |
+| OpenSearch Serverless collection | Deleted | Retained |
+| AppSync, Lambdas, IAM, log groups | Deleted | Deleted |
 
-## What Is Not Included Yet
+Dev/prod `cdk destroy` still destroys the stacks and non-retained infrastructure.
+The KB corpus bucket is retained, so the vector index can be rebuilt by deploying
+and re-running ingestion if needed.
 
-- **Group-based authorization** — Cognito User Pool auth and role groups exist, but resolvers do not yet enforce per-group permissions or detailed `@auth` rules.
-- **Read queries** — `getTask` and `listTasks` resolvers are not built yet.
-- **Offline sync** — planned for a future milestone.
-- **PDF reports** — planned for a future milestone.
-- **Frontend** — this repo is backend only.
+## Configuration
+
+Region resolution in [infrastructure/bin/app.ts](infrastructure/bin/app.ts):
+
+| Setting | Resolution order | Default |
+| ------- | ---------------- | ------- |
+| Backend stack region | `--context backendRegion=...`, `CANPLAN_BACKEND_REGION` | `ca-central-1` |
+| Knowledge Base / Bedrock region | `--context knowledgeBaseRegion=...`, legacy `--context bedrockRegion=...`, `CANPLAN_KNOWLEDGE_BASE_REGION`, legacy `BEDROCK_REGION` | `us-east-1` |
+
+Runtime settings on `generateTaskSteps`:
+
+| Env var | Default | Meaning |
+| ------- | ------- | ------- |
+| `BEDROCK_REGION` | KB region | Region for KB Retrieve and Converse |
+| `BEDROCK_MODEL_ID` | `us.anthropic.claude-sonnet-4-6` | Generation model / inference profile |
+| `BEDROCK_MAX_TOKENS` | `1024` | Generation cap |
+| `RETRIEVAL_TOP_K` | `4` | KB passages retrieved per query |
+
+## Project Map
+
+```text
+graphql/schema.graphql                         AppSync schema
+infrastructure/bin/app.ts                      CDK app and stack wiring
+infrastructure/lib/canplan-backend-stack.ts    Backend stack
+infrastructure/lib/knowledge-base-stack.ts     Knowledge Base stack
+infrastructure/lib/constructs/                 CDK constructs
+scripts/build-corpus.ts                        seed.jsonl -> data/corpus/dist
+src/lambdas/createTask/handler.ts              createTask resolver
+src/lambdas/generateTaskSteps/handler.ts       KB Retrieve -> Converse resolver
+src/shared/                                    Shared AWS clients/types/helpers
+docs/API.md                                    Frontend API reference
+```
+
+## Common Issues
+
+- `Cannot find asset ... data/corpus/dist`: run `npx ts-node scripts/build-corpus.ts`.
+- `Cannot connect to the Docker daemon`: start Docker Desktop and retry synth/deploy.
+- `createTask` Lambda not visible in Lambda console: switch AWS Console region to
+  `CANPLAN_BACKEND_REGION` (`ca-central-1` by default). KB helper Lambdas are in
+  `CANPLAN_KNOWLEDGE_BASE_REGION`.
+- Expired AWS credentials: run `aws sso login --profile canplan-sandbox` again.

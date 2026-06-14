@@ -1,9 +1,9 @@
 import { BedrockRuntimeClient } from '@aws-sdk/client-bedrock-runtime';
 
 // Single shared Bedrock Runtime client reused across Lambda invocations.
-// Bedrock runs in its OWN region (us-east-1 by default), independent of the rest
-// of the backend, which stays in ca-central-1. The US Claude inference profile
-// lives in us-east-1, so model calls are routed there wherever the Lambda runs.
+// Bedrock runs in its OWN region, independent of the rest of the backend, which
+// stays in ca-central-1. The default is us-east-1 for the US Claude inference
+// profile, but CDK sets BEDROCK_REGION to match the deployed KB stack.
 // Deliberately NOT keyed off AWS_REGION (that's the Lambda's ca-central-1 region).
 const client = new BedrockRuntimeClient({ region: process.env.BEDROCK_REGION ?? 'us-east-1' });
 

@@ -16,6 +16,10 @@ export interface CanPlanBackendStackProps extends cdk.StackProps {
    * name collision. Set for sandbox only; leave false (RETAIN) for dev / prod.
    */
   readonly isSandbox: boolean;
+  /** Bedrock KB id from the Bedrock-region KnowledgeBase stack (cross-region ref). */
+  readonly knowledgeBaseId: string;
+  /** Region for KB Retrieve + Converse. Must match the KnowledgeBase stack region. */
+  readonly bedrockRegion: string;
 }
 
 /**
@@ -26,7 +30,7 @@ export class CanPlanBackendStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: CanPlanBackendStackProps) {
     super(scope, id, props);
 
-    const { envName, isSandbox } = props;
+    const { envName, isSandbox, knowledgeBaseId, bedrockRegion } = props;
 
     // Data + storage
     const database = new Database(this, 'Database', { envName, isSandbox });
@@ -36,7 +40,7 @@ export class CanPlanBackendStack extends cdk.Stack {
     const auth = new Auth(this, 'Auth', { envName, isSandbox });
 
     // AI config (Bedrock model selection)
-    const ai = new Ai(this, 'Ai');
+    const ai = new Ai(this, 'Ai', { bedrockRegion });
 
     // Compute — Lambdas depend on the table and the resolved Bedrock config
     const functions = new Functions(this, 'Functions', {
@@ -44,6 +48,7 @@ export class CanPlanBackendStack extends cdk.Stack {
       tasksTable: database.tasksTable,
       bedrockModelId: ai.bedrockModelId,
       bedrockRegion: ai.bedrockRegion,
+      knowledgeBaseId,
     });
 
     // GraphQL API — resolvers depend on the Lambdas; Cognito is the primary authorizer
@@ -51,7 +56,7 @@ export class CanPlanBackendStack extends cdk.Stack {
       envName,
       userPool: auth.userPool,
       createTaskFn: functions.createTaskFn,
-      askAiFn: functions.askAiFn,
+      generateTaskStepsFn: functions.generateTaskStepsFn,
     });
 
     // ── Outputs ───────────────────────────────────────────────────────────────

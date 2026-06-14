@@ -1,18 +1,24 @@
 import { Construct } from 'constructs';
 
+export interface AiProps {
+  /** Region for KB Retrieve + Converse. Resolved once in app.ts. */
+  readonly bedrockRegion: string;
+}
+
 /**
  * AI configuration for CanPlan: resolves the Bedrock model id and the region
  * Bedrock Runtime is called in. The rest of the stack stays in ca-central-1,
- * but inference runs in us-east-1 where the US Claude inference profile lives.
- * A home for future AI resources (e.g. a Bedrock Knowledge Base).
+ * but generation runs in the Bedrock region where the KB and inference profile
+ * live. The current AI path is generateTaskSteps: KB Retrieve followed by
+ * Converse.
  */
 export class Ai extends Construct {
-  /** Bedrock model / inference-profile id the askAi Lambda invokes. */
+  /** Bedrock model / inference-profile id the generateTaskSteps Lambda invokes. */
   public readonly bedrockModelId: string;
-  /** Region the askAi Lambda calls Bedrock Runtime in (not the stack region). */
+  /** Region the generateTaskSteps Lambda calls Bedrock in (not the stack region). */
   public readonly bedrockRegion: string;
 
-  constructor(scope: Construct, id: string) {
+  constructor(scope: Construct, id: string, props: AiProps) {
     super(scope, id);
 
     // Claude Sonnet 4.6 via the US cross-region inference profile. Override with
@@ -20,8 +26,8 @@ export class Ai extends Construct {
     this.bedrockModelId =
       this.node.tryGetContext('bedrockModelId') ?? 'us.anthropic.claude-sonnet-4-6';
 
-    // The US inference profile is served from us-east-1; the backend stack stays
-    // in ca-central-1. Override with --context bedrockRegion=...
-    this.bedrockRegion = this.node.tryGetContext('bedrockRegion') ?? 'us-east-1';
+    // Resolved once in app.ts so the deployed KB region and Lambda runtime/IAM
+    // target cannot drift apart.
+    this.bedrockRegion = props.bedrockRegion;
   }
 }

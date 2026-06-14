@@ -12,18 +12,6 @@ export interface CreateTaskInput {
   description?: string;
 }
 
-// AI assistant: a single prompt in, a single model response out
-export interface AskAiInput {
-  prompt: string;
-}
-
-export interface AiResponse {
-  text: string;
-  model: string;
-  inputTokens?: number;
-  outputTokens?: number;
-}
-
 // Shape of the AppSync event passed to Lambda resolvers
 export interface AppSyncEvent<TArgs = Record<string, unknown>> {
   arguments: TArgs;
@@ -32,4 +20,43 @@ export interface AppSyncEvent<TArgs = Record<string, unknown>> {
   request?: {
     headers: Record<string, string>;
   };
+}
+
+// Step generation: a task query in, ordered source-cited steps out
+export interface QueryContext {
+  role?: string;
+  organizationId?: string;
+}
+
+export interface GenerateTaskStepsInput {
+  userId: string;
+  query: string;
+  context?: QueryContext;
+}
+
+export interface Citation {
+  chunkId: string;
+  title: string;
+  url?: string;
+  snippet?: string;
+}
+
+export interface TaskStep {
+  text: string;
+  citations: Citation[];
+}
+
+export interface TaskStepsResponse {
+  steps: TaskStep[];
+  model: string;
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
+// A passage returned by KB.Retrieve, normalized for prompt-building + citation resolution
+export interface RetrievedPassage {
+  chunkId: string;
+  text: string;
+  title: string;
+  url?: string;
 }

@@ -1,8 +1,12 @@
 node_modules/
 dist/
 cdk.out/
+data/corpus/dist/
 *.js.map
 *.d.ts
 .env
 .DS_Store
 coverage/
+
+# Local-only design docs (specs/plans) — personal reference, never pushed to the shared repo
+docs/superpowers/

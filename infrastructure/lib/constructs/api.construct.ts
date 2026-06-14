@@ -10,7 +10,7 @@ export interface ApiProps {
   /** Cognito User Pool used as the API's primary authorizer. */
   readonly userPool: cognito.IUserPool;
   readonly createTaskFn: lambda.IFunction;
-  readonly askAiFn: lambda.IFunction;
+  readonly generateTaskStepsFn: lambda.IFunction;
 }
 
 /** AppSync GraphQL API and its resolvers. */
@@ -21,7 +21,7 @@ export class Api extends Construct {
   constructor(scope: Construct, id: string, props: ApiProps) {
     super(scope, id);
 
-    const { envName, userPool, createTaskFn, askAiFn } = props;
+    const { envName, userPool, createTaskFn, generateTaskStepsFn } = props;
 
     const api = new appsync.GraphqlApi(this, 'CanPlanApi', {
       name: `canplan-api-${envName}`,
@@ -57,11 +57,11 @@ export class Api extends Construct {
       fieldName: 'createTask',
     });
 
-    // askAi mutation → Lambda data source
-    const askAiDs = api.addLambdaDataSource('AskAiDataSource', askAiFn);
-    askAiDs.createResolver('AskAiResolver', {
+    // generateTaskSteps mutation → Lambda data source
+    const generateTaskStepsDs = api.addLambdaDataSource('GenerateTaskStepsDataSource', generateTaskStepsFn);
+    generateTaskStepsDs.createResolver('GenerateTaskStepsResolver', {
       typeName: 'Mutation',
-      fieldName: 'askAi',
+      fieldName: 'generateTaskSteps',
     });
 
     // healthCheck query — returns a static string, no data source needed

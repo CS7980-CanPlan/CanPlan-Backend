@@ -161,84 +161,6 @@ mutation CreateTask($input: CreateTaskInput!) {
 
 ---
 
-### `askAi` — mutation
-
-Sends user text to a **Claude model on Amazon Bedrock** and returns the model's
-reply as a single string, plus token usage. The default model is **Claude Sonnet
-4.6** via the US cross-region inference profile (`us.anthropic.claude-sonnet-4-6`),
-configurable through `BEDROCK_MODEL_ID`. Inference runs in **`us-east-1`** (set via
-`BEDROCK_REGION`) while the rest of the backend stays in `ca-central-1`. This is a
-synchronous, non-streaming call — the whole response comes back in one shot.
-
-> **Latency:** model calls typically take a few seconds. The backend caps the wait
-> at ~29s (AppSync's resolver ceiling). Show a loading state on the frontend and
-> keep prompts reasonably scoped. Streaming token-by-token is not supported in this
-> setup.
-
-**Input — `AskAiInput`**
-
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `prompt` | `String` | ✅ | The user's text. Non-empty after trimming, or the request errors |
-
-**Returns — `AiResponse`**
-
-| Field | Type | Notes |
-|---|---|---|
-| `text` | `String!` | The model's reply |
-| `model` | `String!` | Bedrock model/inference-profile id used (e.g. `us.anthropic.claude-sonnet-4-6`) |
-| `inputTokens` | `Int` | Prompt tokens consumed (may be `null`) |
-| `outputTokens` | `Int` | Generated tokens (may be `null`) |
-
-**Mutation**
-
-```graphql
-mutation AskAi($input: AskAiInput!) {
-  askAi(input: $input) {
-    text
-    model
-    inputTokens
-    outputTokens
-  }
-}
-```
-
-**Variables**
-
-```json
-{ "input": { "prompt": "Summarize CanPlan in one sentence." } }
-```
-
-**Response**
-
-```json
-{
-  "data": {
-    "askAi": {
-      "text": "CanPlan is a cloud-based task management app that helps you capture, organize, and track your to-dos.",
-      "model": "us.anthropic.claude-sonnet-4-6",
-      "inputTokens": 14,
-      "outputTokens": 27
-    }
-  }
-}
-```
-
-> **Model note:** the backend calls Bedrock in `us-east-1` using the US inference
-> profile `us.anthropic.claude-sonnet-4-6`. The deployed account's AWS organization
-> SCP has historically denied newer Claude models / inference profiles — if calls
-> fail with an access-denied error, the SCP must be widened to allow this profile
-> and its underlying foundation model. The model and region are config-only
-> (`BEDROCK_MODEL_ID` / `BEDROCK_REGION`) — no API contract change.
-
-**Errors** — a blank prompt returns:
-
-```json
-{ "data": null, "errors": [{ "message": "prompt is required and cannot be empty" }] }
-```
-
----
-
 ## Error handling
 
 GraphQL does **not** use HTTP status codes for field-level problems. A request that
@@ -248,8 +170,8 @@ array; `data` for the failed field is `null`. Always check `errors` before readi
 
 | Situation | How it surfaces |
 |---|---|
-| Validation failure (`title`/`prompt` empty) | HTTP 200, `errors: [{ message }]` from the resolver |
-| Bedrock returned nothing (`askAi`) | HTTP 200, `errors: [{ message: "Bedrock returned an empty response" }]` |
+| Validation failure (`title`, `userId`, or `query` empty) | HTTP 200, `errors: [{ message }]` from the resolver |
+| Bedrock or KB failure (`generateTaskSteps`) | HTTP 200, `errors: [{ message }]` from the resolver |
 | Missing/invalid/expired API key | HTTP 401, `{ "errors": [{ "errorType": "UnauthorizedException" }] }` |
 | Malformed query / unknown field | HTTP 200 (or 400), `errors` with a parse/validation message |
 
@@ -274,16 +196,6 @@ export interface CreateTaskInput {
   description?: string;
 }
 
-export interface AskAiInput {
-  prompt: string;
-}
-
-export interface AiResponse {
-  text: string;
-  model: string;
-  inputTokens: number | null;
-  outputTokens: number | null;
-}
 ```
 
 ---
@@ -296,4 +208,4 @@ These are planned but not implemented — don't build against them:
 - **Update / delete task** mutations.
 - **Cognito auth** — the API currently uses an API key; user-scoped auth is the
   planned replacement.
-- **Streaming AI responses** — `askAi` is request/response only.
+- **Streaming AI responses** — `generateTaskSteps` is request/response only.
