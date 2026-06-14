@@ -1,6 +1,7 @@
 node_modules/
 dist/
 cdk.out/
+data/corpus/dist/
 *.js.map
 *.d.ts
 .env
