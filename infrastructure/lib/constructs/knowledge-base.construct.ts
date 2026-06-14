@@ -64,6 +64,7 @@ export class KnowledgeBase extends Construct {
     const vectorBucket = new s3vectors.CfnVectorBucket(this, 'VectorBucket', {
       vectorBucketName,
     });
+    vectorBucket.applyRemovalPolicy(removalPolicy);
     const vectorIndex = new s3vectors.CfnIndex(this, 'VectorIndex', {
       indexName: 'canplan-kb-index',
       vectorBucketName,
@@ -71,6 +72,7 @@ export class KnowledgeBase extends Construct {
       dimension: 1024, // titan-embed-text-v2 default output dimension
       distanceMetric: 'cosine',
     });
+    vectorIndex.applyRemovalPolicy(removalPolicy);
     vectorIndex.addDependency(vectorBucket);
     kbRole.addToPolicy(
       new iam.PolicyStatement({

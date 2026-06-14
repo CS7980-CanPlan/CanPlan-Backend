@@ -45,8 +45,9 @@ if (require.main === module) {
     .map((l) => JSON.parse(l) as CorpusLine);
   rmSync(outDir, { recursive: true, force: true });
   mkdirSync(outDir, { recursive: true });
-  for (const f of toCorpusFiles(lines)) {
+  const files = toCorpusFiles(lines);
+  for (const f of files) {
     writeFileSync(join(outDir, f.key), f.body);
   }
-  console.log(`wrote ${toCorpusFiles(lines).length} files for ${lines.length} passages to ${outDir}`);
+  console.log(`wrote ${files.length} files for ${lines.length} passages to ${outDir}`);
 }
