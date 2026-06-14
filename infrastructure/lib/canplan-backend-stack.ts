@@ -54,7 +54,6 @@ export class CanPlanBackendStack extends cdk.Stack {
       envName,
       userPool: auth.userPool,
       createTaskFn: functions.createTaskFn,
-      askAiFn: functions.askAiFn,
       generateTaskStepsFn: functions.generateTaskStepsFn,
     });
 

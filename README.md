@@ -56,9 +56,6 @@ canplan-backend/
 │   │   ├── createTask/
 │   │   │   ├── handler.ts      # Lambda function logic
 │   │   │   └── handler.test.ts # Unit tests
-│   │   ├── askAi/
-│   │   │   ├── handler.ts      # Bedrock (Converse) Lambda logic
-│   │   │   └── handler.test.ts # Unit tests
 │   │   └── generateTaskSteps/
 │   │       ├── handler.ts      # KB Retrieve → Converse → cited steps
 │   │       └── handler.test.ts # Unit tests
@@ -291,8 +288,8 @@ each step citing the corpus chunk(s) it came from.
 
 ### Two-region layout
 
-As with `askAi`, all Bedrock calls run in `us-east-1` while the rest of the
-backend stays in `ca-central-1`. But a Knowledge Base is a *deployed* resource
+All Bedrock calls run in `us-east-1` while the rest of the backend stays in
+`ca-central-1`. But a Knowledge Base is a *deployed* resource
 (not just a runtime API call), and one CDK stack deploys to one region — so the KB
 lives in its own stack pinned to `us-east-1`:
 
@@ -416,9 +413,8 @@ your machine — see [Deploying to an AWS Sandbox](#deploying-to-an-aws-sandbox)
 - DynamoDB table `CanPlanTasks-<env>` with pay-per-request billing
 - S3 bucket for future media storage
 - `createTask` Lambda with input validation
-- `askAi` Lambda calling Claude Sonnet 4.6 on Amazon Bedrock via the Converse API — inference runs in `us-east-1` (the US inference profile `us.anthropic.claude-sonnet-4-6`) while the rest of the stack stays in `ca-central-1`; region/model are configurable via `BEDROCK_REGION` / `BEDROCK_MODEL_ID`
 - `generateTaskSteps` Lambda — RAG over a dedicated Bedrock Knowledge Base (OpenSearch Serverless + titan-embed-text-v2, in its own `us-east-1` stack) returning ordered, source-cited steps for a task; see [Step generation with a Bedrock Knowledge Base](#step-generation-with-a-bedrock-knowledge-base)
-- AppSync GraphQL API with `createTask`, `askAi`, and `generateTaskSteps` mutations and a `healthCheck` query
+- AppSync GraphQL API with `createTask` and `generateTaskSteps` mutations and a `healthCheck` query
 - Amazon Cognito User Pool (email sign-in, self sign-up, email verification, password reset) authorizing the API, with `PrimaryUser` / `SupportPerson` / `OrganizationAdmin` / `SystemAdmin` role groups — see [Authentication setup](#authentication-setup)
 - CloudWatch log retention (7 days)
 - Jest unit tests with DynamoDB mocked

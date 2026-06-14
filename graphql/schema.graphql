@@ -10,17 +10,6 @@ input CreateTaskInput {
   description: String
 }
 
-input AskAiInput {
-  prompt: String!
-}
-
-type AiResponse {
-  text: String!
-  model: String!
-  inputTokens: Int
-  outputTokens: Int
-}
-
 input QueryContext {
   role: String
   organizationId: String
@@ -53,8 +42,6 @@ type TaskStepsResponse {
 
 type Mutation {
   createTask(input: CreateTaskInput!): Task!
-  # Send user text to a Claude model on Amazon Bedrock and return its reply
-  askAi(input: AskAiInput!): AiResponse!
   # Break a daily-living task into ordered, source-cited steps via Bedrock KB + RAG
   generateTaskSteps(input: GenerateTaskStepsInput!): TaskStepsResponse!
 }

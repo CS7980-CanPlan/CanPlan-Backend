@@ -3,13 +3,13 @@ import { Construct } from 'constructs';
 /**
  * AI configuration for CanPlan: resolves the Bedrock model id and the region
  * Bedrock Runtime is called in. The rest of the stack stays in ca-central-1,
- * but inference runs in us-east-1 where the US Claude inference profile lives.
- * A home for future AI resources (e.g. a Bedrock Knowledge Base).
+ * but generation runs in us-east-1 where the US Claude inference profile lives.
+ * The current AI path is generateTaskSteps: KB Retrieve followed by Converse.
  */
 export class Ai extends Construct {
-  /** Bedrock model / inference-profile id the askAi Lambda invokes. */
+  /** Bedrock model / inference-profile id the generateTaskSteps Lambda invokes. */
   public readonly bedrockModelId: string;
-  /** Region the askAi Lambda calls Bedrock Runtime in (not the stack region). */
+  /** Region the generateTaskSteps Lambda calls Bedrock in (not the stack region). */
   public readonly bedrockRegion: string;
 
   constructor(scope: Construct, id: string) {
