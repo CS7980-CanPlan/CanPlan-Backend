@@ -21,7 +21,12 @@ export class Ai extends Construct {
       this.node.tryGetContext('bedrockModelId') ?? 'us.anthropic.claude-sonnet-4-6';
 
     // The US inference profile is served from us-east-1; the backend stack stays
-    // in ca-central-1. Override with --context bedrockRegion=...
+    // in ca-central-1. This region is also where the generateTaskSteps Lambda
+    // calls KB Retrieve (runtime client + Retrieve IAM ARN). NOTE: it does NOT
+    // move the physically-deployed Knowledge Base — that lives in its own stack
+    // pinned to us-east-1 (see knowledge-base-stack.ts). Overriding
+    // --context bedrockRegion=... moves inference + the Retrieve target, so it
+    // must stay in sync with the KB stack's region or Retrieve will miss the KB.
     this.bedrockRegion = this.node.tryGetContext('bedrockRegion') ?? 'us-east-1';
   }
 }
