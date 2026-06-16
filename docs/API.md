@@ -91,6 +91,22 @@ backs the SystemAdmin list-all APIs without a Scan).
 
 ---
 
+## Enums
+
+| Enum | Values |
+|---|---|
+| `UserRole` | `PRIMARY_USER`, `SUPPORT_PERSON`, `ORG_ADMIN` |
+| `TaskStatus` | `DRAFT`, `ACTIVE`, `ARCHIVED` |
+| `AssignmentStatus` | `ACTIVE`, `COMPLETED`, `PAUSED`, `CANCELLED` |
+| `ProgressEventType` | `STARTED`, `PAUSED`, `RESUMED`, `SKIPPED`, `COMPLETED`, `SYNCED` |
+| `MediaType` | `IMAGE`, `AUDIO`, `VIDEO` |
+| `SupportLinkStatus` | `PENDING`, `ACTIVE`, `REVOKED` |
+
+Free-form object fields (`accessibilitySettings`, `permissions`, `metadata`) are the
+AppSync `AWSJSON` scalar — send/receive them as JSON objects.
+
+---
+
 ## Operations
 
 ### `healthCheck` — query
@@ -164,14 +180,17 @@ mutation CreateTask($input: CreateTaskInput!) {
 }
 ```
 
-Steps come back keyed `STEP#001`, `STEP#002`, `STEP#003` and are returned in order.
+The created steps are returned in `order` (`1`, `2`, `3`, …) — clients work with the
+`order` field, not the internal `STEP#NNN` sort key.
 
 ---
 
 ### Other operations
 
-These follow the same request/response conventions. See
-[schema.graphql](../graphql/schema.graphql) for exact field types and nullability.
+These follow the same request/response conventions. `create…`/`update…` are
+mutations; `get…`/`list…` are queries. In the **Input** columns below, required
+fields are marked `!` and everything else is optional; see
+[schema.graphql](../graphql/schema.graphql) for full nullability of the returned types.
 
 > **All `list*` queries are paginated.** Each accepts optional `limit` (page size)
 > and `nextToken`, and returns a `{ items, nextToken }` **connection** (e.g.
@@ -182,41 +201,41 @@ These follow the same request/response conventions. See
 
 **Users & support**
 
-| Operation | Kind | Purpose / access pattern |
+| Operation | Input | Returns |
 |---|---|---|
-| `createUserProfile(input)` | mutation | Create a `UserProfile` (`USER#<id>` / `#PROFILE`) |
-| `getUserProfile(userId)` | query | GetItem the profile |
-| `listUsersByOrganization(organizationId)` | query | Query `orgIndex` — lightweight roster (`userId`, `displayName`, `role`) |
-| `createSupportLink(input)` | mutation | Link a supporter to a primary user |
-| `listPrimaryUsersBySupporter(supporterId)` | query | Query `supporterIndex` — users a supporter manages |
+| `createUserProfile` | `input: { userId!, role!, displayName, email, organizationId, accessibilitySettings }` | `UserProfile` |
+| `getUserProfile` | `userId!` | `UserProfile` · `null` if not found |
+| `listUsersByOrganization` | `organizationId!, limit, nextToken` | `UserProfileConnection!` — **roster only**: just `userId`, `displayName`, `role` are populated (orgIndex projection); other fields are `null` |
+| `createSupportLink` | `input: { supporterId!, primaryUserId!, status, permissions }` | `SupportLink` · `status` defaults to `PENDING` |
+| `listPrimaryUsersBySupporter` | `supporterId!, limit, nextToken` | `SupportLinkConnection!` |
 
 **Tasks & steps**
 
-| Operation | Kind | Purpose / access pattern |
+| Operation | Input | Returns |
 |---|---|---|
-| `getTask(taskId)` | query | GetItem the task `#META` |
-| `listTaskSteps(taskId)` | query | Query `STEP#` rows under the task, in order |
-| `listTasksByOwner(ownerId)` | query | Query `taskOwnerIndex` |
-| `createTaskStep(input)` | mutation | Add a single step (`taskId`, `order`, `text`) to a task |
+| `getTask` | `taskId!` | `Task` · `null` if not found · `steps` is `null` here (use `listTaskSteps`) |
+| `listTaskSteps` | `taskId!, limit, nextToken` | `TaskStepConnection!` — steps in ascending `order` |
+| `listTasksByOwner` | `ownerId!, limit, nextToken` | `TaskConnection!` |
+| `createTaskStep` | `input: { taskId!, order!, text!, mediaRefs, expectedDuration }` | `TaskStep` |
 
 **Assignments**
 
-| Operation | Kind | Purpose / access pattern |
+| Operation | Input | Returns |
 |---|---|---|
-| `createAssignment(input)` | mutation | Assign a task to a user (`USER#<userId>` / `ASSIGN#<assignmentId>`) |
-| `updateAssignmentStatus(input)` | mutation | Update an assignment's `status` / `active` |
-| `listAssignmentsForUser(userId)` | query | Query `ASSIGN#` rows under the user |
+| `createAssignment` | `input: { taskId!, userId!, assignedBy, dueDate, recurrence, scheduleRule, active, status }` | `Assignment` · `active` defaults `true`, `status` defaults `ACTIVE` |
+| `updateAssignmentStatus` | `input: { userId!, assignmentId!, status!, active }` | `Assignment` · **needs both `userId` and `assignmentId`** (they form the item key); errors if the assignment doesn't exist |
+| `listAssignmentsForUser` | `userId!, limit, nextToken` | `AssignmentConnection!` |
 
 **Progress (append-only) & media**
 
-| Operation | Kind | Purpose / access pattern |
+| Operation | Input | Returns |
 |---|---|---|
-| `createProgressEvent(input)` | mutation | Append a progress event (offline-sync friendly) |
-| `listProgressEventsForUser(userId, assignmentId?)` | query | Query `PROGRESS#` rows; optionally filter by assignment |
-| `createMediaUploadUrl(input)` | mutation | Mint a presigned S3 **PUT** URL + server-owned `s3Key` |
-| `createMediaAsset(input)` | mutation | Register metadata for an uploaded `IMAGE` / `AUDIO` / `VIDEO` asset |
-| `getMediaDownloadUrl(taskId, assetId)` | query | Presigned **GET** URL to view/download a private asset |
-| `listMediaForTask(taskId)` | query | Query `MEDIA#` rows under the task |
+| `createProgressEvent` | `input: { userId!, eventType!, assignmentId, taskId, timestamp, source, metadata }` | `ProgressEvent` · append-only; `timestamp` defaults to now |
+| `listProgressEventsForUser` | `userId!, assignmentId, limit, nextToken` | `ProgressEventConnection!` — optional `assignmentId` filter |
+| `createMediaUploadUrl` | `input: { taskId!, contentType!, fileName }` | `MediaUploadTarget` — see flow below |
+| `createMediaAsset` | `input: { taskId!, s3Key!, type!, mimeType!, ownerId!, size, stepId }` | `MediaAsset` — see flow below |
+| `getMediaDownloadUrl` | `taskId!, assetId!` | `MediaDownloadTarget` — see flow below |
+| `listMediaForTask` | `taskId!, limit, nextToken` | `MediaAssetConnection!` |
 
 > **Media is upload-first.** Binaries live in the S3 media bucket; DynamoDB stores
 > only the `s3Key` and metadata (`type`, `mimeType`, `ownerId`, `size`, optional
