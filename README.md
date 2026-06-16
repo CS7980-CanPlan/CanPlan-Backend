@@ -6,17 +6,29 @@ backed by OpenSearch Serverless.
 
 ## Current API
 
-The GraphQL schema is in [graphql/schema.graphql](graphql/schema.graphql).
+The GraphQL schema is in [graphql/schema.graphql](graphql/schema.graphql) and the
+frontend-facing reference is [docs/API.md](docs/API.md).
 
-| Operation | Type | Backing service |
+CanPlan uses a **single DynamoDB table** (`CanPlanTasks-<env>`, composite `PK`/`SK`)
+for every entity — UserProfile, SupportLink, Task, TaskStep, Assignment,
+ProgressEvent, MediaAsset, Report. The item-key conventions live in
+[src/shared/keys.ts](src/shared/keys.ts).
+
+| Operation(s) | Type | Backing service |
 | --------- | ---- | --------------- |
 | `healthCheck` | Query | AppSync none data source |
-| `createTask` | Mutation | `canplan-createTask-<env>` Lambda + DynamoDB |
+| `createTask` | Mutation | `canplan-createTask-<env>` Lambda (writes Task + steps atomically) |
+| `createUserProfile`, `createSupportLink`, `getUserProfile`, `listUsersByOrganization`, `listPrimaryUsersBySupporter` | Query/Mutation | `canplan-users-<env>` Lambda + DynamoDB |
+| `getTask`, `listTaskSteps`, `listTasksByOwner`, `createTaskStep` | Query/Mutation | `canplan-tasks-<env>` Lambda + DynamoDB |
+| `createAssignment`, `updateAssignmentStatus`, `listAssignmentsForUser` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB |
+| `createProgressEvent`, `listProgressEventsForUser` | Query/Mutation | `canplan-progress-<env>` Lambda + DynamoDB |
+| `createMediaAsset`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB |
 | `generateTaskSteps` | Mutation | `canplan-generateTaskSteps-<env>` Lambda + Bedrock KB RAG |
 
-There is no standalone `askAi` mutation. AI usage is through `generateTaskSteps`:
-retrieve relevant corpus passages from the Knowledge Base, then call Bedrock
-Converse to generate cited task steps.
+Domain Lambdas back several fields each, routing on the resolved GraphQL field
+(`event.info.fieldName`). AI usage is through `generateTaskSteps`: retrieve relevant
+corpus passages from the Knowledge Base, then call Bedrock Converse to generate
+cited task steps.
 
 AppSync default authorization is Cognito User Pool auth. An API key is configured
 as an additional auth mode, but the current schema does not add `@aws_api_key`
@@ -28,7 +40,7 @@ The app deploys two CDK stacks with `--all`.
 
 | Region | Stack | Main resources |
 | ------ | ----- | -------------- |
-| `CANPLAN_BACKEND_REGION` default `ca-central-1` | `canplan-backend-<env>` | AppSync, Cognito, DynamoDB `CanPlanTasks-<env>`, media S3 bucket, `createTask` Lambda, `generateTaskSteps` Lambda, CloudWatch logs |
+| `CANPLAN_BACKEND_REGION` default `ca-central-1` | `canplan-backend-<env>` | AppSync, Cognito, single-table DynamoDB `CanPlanTasks-<env>`, media S3 bucket, `createTask` + domain Lambdas (`users`/`tasks`/`assignments`/`progress`/`media`) + `generateTaskSteps` Lambda, CloudWatch logs |
 | `CANPLAN_KNOWLEDGE_BASE_REGION` default `us-east-1` | `canplan-knowledge-base-<env>` | Bedrock Knowledge Base, S3 corpus bucket, Bedrock S3 data source, OpenSearch Serverless vector collection/index |
 
 `generateTaskSteps` runs in `ca-central-1` by default, but calls Bedrock Agent
@@ -41,7 +53,7 @@ region:
 
 | Region | Lambda functions you should expect |
 | ------ | ---------------------------------- |
-| Backend region | `canplan-createTask-<env>`, `canplan-generateTaskSteps-<env>`, CDK cross-region reader, sandbox S3 auto-delete helper |
+| Backend region | `canplan-createTask-<env>`, `canplan-users-<env>`, `canplan-tasks-<env>`, `canplan-assignments-<env>`, `canplan-progress-<env>`, `canplan-media-<env>`, `canplan-generateTaskSteps-<env>`, CDK cross-region reader, sandbox S3 auto-delete helper |
 | Knowledge Base region | OpenSearch index custom-resource provider, bucket deployment helper, CDK cross-region writer, sandbox S3 auto-delete helper |
 
 ## Prerequisites
@@ -213,8 +225,10 @@ infrastructure/lib/canplan-backend-stack.ts    Backend stack
 infrastructure/lib/knowledge-base-stack.ts     Knowledge Base stack
 infrastructure/lib/constructs/                 CDK constructs
 scripts/build-corpus.ts                        seed.jsonl -> data/corpus/dist
-src/lambdas/createTask/handler.ts              createTask resolver
+src/lambdas/createTask/handler.ts              createTask resolver (Task + steps)
+src/lambdas/{users,tasks,assignments,progress,media}/handler.ts   Domain resolvers (routed by fieldName)
 src/lambdas/generateTaskSteps/handler.ts       KB Retrieve -> Converse resolver
+src/shared/keys.ts                             Single-table PK/SK + entityType conventions
 src/shared/                                    Shared AWS clients/types/helpers
 docs/API.md                                    Frontend API reference
 ```

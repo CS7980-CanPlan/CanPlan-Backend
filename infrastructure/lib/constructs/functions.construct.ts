@@ -9,8 +9,8 @@ import * as path from 'path';
 
 export interface FunctionsProps {
   readonly envName: string;
-  /** Tasks table the createTask Lambda writes to. */
-  readonly tasksTable: dynamodb.ITable;
+  /** Single-table store the data Lambdas read from / write to. */
+  readonly table: dynamodb.ITable;
   /** Bedrock model id passed to the generateTaskSteps Lambda. */
   readonly bedrockModelId: string;
   /** Region the generateTaskSteps Lambda calls Bedrock in (e.g. us-east-1). */
@@ -23,28 +23,50 @@ export interface FunctionsProps {
 export class Functions extends Construct {
   public readonly createTaskFn: NodejsFunction;
   public readonly generateTaskStepsFn: NodejsFunction;
+  /** Domain Lambdas — each backs several fields of one domain (routed by fieldName). */
+  public readonly usersFn: NodejsFunction;
+  public readonly tasksFn: NodejsFunction;
+  public readonly assignmentsFn: NodejsFunction;
+  public readonly progressFn: NodejsFunction;
+  public readonly mediaFn: NodejsFunction;
 
   constructor(scope: Construct, id: string, props: FunctionsProps) {
     super(scope, id);
 
-    const { envName, tasksTable, bedrockModelId, bedrockRegion, knowledgeBaseId } = props;
+    const { envName, table, bedrockModelId, bedrockRegion, knowledgeBaseId } = props;
 
-    // ── createTask ────────────────────────────────────────────────────────────
-    this.createTaskFn = new NodejsFunction(this, 'CreateTaskFunction', {
-      functionName: `canplan-createTask-${envName}`,
-      entry: path.join(__dirname, '../../../src/lambdas/createTask/handler.ts'),
-      handler: 'handler',
-      runtime: lambda.Runtime.NODEJS_20_X,
-      environment: {
-        DYNAMODB_TABLE_NAME: tasksTable.tableName,
-        AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
-      },
-      logRetention: logs.RetentionDays.ONE_WEEK,
-      timeout: cdk.Duration.seconds(10),
-    });
+    // Shared factory for a DynamoDB-backed resolver Lambda. Each gets the table
+    // name in its env and connection reuse enabled.
+    const dataFn = (construct: string, fnName: string, dir: string): NodejsFunction =>
+      new NodejsFunction(this, construct, {
+        functionName: `canplan-${fnName}-${envName}`,
+        entry: path.join(__dirname, `../../../src/lambdas/${dir}/handler.ts`),
+        handler: 'handler',
+        runtime: lambda.Runtime.NODEJS_20_X,
+        environment: {
+          DYNAMODB_TABLE_NAME: table.tableName,
+          AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
+        },
+        logRetention: logs.RetentionDays.ONE_WEEK,
+        timeout: cdk.Duration.seconds(10),
+      });
 
-    // Least-privilege: write-only access to the tasks table.
-    tasksTable.grantWriteData(this.createTaskFn);
+    // ── createTask ──────────────────────────────────────────────────────────────
+    // Writes a Task #META item plus its TaskStep items in one transaction.
+    this.createTaskFn = dataFn('CreateTaskFunction', 'createTask', 'createTask');
+    table.grantWriteData(this.createTaskFn);
+
+    // ── Domain Lambdas (read + write the single table, incl. its GSIs) ──────────
+    this.usersFn = dataFn('UsersFunction', 'users', 'users');
+    this.tasksFn = dataFn('TasksFunction', 'tasks', 'tasks');
+    this.assignmentsFn = dataFn('AssignmentsFunction', 'assignments', 'assignments');
+    this.progressFn = dataFn('ProgressFunction', 'progress', 'progress');
+    this.mediaFn = dataFn('MediaFunction', 'media', 'media');
+
+    for (const fn of [this.usersFn, this.tasksFn, this.assignmentsFn, this.progressFn, this.mediaFn]) {
+      // grantReadWriteData also covers the table's GSIs (table-arn/index/*).
+      table.grantReadWriteData(fn);
+    }
 
     // ── generateTaskSteps (Bedrock KB + RAG) ────────────────────────────────────
     this.generateTaskStepsFn = new NodejsFunction(this, 'GenerateTaskStepsFunction', {

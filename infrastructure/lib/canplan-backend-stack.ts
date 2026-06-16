@@ -45,7 +45,7 @@ export class CanPlanBackendStack extends cdk.Stack {
     // Compute — Lambdas depend on the table and the resolved Bedrock config
     const functions = new Functions(this, 'Functions', {
       envName,
-      tasksTable: database.tasksTable,
+      table: database.table,
       bedrockModelId: ai.bedrockModelId,
       bedrockRegion: ai.bedrockRegion,
       knowledgeBaseId,
@@ -57,6 +57,11 @@ export class CanPlanBackendStack extends cdk.Stack {
       userPool: auth.userPool,
       createTaskFn: functions.createTaskFn,
       generateTaskStepsFn: functions.generateTaskStepsFn,
+      usersFn: functions.usersFn,
+      tasksFn: functions.tasksFn,
+      assignmentsFn: functions.assignmentsFn,
+      progressFn: functions.progressFn,
+      mediaFn: functions.mediaFn,
     });
 
     // ── Outputs ───────────────────────────────────────────────────────────────
@@ -66,7 +71,7 @@ export class CanPlanBackendStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'UserPoolId', { value: auth.userPool.userPoolId });
     new cdk.CfnOutput(this, 'UserPoolClientId', { value: auth.userPoolClient.userPoolClientId });
     new cdk.CfnOutput(this, 'AwsRegion', { value: this.region });
-    new cdk.CfnOutput(this, 'TasksTableName', { value: database.tasksTable.tableName });
+    new cdk.CfnOutput(this, 'TasksTableName', { value: database.table.tableName });
     new cdk.CfnOutput(this, 'BedrockModelId', { value: ai.bedrockModelId });
     new cdk.CfnOutput(this, 'BedrockRegion', { value: ai.bedrockRegion });
   }

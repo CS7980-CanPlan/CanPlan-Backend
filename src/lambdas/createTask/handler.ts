@@ -1,29 +1,85 @@
 import { randomUUID } from 'crypto';
-import { PutCommand } from '@aws-sdk/lib-dynamodb';
-import { dynamo, TASKS_TABLE } from '../../shared/dynamodb';
+import { TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
+import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
+import { ENTITY, META_SK, stepSk, taskPk } from '../../shared/keys';
 import { ValidationError } from '../../shared/response';
-import type { AppSyncEvent, CreateTaskInput, Task } from '../../shared/types';
+import type { AppSyncEvent, CreateTaskInput, Task, TaskStep } from '../../shared/types';
 
+/**
+ * createTask — create a reusable task template owned by a SupportPerson or
+ * OrgAdmin. Writes one Task `#META` item plus one TaskStep item per nested step,
+ * each as a separate row (never an embedded array). Task and step writes happen
+ * in a single transaction so a task never lands without its steps.
+ *
+ * Assignment creation is a separate operation (createAssignment) — not done here.
+ */
 export const handler = async (event: AppSyncEvent<{ input: CreateTaskInput }>): Promise<Task> => {
   const { input } = event.arguments;
 
+  if (!input?.ownerId?.trim()) {
+    throw new ValidationError('ownerId is required and cannot be empty');
+  }
   if (!input?.title?.trim()) {
     throw new ValidationError('title is required and cannot be empty');
   }
 
+  const taskId = randomUUID();
+  const now = new Date().toISOString();
+
   const task: Task = {
-    taskId: randomUUID(),
+    taskId,
+    ownerId: input.ownerId.trim(),
     title: input.title.trim(),
+    categoryId: input.categoryId?.trim(),
     description: input.description?.trim(),
-    createdAt: new Date().toISOString(),
+    scheduleRule: input.scheduleRule?.trim(),
+    status: input.status ?? 'DRAFT',
+    createdAt: now,
+    updatedAt: now,
   };
 
+  // Each nested step becomes its own TaskStep item with a 1-based, zero-padded order.
+  const steps: TaskStep[] = (input.steps ?? []).map((step, index) => {
+    if (!step?.text?.trim()) {
+      throw new ValidationError(`step ${index + 1}: text is required and cannot be empty`);
+    }
+    return {
+      stepId: randomUUID(),
+      taskId,
+      order: index + 1,
+      text: step.text.trim(),
+      mediaRefs: step.mediaRefs,
+      expectedDuration: step.expectedDuration,
+      createdAt: now,
+      updatedAt: now,
+    };
+  });
+
   await dynamo.send(
-    new PutCommand({
-      TableName: TASKS_TABLE,
-      Item: task,
+    new TransactWriteCommand({
+      TransactItems: [
+        {
+          Put: {
+            TableName: TABLE_NAME,
+            Item: { PK: taskPk(taskId), SK: META_SK, entityType: ENTITY.TASK, ...task },
+          },
+        },
+        ...steps.map((step) => ({
+          Put: {
+            TableName: TABLE_NAME,
+            Item: {
+              PK: taskPk(taskId),
+              SK: stepSk(step.order),
+              entityType: ENTITY.TASK_STEP,
+              ...step,
+            },
+          },
+        })),
+      ],
     }),
   );
 
-  return task;
+  // Return the created task with the steps it just wrote (clients can also fetch
+  // them later via the listTaskSteps query).
+  return { ...task, steps };
 };
