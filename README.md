@@ -22,7 +22,7 @@ ProgressEvent, MediaAsset, Report. The item-key conventions live in
 | `getTask`, `listTaskSteps`, `listTasksByOwner`, `createTaskStep` | Query/Mutation | `canplan-tasks-<env>` Lambda + DynamoDB |
 | `createAssignment`, `updateAssignmentStatus`, `listAssignmentsForUser` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB |
 | `createProgressEvent`, `listProgressEventsForUser` | Query/Mutation | `canplan-progress-<env>` Lambda + DynamoDB |
-| `createMediaAsset`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB |
+| `createMediaUploadUrl`, `createMediaAsset`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB + S3 media bucket (presigned upload) |
 | `listAllUsers`, `listAllTasks` | Query | `canplan-admin-<env>` Lambda + DynamoDB `entityTypeIndex` (SystemAdmin only, paginated) |
 | `generateTaskSteps` | Mutation | `canplan-generateTaskSteps-<env>` Lambda + Bedrock KB RAG |
 
@@ -249,7 +249,8 @@ src/lambdas/admin/handler.ts                   SystemAdmin list-all-by-entityTyp
 src/lambdas/generateTaskSteps/handler.ts       KB Retrieve -> Converse resolver
 src/shared/keys.ts                             Single-table PK/SK + entityType conventions
 src/shared/{auth,pagination}.ts                Cognito group checks + nextToken cursors
-src/shared/                                    Shared AWS clients/types/helpers
+src/shared/{dynamodb,s3,bedrock,kb}.ts         Shared AWS clients (s3 = media presign)
+src/shared/                                    Shared types/helpers
 docs/API.md                                    Frontend API reference
 ```
 

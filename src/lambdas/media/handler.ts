@@ -1,21 +1,36 @@
 import { randomUUID } from 'crypto';
+import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { PutCommand } from '@aws-sdk/lib-dynamodb';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import { ENTITY, MEDIA_PREFIX, mediaSk, taskPk } from '../../shared/keys';
 import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
 import { ValidationError } from '../../shared/response';
-import type { AppSyncEvent, Connection, CreateMediaAssetInput, MediaAsset } from '../../shared/types';
+import { MEDIA_BUCKET, s3, UPLOAD_URL_TTL_SECONDS } from '../../shared/s3';
+import type {
+  AppSyncEvent,
+  Connection,
+  CreateMediaAssetInput,
+  CreateMediaUploadUrlInput,
+  MediaAsset,
+  MediaUploadTarget,
+} from '../../shared/types';
 
 /**
- * Media domain Lambda — record metadata for a media asset (IMAGE / AUDIO / VIDEO)
- * and list a task's media. The binary stays in S3; DynamoDB only stores the s3Key
- * and descriptive metadata. Routed by GraphQL field.
+ * Media domain Lambda — mint a presigned S3 upload URL, record metadata for a media
+ * asset (IMAGE / AUDIO / VIDEO), and list a task's media. The binary stays in S3;
+ * DynamoDB only stores the s3Key and descriptive metadata. Routed by GraphQL field.
+ *
+ * Upload flow: createMediaUploadUrl → client PUTs the file to the returned uploadUrl
+ * → createMediaAsset registers the metadata for the now-uploaded object.
  */
 export const handler = async (
   event: AppSyncEvent<Record<string, unknown>>,
-): Promise<MediaAsset | Connection<MediaAsset>> => {
+): Promise<MediaAsset | Connection<MediaAsset> | MediaUploadTarget> => {
   const { arguments: args } = event;
   switch (event.info?.fieldName) {
+    case 'createMediaUploadUrl':
+      return createMediaUploadUrl(args.input as CreateMediaUploadUrlInput);
     case 'createMediaAsset':
       return createMediaAsset(args.input as CreateMediaAssetInput);
     case 'listMediaForTask':
@@ -24,6 +39,38 @@ export const handler = async (
       throw new Error(`media handler: unsupported field "${event.info?.fieldName}"`);
   }
 };
+
+async function createMediaUploadUrl(input: CreateMediaUploadUrlInput): Promise<MediaUploadTarget> {
+  const taskId = input?.taskId?.trim();
+  const contentType = input?.contentType?.trim();
+  if (!taskId) throw new ValidationError('taskId is required and cannot be empty');
+  if (!contentType) throw new ValidationError('contentType is required (e.g. image/png)');
+
+  // Server-owned key under the task's prefix; the random id avoids collisions and
+  // keeps clients from choosing arbitrary paths.
+  const ext = fileExtension(input.fileName, contentType);
+  const s3Key = `media/${taskId}/${randomUUID()}${ext ? `.${ext}` : ''}`;
+
+  // Presigning is a local signing operation (no S3 call). The URL inherits this
+  // Lambda's s3:PutObject permission, scoped by the bucket policy + the key above.
+  const uploadUrl = await getSignedUrl(
+    s3,
+    new PutObjectCommand({ Bucket: MEDIA_BUCKET, Key: s3Key, ContentType: contentType }),
+    { expiresIn: UPLOAD_URL_TTL_SECONDS },
+  );
+
+  return { uploadUrl, s3Key, expiresIn: UPLOAD_URL_TTL_SECONDS };
+}
+
+/** Best-effort file extension: prefer the fileName's, fall back to the content subtype. */
+function fileExtension(fileName: string | undefined, contentType: string): string | undefined {
+  if (fileName && fileName.includes('.')) {
+    const ext = fileName.split('.').pop()?.trim().toLowerCase();
+    if (ext) return ext;
+  }
+  const subtype = contentType.split('/')[1]?.split(';')[0]?.trim().toLowerCase();
+  return subtype || undefined;
+}
 
 async function createMediaAsset(input: CreateMediaAssetInput): Promise<MediaAsset> {
   const taskId = input?.taskId?.trim();

@@ -178,6 +178,20 @@ export interface CreateMediaAssetInput {
   size?: number;
 }
 
+export interface CreateMediaUploadUrlInput {
+  taskId: string;
+  contentType: string;
+  fileName?: string;
+}
+
+// Returned by createMediaUploadUrl: a presigned PUT URL the client uploads the
+// binary to, plus the s3Key to pass back to createMediaAsset once the upload lands.
+export interface MediaUploadTarget {
+  uploadUrl: string;
+  s3Key: string;
+  expiresIn: number;
+}
+
 // Cognito User Pool identity AppSync passes to a Lambda resolver. `groups` is the
 // caller's Cognito groups surfaced as a top-level array; the raw claim lives under
 // claims['cognito:groups'].

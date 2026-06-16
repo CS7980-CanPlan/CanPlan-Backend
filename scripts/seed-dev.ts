@@ -1,30 +1,25 @@
 /**
- * Seed the dev DynamoDB table with a small single-table sample: a support person,
- * a primary user, the support link between them, a task template with steps, an
- * assignment of that task to the primary user, a progress event, and a media asset.
+ * Seed the dev DynamoDB table with sample CONTENT: one reusable task template and
+ * its ordered steps.
+ *
+ * A task template is the only entity that doesn't depend on a real account or file:
+ *   - UserProfile / SupportLink / Assignment / ProgressEvent are all tied to Cognito
+ *     users (created via sign-up), so seeding them would create orphan rows for users
+ *     that don't exist in the User Pool.
+ *   - MediaAsset only stores an `s3Key`; seeding one points at an S3 object that was
+ *     never uploaded. Real flow: upload the binary to the media bucket first, THEN
+ *     call createMediaAsset.
+ * None of those are seeded here.
  *
  * Run with: npx ts-node scripts/seed-dev.ts
- * Requires AWS credentials, and DYNAMODB_TABLE_NAME set to the deployed table
- * (e.g. CanPlanTasks-sandbox). The table lives in the backend region — override
- * with AWS_REGION if your default profile region isn't ca-central-1.
+ * Requires AWS credentials; set DYNAMODB_TABLE_NAME to the deployed table (e.g.
+ * CanPlanTasks-sandbox). Override AWS_REGION if your profile's default isn't ca-central-1.
  */
 
 import { randomUUID } from 'crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
-import {
-  assignSk,
-  ENTITY,
-  mediaSk,
-  META_SK,
-  PROFILE_SK,
-  progressSk,
-  stepSk,
-  supporterPk,
-  taskPk,
-  userLinkSk,
-  userPk,
-} from '../src/shared/keys';
+import { ENTITY, META_SK, stepSk, taskPk } from '../src/shared/keys';
 
 // Default to the backend region (ca-central-1), matching src/shared/dynamodb.ts, so
 // the seed targets the right table even if the profile's default region differs.
@@ -35,121 +30,37 @@ const client = DynamoDBDocumentClient.from(
 const TABLE = process.env.DYNAMODB_TABLE_NAME ?? 'CanPlanTasks-dev';
 
 const now = new Date().toISOString();
-const supporterId = 'seed-support-1';
-const primaryUserId = 'seed-primary-1';
 const taskId = randomUUID();
-const assignmentId = randomUUID();
-const eventId = randomUUID();
-const assetId = randomUUID();
-
-// Task steps captured as a list so the media asset below can reference a real stepId.
-const stepItems = [
-  'Wet your hands with warm water',
-  'Add soap and scrub for 20 seconds',
-  'Rinse and dry',
-].map((text, index) => ({
-  PK: taskPk(taskId),
-  SK: stepSk(index + 1),
-  entityType: ENTITY.TASK_STEP,
-  stepId: randomUUID(),
-  taskId,
-  order: index + 1,
-  text,
-  createdAt: now,
-  updatedAt: now,
-}));
+// Placeholder owner. In production this is the Cognito `sub` of the SupportPerson /
+// OrgAdmin who created the template; here it's a known value so you can exercise
+// listTasksByOwner without a real account.
+const ownerId = 'seed-support-1';
 
 const items: Array<Record<string, unknown>> = [
-  {
-    PK: userPk(supporterId),
-    SK: PROFILE_SK,
-    entityType: ENTITY.USER_PROFILE,
-    userId: supporterId,
-    role: 'SUPPORT_PERSON',
-    displayName: 'Sample Supporter',
-    organizationId: 'seed-org-1',
-    createdAt: now,
-    updatedAt: now,
-  },
-  {
-    PK: userPk(primaryUserId),
-    SK: PROFILE_SK,
-    entityType: ENTITY.USER_PROFILE,
-    userId: primaryUserId,
-    role: 'PRIMARY_USER',
-    displayName: 'Sample Primary User',
-    organizationId: 'seed-org-1',
-    createdAt: now,
-    updatedAt: now,
-  },
-  {
-    PK: supporterPk(supporterId),
-    SK: userLinkSk(primaryUserId),
-    entityType: ENTITY.SUPPORT_LINK,
-    supporterId,
-    primaryUserId,
-    userId: primaryUserId,
-    status: 'ACTIVE',
-    createdAt: now,
-    updatedAt: now,
-  },
   {
     PK: taskPk(taskId),
     SK: META_SK,
     entityType: ENTITY.TASK,
     taskId,
-    ownerId: supporterId,
+    ownerId,
     title: 'Wash your hands',
     status: 'ACTIVE',
     createdAt: now,
     updatedAt: now,
   },
-  ...stepItems,
-  {
-    PK: userPk(primaryUserId),
-    SK: assignSk(assignmentId),
-    entityType: ENTITY.ASSIGNMENT,
-    assignmentId,
-    taskId,
-    userId: primaryUserId,
-    assignedBy: supporterId,
-    active: true,
-    status: 'ACTIVE',
-    assignedAt: now,
-    createdAt: now,
-    updatedAt: now,
-  },
-  {
-    // Append-only progress event — ProgressEvent has createdAt but no updatedAt.
-    PK: userPk(primaryUserId),
-    SK: progressSk(now, eventId),
-    entityType: ENTITY.PROGRESS_EVENT,
-    eventId,
-    assignmentId,
-    taskId,
-    userId: primaryUserId,
-    eventType: 'COMPLETED',
-    timestamp: now,
-    source: 'seed',
-    metadata: { note: 'seeded sample event' },
-    createdAt: now,
-  },
-  {
-    // Metadata only — the binary itself would live in the S3 media bucket.
-    PK: taskPk(taskId),
-    SK: mediaSk(assetId),
-    entityType: ENTITY.MEDIA_ASSET,
-    assetId,
-    taskId,
-    stepId: stepItems[0].stepId,
-    s3Key: `media/${taskId}/sample.png`,
-    type: 'IMAGE',
-    mimeType: 'image/png',
-    ownerId: supporterId,
-    size: 2048,
-    createdAt: now,
-    updatedAt: now,
-  },
+  ...['Wet your hands with warm water', 'Add soap and scrub for 20 seconds', 'Rinse and dry'].map(
+    (text, index) => ({
+      PK: taskPk(taskId),
+      SK: stepSk(index + 1),
+      entityType: ENTITY.TASK_STEP,
+      stepId: randomUUID(),
+      taskId,
+      order: index + 1,
+      text,
+      createdAt: now,
+      updatedAt: now,
+    }),
+  ),
 ];
 
 async function seed() {
@@ -158,7 +69,7 @@ async function seed() {
     await client.send(new PutCommand({ TableName: TABLE, Item: item }));
     console.log(`  Put ${item.entityType}: ${item.PK} / ${item.SK}`);
   }
-  console.log('Done.');
+  console.log(`Done. Seeded task ${taskId} (owner ${ownerId}) with ${items.length - 1} steps.`);
 }
 
 seed().catch((err) => {

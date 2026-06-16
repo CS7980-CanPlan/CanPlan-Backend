@@ -1,6 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
@@ -11,6 +12,8 @@ export interface FunctionsProps {
   readonly envName: string;
   /** Single-table store the data Lambdas read from / write to. */
   readonly table: dynamodb.ITable;
+  /** Media bucket the media Lambda mints presigned upload URLs for. */
+  readonly mediaBucket: s3.IBucket;
   /** Bedrock model id passed to the generateTaskSteps Lambda. */
   readonly bedrockModelId: string;
   /** Region the generateTaskSteps Lambda calls Bedrock in (e.g. us-east-1). */
@@ -35,7 +38,7 @@ export class Functions extends Construct {
   constructor(scope: Construct, id: string, props: FunctionsProps) {
     super(scope, id);
 
-    const { envName, table, bedrockModelId, bedrockRegion, knowledgeBaseId } = props;
+    const { envName, table, mediaBucket, bedrockModelId, bedrockRegion, knowledgeBaseId } = props;
 
     // Shared factory for a DynamoDB-backed resolver Lambda. Each gets the table
     // name in its env and connection reuse enabled.
@@ -73,6 +76,11 @@ export class Functions extends Construct {
     // admin — read-only list-all-by-entityType (queries entityTypeIndex; never writes).
     this.adminFn = dataFn('AdminFunction', 'admin', 'admin');
     table.grantReadData(this.adminFn);
+
+    // The media Lambda also mints presigned S3 upload URLs (createMediaUploadUrl);
+    // the signed URL inherits the Lambda's s3:PutObject permission on this bucket.
+    this.mediaFn.addEnvironment('MEDIA_BUCKET_NAME', mediaBucket.bucketName);
+    mediaBucket.grantPut(this.mediaFn);
 
     // ── generateTaskSteps (Bedrock KB + RAG) ────────────────────────────────────
     this.generateTaskStepsFn = new NodejsFunction(this, 'GenerateTaskStepsFunction', {

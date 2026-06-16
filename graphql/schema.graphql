@@ -146,6 +146,14 @@ type Report {
   createdAt: String!
 }
 
+# Presigned S3 upload target returned by createMediaUploadUrl. The client PUTs the
+# file bytes to `uploadUrl`, then registers it via createMediaAsset with `s3Key`.
+type MediaUploadTarget {
+  uploadUrl: String!
+  s3Key: String!
+  expiresIn: Int!
+}
+
 # ─── AI step generation (Bedrock KB + RAG) ──────────────────────────────────--
 
 type Citation {
@@ -248,6 +256,12 @@ input CreateMediaAssetInput {
   size: Int
 }
 
+input CreateMediaUploadUrlInput {
+  taskId: ID!
+  contentType: String!
+  fileName: String
+}
+
 # AI step generation
 input QueryContext {
   role: String
@@ -340,6 +354,10 @@ type Mutation {
   updateAssignmentStatus(input: UpdateAssignmentStatusInput!): Assignment
 
   createProgressEvent(input: CreateProgressEventInput!): ProgressEvent
+
+  # Mint a presigned S3 upload URL; the client uploads the file, then calls
+  # createMediaAsset with the returned s3Key to register the metadata.
+  createMediaUploadUrl(input: CreateMediaUploadUrlInput!): MediaUploadTarget
   createMediaAsset(input: CreateMediaAssetInput!): MediaAsset
 
   # Break a daily-living task into ordered, source-cited steps via Bedrock KB + RAG.

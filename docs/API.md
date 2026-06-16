@@ -213,11 +213,27 @@ These follow the same request/response conventions. See
 |---|---|---|
 | `createProgressEvent(input)` | mutation | Append a progress event (offline-sync friendly) |
 | `listProgressEventsForUser(userId, assignmentId?)` | query | Query `PROGRESS#` rows; optionally filter by assignment |
-| `createMediaAsset(input)` | mutation | Record S3 metadata for an `IMAGE` / `AUDIO` / `VIDEO` asset |
+| `createMediaUploadUrl(input)` | mutation | Mint a presigned S3 **PUT** URL + server-owned `s3Key` |
+| `createMediaAsset(input)` | mutation | Register metadata for an uploaded `IMAGE` / `AUDIO` / `VIDEO` asset |
 | `listMediaForTask(taskId)` | query | Query `MEDIA#` rows under the task |
 
-> **Media:** binaries live in the S3 media bucket; DynamoDB stores only the `s3Key`
-> and descriptive metadata (`type`, `mimeType`, `ownerId`, `size`, optional `stepId`).
+> **Media is upload-first.** Binaries live in the S3 media bucket; DynamoDB stores
+> only the `s3Key` and metadata (`type`, `mimeType`, `ownerId`, `size`, optional
+> `stepId`). Clients never need AWS credentials — they upload through a presigned URL:
+>
+> 1. **`createMediaUploadUrl({ taskId, contentType, fileName? })`** → returns
+>    `{ uploadUrl, s3Key, expiresIn }`. `uploadUrl` is a short-lived (default 15 min)
+>    presigned **PUT**; `s3Key` is server-chosen (`media/<taskId>/<uuid>.<ext>`).
+> 2. **`PUT` the raw file bytes to `uploadUrl`** with the same `Content-Type` you
+>    passed as `contentType` (direct browser/mobile upload to S3 — the bucket allows
+>    CORS PUT). No GraphQL, no credentials.
+> 3. **`createMediaAsset({ taskId, s3Key, type, mimeType, ownerId, size?, stepId? })`**
+>    → registers the now-uploaded object's metadata so it shows up in `listMediaForTask`.
+>
+> ```bash
+> # 2) upload the bytes to the presigned URL from step 1
+> curl -X PUT "$UPLOAD_URL" -H "Content-Type: image/png" --data-binary @photo.png
+> ```
 
 ---
 

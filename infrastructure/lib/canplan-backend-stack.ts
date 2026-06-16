@@ -34,7 +34,7 @@ export class CanPlanBackendStack extends cdk.Stack {
 
     // Data + storage
     const database = new Database(this, 'Database', { envName, isSandbox });
-    new Storage(this, 'Storage', { envName, isSandbox });
+    const storage = new Storage(this, 'Storage', { envName, isSandbox });
 
     // Authentication — Cognito user pool, client, and role groups
     const auth = new Auth(this, 'Auth', { envName, isSandbox });
@@ -46,6 +46,7 @@ export class CanPlanBackendStack extends cdk.Stack {
     const functions = new Functions(this, 'Functions', {
       envName,
       table: database.table,
+      mediaBucket: storage.mediaBucket,
       bedrockModelId: ai.bedrockModelId,
       bedrockRegion: ai.bedrockRegion,
       knowledgeBaseId,
