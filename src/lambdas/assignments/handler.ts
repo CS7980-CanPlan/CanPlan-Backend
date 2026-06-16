@@ -1,11 +1,13 @@
 import { randomUUID } from 'crypto';
-import { PutCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import { ASSIGN_PREFIX, assignSk, ENTITY, userPk } from '../../shared/keys';
+import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
 import { ValidationError } from '../../shared/response';
 import type {
   AppSyncEvent,
   Assignment,
+  Connection,
   CreateAssignmentInput,
   UpdateAssignmentStatusInput,
 } from '../../shared/types';
@@ -16,7 +18,7 @@ import type {
  */
 export const handler = async (
   event: AppSyncEvent<Record<string, unknown>>,
-): Promise<Assignment | Assignment[]> => {
+): Promise<Assignment | Connection<Assignment>> => {
   const { arguments: args } = event;
   switch (event.info?.fieldName) {
     case 'createAssignment':
@@ -24,7 +26,7 @@ export const handler = async (
     case 'updateAssignmentStatus':
       return updateAssignmentStatus(args.input as UpdateAssignmentStatusInput);
     case 'listAssignmentsForUser':
-      return listAssignmentsForUser(args.userId as string);
+      return listAssignmentsForUser(args.userId as string, pageArgs(args));
     default:
       throw new Error(`assignments handler: unsupported field "${event.info?.fieldName}"`);
   }
@@ -106,14 +108,17 @@ async function updateAssignmentStatus(input: UpdateAssignmentStatusInput): Promi
   return result.Attributes as Assignment;
 }
 
-async function listAssignmentsForUser(userId: string): Promise<Assignment[]> {
+async function listAssignmentsForUser(
+  userId: string,
+  page: PageArgs,
+): Promise<Connection<Assignment>> {
   if (!userId?.trim()) throw new ValidationError('userId is required');
-  const result = await dynamo.send(
-    new QueryCommand({
+  return queryPage<Assignment>(
+    {
       TableName: TABLE_NAME,
       KeyConditionExpression: 'PK = :pk AND begins_with(SK, :prefix)',
       ExpressionAttributeValues: { ':pk': userPk(userId), ':prefix': ASSIGN_PREFIX },
-    }),
+    },
+    page,
   );
-  return (result.Items as Assignment[]) ?? [];
 }

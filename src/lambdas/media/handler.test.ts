@@ -1,6 +1,6 @@
 import { handler } from './handler';
 import { dynamo } from '../../shared/dynamodb';
-import type { MediaAsset } from '../../shared/types';
+import type { Connection, MediaAsset } from '../../shared/types';
 
 jest.mock('../../shared/dynamodb', () => ({
   dynamo: { send: jest.fn() },
@@ -59,8 +59,8 @@ describe('media handler', () => {
 
   it('listMediaForTask queries PK=TASK#<id> with SK begins_with MEDIA#', async () => {
     mockSend.mockResolvedValueOnce({ Items: [{ assetId: 'a1' }] });
-    const result = await handler(event('listMediaForTask', { taskId: 't1' }));
+    const result = (await handler(event('listMediaForTask', { taskId: 't1' }))) as Connection<unknown>;
     expect(lastInput().ExpressionAttributeValues).toEqual({ ':pk': 'TASK#t1', ':prefix': 'MEDIA#' });
-    expect(result).toHaveLength(1);
+    expect(result.items).toHaveLength(1);
   });
 });

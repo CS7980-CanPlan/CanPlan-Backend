@@ -1,5 +1,7 @@
 import { handler } from './handler';
 import { dynamo } from '../../shared/dynamodb';
+import { encodeNextToken } from '../../shared/pagination';
+import type { Connection } from '../../shared/types';
 
 jest.mock('../../shared/dynamodb', () => ({
   dynamo: { send: jest.fn() },
@@ -50,12 +52,30 @@ describe('users handler — UserProfile', () => {
     expect(result).toBeNull();
   });
 
-  it('listUsersByOrganization queries the orgIndex by organizationId', async () => {
+  it('listUsersByOrganization queries the orgIndex by organizationId and returns a connection', async () => {
     mockSend.mockResolvedValueOnce({ Items: [{ userId: 'u1', role: 'PRIMARY_USER' }] });
-    const result = await handler(event('listUsersByOrganization', { organizationId: 'org-1' }));
+    const result = (await handler(
+      event('listUsersByOrganization', { organizationId: 'org-1' }),
+    )) as Connection<unknown>;
     expect(lastInput().IndexName).toBe('orgIndex');
     expect(lastInput().ExpressionAttributeValues).toEqual({ ':org': 'org-1' });
-    expect(result).toHaveLength(1);
+    expect(result.items).toHaveLength(1);
+    expect(result.nextToken).toBeNull();
+  });
+
+  it('listUsersByOrganization forwards limit and decodes nextToken into ExclusiveStartKey', async () => {
+    const startKey = { organizationId: 'org-1', userId: 'u0', PK: 'USER#u0', SK: '#PROFILE' };
+    mockSend.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: startKey });
+    const result = (await handler(
+      event('listUsersByOrganization', {
+        organizationId: 'org-1',
+        limit: 10,
+        nextToken: encodeNextToken(startKey)!,
+      }),
+    )) as Connection<unknown>;
+    expect(lastInput().Limit).toBe(10);
+    expect(lastInput().ExclusiveStartKey).toEqual(startKey);
+    expect(result.nextToken).not.toBeNull(); // LastEvaluatedKey present → another page
   });
 });
 
@@ -85,10 +105,12 @@ describe('users handler — SupportLink', () => {
 
   it('listPrimaryUsersBySupporter queries the supporterIndex by supporterId', async () => {
     mockSend.mockResolvedValueOnce({ Items: [{ supporterId: 's1', userId: 'u1' }] });
-    const result = await handler(event('listPrimaryUsersBySupporter', { supporterId: 's1' }));
+    const result = (await handler(
+      event('listPrimaryUsersBySupporter', { supporterId: 's1' }),
+    )) as Connection<unknown>;
     expect(lastInput().IndexName).toBe('supporterIndex');
     expect(lastInput().ExpressionAttributeValues).toEqual({ ':sup': 's1' });
-    expect(result).toHaveLength(1);
+    expect(result.items).toHaveLength(1);
   });
 });
 

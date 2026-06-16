@@ -29,7 +29,7 @@ operation in the query, not the path.
 > `Authorization` header. The API key is an additional mode kept for the
 > unauthenticated `healthCheck` probe and proof-of-concept tooling — don't ship it
 > as the app's auth. The User Pool id and client id are CloudFormation outputs
-> (`UserPoolId`, `UserPoolClientId`); see the README "Authentication setup".
+> (`UserPoolId`, `UserPoolClientId`); see the README "Authentication" section.
 
 ### Required headers
 
@@ -173,6 +173,13 @@ Steps come back keyed `STEP#001`, `STEP#002`, `STEP#003` and are returned in ord
 These follow the same request/response conventions. See
 [schema.graphql](../graphql/schema.graphql) for exact field types and nullability.
 
+> **All `list*` queries are paginated.** Each accepts optional `limit` (page size)
+> and `nextToken`, and returns a `{ items, nextToken }` **connection** (e.g.
+> `listTaskSteps` → `TaskStepConnection`, `listAssignmentsForUser` →
+> `AssignmentConnection`). `nextToken` is an opaque, base64-encoded cursor — pass it
+> back to fetch the next page; it's `null` on the last page. (See the
+> `listAllUsers` example below for the paging loop — every list query works the same way.)
+
 **Users & support**
 
 | Operation | Kind | Purpose / access pattern |
@@ -290,10 +297,11 @@ reached a resolver returns **HTTP 200** with the failure in an `errors` array;
 
 Planned but not implemented — don't build against them:
 
-- **Group/owner authorization enforcement** — Cognito is the authorizer, but
-  per-role resolver rules (primary users read their own data, supporters manage
-  linked users, org admins list their org) are not enforced yet. The schema and
-  single-table keys are structured to support them.
+- **Per-role/owner authorization on domain operations** — the `SystemAdmin` admin
+  queries are group-gated (enforced), but the regular create/get/list resolvers
+  don't yet verify the caller (e.g. that a primary user only reads their own data,
+  or that a supporter owns the task). The schema and single-table keys are
+  structured to support these rules.
 - **Update/delete** for entities other than `updateAssignmentStatus`.
 - **Report generation** — the `Report` type exists in the schema, but no query or
   mutation is exposed for it yet.

@@ -1,9 +1,10 @@
 import { randomUUID } from 'crypto';
-import { PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
+import { PutCommand } from '@aws-sdk/lib-dynamodb';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import { ENTITY, PROGRESS_PREFIX, progressSk, userPk } from '../../shared/keys';
+import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
 import { ValidationError } from '../../shared/response';
-import type { AppSyncEvent, CreateProgressEventInput, ProgressEvent } from '../../shared/types';
+import type { AppSyncEvent, Connection, CreateProgressEventInput, ProgressEvent } from '../../shared/types';
 
 /**
  * Progress domain Lambda — append a progress event and list a user's events.
@@ -12,13 +13,17 @@ import type { AppSyncEvent, CreateProgressEventInput, ProgressEvent } from '../.
  */
 export const handler = async (
   event: AppSyncEvent<Record<string, unknown>>,
-): Promise<ProgressEvent | ProgressEvent[]> => {
+): Promise<ProgressEvent | Connection<ProgressEvent>> => {
   const { arguments: args } = event;
   switch (event.info?.fieldName) {
     case 'createProgressEvent':
       return createProgressEvent(args.input as CreateProgressEventInput);
     case 'listProgressEventsForUser':
-      return listProgressEventsForUser(args.userId as string, args.assignmentId as string | undefined);
+      return listProgressEventsForUser(
+        args.userId as string,
+        args.assignmentId as string | undefined,
+        pageArgs(args),
+      );
     default:
       throw new Error(`progress handler: unsupported field "${event.info?.fieldName}"`);
   }
@@ -65,28 +70,22 @@ async function createProgressEvent(input: CreateProgressEventInput): Promise<Pro
 
 async function listProgressEventsForUser(
   userId: string,
-  assignmentId?: string,
-): Promise<ProgressEvent[]> {
+  assignmentId: string | undefined,
+  page: PageArgs,
+): Promise<Connection<ProgressEvent>> {
   if (!userId?.trim()) throw new ValidationError('userId is required');
 
-  const result = await dynamo.send(
-    new QueryCommand({
+  const values: Record<string, unknown> = { ':pk': userPk(userId), ':prefix': PROGRESS_PREFIX };
+  if (assignmentId) values[':assignmentId'] = assignmentId;
+
+  return queryPage<ProgressEvent>(
+    {
       TableName: TABLE_NAME,
       KeyConditionExpression: 'PK = :pk AND begins_with(SK, :prefix)',
       // Optionally narrow to one assignment's events.
-      ...(assignmentId
-        ? {
-            FilterExpression: 'assignmentId = :assignmentId',
-            ExpressionAttributeValues: {
-              ':pk': userPk(userId),
-              ':prefix': PROGRESS_PREFIX,
-              ':assignmentId': assignmentId,
-            },
-          }
-        : {
-            ExpressionAttributeValues: { ':pk': userPk(userId), ':prefix': PROGRESS_PREFIX },
-          }),
-    }),
+      ...(assignmentId ? { FilterExpression: 'assignmentId = :assignmentId' } : {}),
+      ExpressionAttributeValues: values,
+    },
+    page,
   );
-  return (result.Items as ProgressEvent[]) ?? [];
 }

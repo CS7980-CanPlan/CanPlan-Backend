@@ -1,6 +1,6 @@
 import { handler } from './handler';
 import { dynamo } from '../../shared/dynamodb';
-import type { Assignment } from '../../shared/types';
+import type { Assignment, Connection } from '../../shared/types';
 
 jest.mock('../../shared/dynamodb', () => ({
   dynamo: { send: jest.fn() },
@@ -78,8 +78,8 @@ describe('assignments handler', () => {
 
   it('listAssignmentsForUser queries PK=USER#<id> with SK begins_with ASSIGN#', async () => {
     mockSend.mockResolvedValueOnce({ Items: [{ assignmentId: 'a1' }] });
-    const result = await handler(event('listAssignmentsForUser', { userId: 'u1' }));
+    const result = (await handler(event('listAssignmentsForUser', { userId: 'u1' }))) as Connection<unknown>;
     expect(lastInput().ExpressionAttributeValues).toEqual({ ':pk': 'USER#u1', ':prefix': 'ASSIGN#' });
-    expect(result).toHaveLength(1);
+    expect(result.items).toHaveLength(1);
   });
 });

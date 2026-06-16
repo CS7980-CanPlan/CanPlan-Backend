@@ -31,9 +31,26 @@ Domain Lambdas back several fields each, routing on the resolved GraphQL field
 corpus passages from the Knowledge Base, then call Bedrock Converse to generate
 cited task steps.
 
-AppSync default authorization is Cognito User Pool auth. An API key is configured
-as an additional auth mode, but the current schema does not add `@aws_api_key`
-directives, so frontend clients should use a signed-in user's JWT.
+Default authorization is Cognito User Pool — frontend clients send a signed-in
+user's JWT. A few fields carry auth directives; see [Authentication](#authentication).
+
+## Authentication
+
+AppSync uses **Cognito User Pool** auth as the default for every field — clients send
+a signed-in user's **ID token (JWT)** in the `Authorization` header. An API key is
+configured as a secondary mode, but it only works on fields that explicitly opt in.
+
+The only fields with auth directives:
+
+| Field | Auth |
+| ----- | ---- |
+| `healthCheck` | `@aws_api_key @aws_cognito_user_pools` — the API key **or** any signed-in user |
+| `listAllUsers`, `listAllTasks` | `@aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])` — SystemAdmin group only |
+| everything else | default Cognito User Pool (any signed-in user) |
+
+The frontend needs the `UserPoolId` and `UserPoolClientId` deploy outputs to run the
+Cognito sign-in flow. Per-role/owner authorization on the domain operations (e.g.
+"only the task owner may edit it") is not enforced yet.
 
 ## Region Layout
 
@@ -41,7 +58,7 @@ The app deploys two CDK stacks with `--all`.
 
 | Region | Stack | Main resources |
 | ------ | ----- | -------------- |
-| `CANPLAN_BACKEND_REGION` default `ca-central-1` | `canplan-backend-<env>` | AppSync, Cognito, single-table DynamoDB `CanPlanTasks-<env>`, media S3 bucket, `createTask` + domain Lambdas (`users`/`tasks`/`assignments`/`progress`/`media`) + `generateTaskSteps` Lambda, CloudWatch logs |
+| `CANPLAN_BACKEND_REGION` default `ca-central-1` | `canplan-backend-<env>` | AppSync, Cognito, single-table DynamoDB `CanPlanTasks-<env>`, media S3 bucket, `createTask` + domain Lambdas (`users`/`tasks`/`assignments`/`progress`/`media`/`admin`) + `generateTaskSteps` Lambda, CloudWatch logs |
 | `CANPLAN_KNOWLEDGE_BASE_REGION` default `us-east-1` | `canplan-knowledge-base-<env>` | Bedrock Knowledge Base, S3 corpus bucket, Bedrock S3 data source, OpenSearch Serverless vector collection/index |
 
 `generateTaskSteps` runs in `ca-central-1` by default, but calls Bedrock Agent
@@ -188,7 +205,7 @@ The CDK app reads `--context env=...`; only `env=sandbox` is treated as sandbox.
 
 | Resource | Sandbox destroy | Dev/prod destroy |
 | -------- | --------------- | ---------------- |
-| DynamoDB task table | Deleted | Retained |
+| DynamoDB table (single-table) | Deleted | Retained |
 | Media S3 bucket | Emptied and deleted | Retained |
 | Cognito User Pool | Deleted | Retained |
 | KB corpus S3 bucket | Emptied and deleted | Retained |

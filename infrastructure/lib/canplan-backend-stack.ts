@@ -68,7 +68,7 @@ export class CanPlanBackendStack extends cdk.Stack {
     // ── Outputs ───────────────────────────────────────────────────────────────
     new cdk.CfnOutput(this, 'GraphQLApiUrl', { value: api.graphqlUrl });
     new cdk.CfnOutput(this, 'GraphQLApiKey', { value: api.apiKey });
-    // Cognito values the frontend needs — see README "Authentication setup".
+    // Cognito values the frontend needs — see the README "Authentication" section.
     new cdk.CfnOutput(this, 'UserPoolId', { value: auth.userPool.userPoolId });
     new cdk.CfnOutput(this, 'UserPoolClientId', { value: auth.userPoolClient.userPoolClientId });
     new cdk.CfnOutput(this, 'AwsRegion', { value: this.region });

@@ -1,4 +1,4 @@
-import { GetCommand, PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
+import { GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import {
   ENTITY,
@@ -9,9 +9,11 @@ import {
   userLinkSk,
   userPk,
 } from '../../shared/keys';
+import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
 import { ValidationError } from '../../shared/response';
 import type {
   AppSyncEvent,
+  Connection,
   CreateSupportLinkInput,
   CreateUserProfileInput,
   SupportLink,
@@ -25,7 +27,7 @@ import type {
  */
 export const handler = async (
   event: AppSyncEvent<Record<string, unknown>>,
-): Promise<UserProfile | UserProfile[] | SupportLink | SupportLink[] | null> => {
+): Promise<UserProfile | SupportLink | Connection<UserProfile> | Connection<SupportLink> | null> => {
   const { arguments: args } = event;
   switch (event.info?.fieldName) {
     case 'createUserProfile':
@@ -33,11 +35,11 @@ export const handler = async (
     case 'getUserProfile':
       return getUserProfile(args.userId as string);
     case 'listUsersByOrganization':
-      return listUsersByOrganization(args.organizationId as string);
+      return listUsersByOrganization(args.organizationId as string, pageArgs(args));
     case 'createSupportLink':
       return createSupportLink(args.input as CreateSupportLinkInput);
     case 'listPrimaryUsersBySupporter':
-      return listPrimaryUsersBySupporter(args.supporterId as string);
+      return listPrimaryUsersBySupporter(args.supporterId as string, pageArgs(args));
     default:
       throw new Error(`users handler: unsupported field "${event.info?.fieldName}"`);
   }
@@ -78,18 +80,21 @@ async function getUserProfile(userId: string): Promise<UserProfile | null> {
   return (result.Item as UserProfile) ?? null;
 }
 
-async function listUsersByOrganization(organizationId: string): Promise<UserProfile[]> {
+async function listUsersByOrganization(
+  organizationId: string,
+  page: PageArgs,
+): Promise<Connection<UserProfile>> {
   if (!organizationId?.trim()) throw new ValidationError('organizationId is required');
   // orgIndex projects displayName + role — a lightweight roster, not the full profile.
-  const result = await dynamo.send(
-    new QueryCommand({
+  return queryPage<UserProfile>(
+    {
       TableName: TABLE_NAME,
       IndexName: ORG_INDEX,
       KeyConditionExpression: 'organizationId = :org',
       ExpressionAttributeValues: { ':org': organizationId },
-    }),
+    },
+    page,
   );
-  return (result.Items as UserProfile[]) ?? [];
 }
 
 async function createSupportLink(input: CreateSupportLinkInput): Promise<SupportLink> {
@@ -125,15 +130,18 @@ async function createSupportLink(input: CreateSupportLinkInput): Promise<Support
   return link;
 }
 
-async function listPrimaryUsersBySupporter(supporterId: string): Promise<SupportLink[]> {
+async function listPrimaryUsersBySupporter(
+  supporterId: string,
+  page: PageArgs,
+): Promise<Connection<SupportLink>> {
   if (!supporterId?.trim()) throw new ValidationError('supporterId is required');
-  const result = await dynamo.send(
-    new QueryCommand({
+  return queryPage<SupportLink>(
+    {
       TableName: TABLE_NAME,
       IndexName: SUPPORTER_INDEX,
       KeyConditionExpression: 'supporterId = :sup',
       ExpressionAttributeValues: { ':sup': supporterId },
-    }),
+    },
+    page,
   );
-  return (result.Items as SupportLink[]) ?? [];
 }

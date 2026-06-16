@@ -260,17 +260,43 @@ input GenerateTaskStepsInput {
   context: QueryContext
 }
 
-# ─── Admin / debug pagination ───────────────────────────────────────────────--
-# `nextToken` is an opaque, base64-encoded DynamoDB key; pass it back to fetch the
-# next page. null when there are no more pages.
+# ─── Pagination / connections ───────────────────────────────────────────────--
+# Every list query is paginated: pass an optional `limit` (page size) and the
+# `nextToken` from the previous page. `nextToken` is an opaque, base64-encoded
+# DynamoDB key; it is null when there are no more pages.
 
 type UserProfileConnection {
   items: [UserProfile!]!
   nextToken: String
 }
 
+type SupportLinkConnection {
+  items: [SupportLink!]!
+  nextToken: String
+}
+
 type TaskConnection {
   items: [Task!]!
+  nextToken: String
+}
+
+type TaskStepConnection {
+  items: [TaskStep!]!
+  nextToken: String
+}
+
+type AssignmentConnection {
+  items: [Assignment!]!
+  nextToken: String
+}
+
+type ProgressEventConnection {
+  items: [ProgressEvent!]!
+  nextToken: String
+}
+
+type MediaAssetConnection {
+  items: [MediaAsset!]!
   nextToken: String
 }
 
@@ -282,16 +308,16 @@ type Query {
   healthCheck: String! @aws_api_key @aws_cognito_user_pools
 
   getUserProfile(userId: ID!): UserProfile
-  listUsersByOrganization(organizationId: ID!): [UserProfile!]!
-  listPrimaryUsersBySupporter(supporterId: ID!): [SupportLink!]!
+  listUsersByOrganization(organizationId: ID!, limit: Int, nextToken: String): UserProfileConnection!
+  listPrimaryUsersBySupporter(supporterId: ID!, limit: Int, nextToken: String): SupportLinkConnection!
 
   getTask(taskId: ID!): Task
-  listTaskSteps(taskId: ID!): [TaskStep!]!
-  listTasksByOwner(ownerId: ID!): [Task!]!
+  listTaskSteps(taskId: ID!, limit: Int, nextToken: String): TaskStepConnection!
+  listTasksByOwner(ownerId: ID!, limit: Int, nextToken: String): TaskConnection!
 
-  listAssignmentsForUser(userId: ID!): [Assignment!]!
-  listProgressEventsForUser(userId: ID!, assignmentId: ID): [ProgressEvent!]!
-  listMediaForTask(taskId: ID!): [MediaAsset!]!
+  listAssignmentsForUser(userId: ID!, limit: Int, nextToken: String): AssignmentConnection!
+  listProgressEventsForUser(userId: ID!, assignmentId: ID, limit: Int, nextToken: String): ProgressEventConnection!
+  listMediaForTask(taskId: ID!, limit: Int, nextToken: String): MediaAssetConnection!
 
   # SystemAdmin-only admin/debug listings — query entityTypeIndex (no Scan),
   # paginated. Gated to the SystemAdmin Cognito group at the edge; the resolver

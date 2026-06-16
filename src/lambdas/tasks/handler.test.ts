@@ -1,6 +1,6 @@
 import { handler } from './handler';
 import { dynamo } from '../../shared/dynamodb';
-import type { TaskStep } from '../../shared/types';
+import type { Connection, TaskStep } from '../../shared/types';
 
 jest.mock('../../shared/dynamodb', () => ({
   dynamo: { send: jest.fn() },
@@ -27,10 +27,10 @@ describe('tasks handler', () => {
 
   it('listTaskSteps queries PK=TASK#<id> with SK begins_with STEP#', async () => {
     mockSend.mockResolvedValueOnce({ Items: [{ stepId: 's1', order: 1 }] });
-    const result = await handler(event('listTaskSteps', { taskId: 't1' }));
+    const result = (await handler(event('listTaskSteps', { taskId: 't1' }))) as Connection<unknown>;
     expect(lastInput().KeyConditionExpression).toBe('PK = :pk AND begins_with(SK, :prefix)');
     expect(lastInput().ExpressionAttributeValues).toEqual({ ':pk': 'TASK#t1', ':prefix': 'STEP#' });
-    expect(result).toHaveLength(1);
+    expect(result.items).toHaveLength(1);
   });
 
   it('listTasksByOwner queries taskOwnerIndex and filters to entityType=Task', async () => {

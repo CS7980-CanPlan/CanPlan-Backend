@@ -1,9 +1,10 @@
 import { randomUUID } from 'crypto';
-import { PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
+import { PutCommand } from '@aws-sdk/lib-dynamodb';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import { ENTITY, MEDIA_PREFIX, mediaSk, taskPk } from '../../shared/keys';
+import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
 import { ValidationError } from '../../shared/response';
-import type { AppSyncEvent, CreateMediaAssetInput, MediaAsset } from '../../shared/types';
+import type { AppSyncEvent, Connection, CreateMediaAssetInput, MediaAsset } from '../../shared/types';
 
 /**
  * Media domain Lambda — record metadata for a media asset (IMAGE / AUDIO / VIDEO)
@@ -12,13 +13,13 @@ import type { AppSyncEvent, CreateMediaAssetInput, MediaAsset } from '../../shar
  */
 export const handler = async (
   event: AppSyncEvent<Record<string, unknown>>,
-): Promise<MediaAsset | MediaAsset[]> => {
+): Promise<MediaAsset | Connection<MediaAsset>> => {
   const { arguments: args } = event;
   switch (event.info?.fieldName) {
     case 'createMediaAsset':
       return createMediaAsset(args.input as CreateMediaAssetInput);
     case 'listMediaForTask':
-      return listMediaForTask(args.taskId as string);
+      return listMediaForTask(args.taskId as string, pageArgs(args));
     default:
       throw new Error(`media handler: unsupported field "${event.info?.fieldName}"`);
   }
@@ -59,14 +60,14 @@ async function createMediaAsset(input: CreateMediaAssetInput): Promise<MediaAsse
   return asset;
 }
 
-async function listMediaForTask(taskId: string): Promise<MediaAsset[]> {
+async function listMediaForTask(taskId: string, page: PageArgs): Promise<Connection<MediaAsset>> {
   if (!taskId?.trim()) throw new ValidationError('taskId is required');
-  const result = await dynamo.send(
-    new QueryCommand({
+  return queryPage<MediaAsset>(
+    {
       TableName: TABLE_NAME,
       KeyConditionExpression: 'PK = :pk AND begins_with(SK, :prefix)',
       ExpressionAttributeValues: { ':pk': taskPk(taskId), ':prefix': MEDIA_PREFIX },
-    }),
+    },
+    page,
   );
-  return (result.Items as MediaAsset[]) ?? [];
 }
