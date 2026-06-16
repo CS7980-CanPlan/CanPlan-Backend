@@ -1,15 +1,275 @@
+# CanPlan 2.0 GraphQL schema.
+#
+# Backed by a single DynamoDB table (composite PK/SK). Default authorization is
+# Cognito User Pool; the API key is a secondary mode for healthCheck + tooling.
+# See docs/API.md for the human-readable companion and src/shared/keys.ts for the
+# item-key conventions behind each operation.
+
+# ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  PRIMARY_USER
+  SUPPORT_PERSON
+  ORG_ADMIN
+}
+
+enum SupportLinkStatus {
+  PENDING
+  ACTIVE
+  REVOKED
+}
+
+enum TaskStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum AssignmentStatus {
+  ACTIVE
+  COMPLETED
+  PAUSED
+  CANCELLED
+}
+
+enum ProgressEventType {
+  STARTED
+  PAUSED
+  RESUMED
+  SKIPPED
+  COMPLETED
+  SYNCED
+}
+
+enum MediaType {
+  IMAGE
+  AUDIO
+  VIDEO
+}
+
+# ─── Domain types ───────────────────────────────────────────────────────────--
+
+type UserProfile {
+  userId: ID!
+  role: UserRole!
+  displayName: String
+  email: String
+  organizationId: ID
+  accessibilitySettings: AWSJSON
+  # Nullable: the orgIndex roster projection (listUsersByOrganization) omits it.
+  createdAt: String
+  updatedAt: String
+}
+
+type SupportLink {
+  supporterId: ID!
+  primaryUserId: ID!
+  # Mirror of primaryUserId — the supporterIndex sort key.
+  userId: ID!
+  status: SupportLinkStatus!
+  permissions: AWSJSON
+  createdAt: String!
+  updatedAt: String
+}
+
 type Task {
   taskId: ID!
+  ownerId: ID!
   title: String!
+  categoryId: ID
   description: String
+  scheduleRule: String
+  status: TaskStatus!
+  createdAt: String!
+  updatedAt: String
+  # Populated by createTask with the steps it just wrote; use listTaskSteps otherwise.
+  steps: [TaskStep!]
+}
+
+type TaskStep {
+  stepId: ID!
+  taskId: ID!
+  order: Int!
+  text: String!
+  mediaRefs: [ID!]
+  expectedDuration: Int
+  createdAt: String!
+  updatedAt: String
+}
+
+type Assignment {
+  assignmentId: ID!
+  taskId: ID!
+  userId: ID!
+  assignedBy: ID
+  dueDate: String
+  recurrence: String
+  scheduleRule: String
+  active: Boolean!
+  status: AssignmentStatus!
+  assignedAt: String!
+  createdAt: String!
+  updatedAt: String
+}
+
+type ProgressEvent {
+  eventId: ID!
+  assignmentId: ID
+  taskId: ID
+  userId: ID!
+  eventType: ProgressEventType!
+  timestamp: String!
+  source: String
+  metadata: AWSJSON
   createdAt: String!
 }
 
-input CreateTaskInput {
-  title: String!
-  description: String
+type MediaAsset {
+  assetId: ID!
+  taskId: ID!
+  stepId: ID
+  s3Key: String!
+  type: MediaType!
+  mimeType: String!
+  ownerId: ID!
+  size: Int
+  createdAt: String!
+  updatedAt: String
 }
 
+type Report {
+  reportId: ID!
+  scope: AWSJSON
+  dateRange: AWSJSON
+  s3Key: String
+  createdBy: ID
+  createdAt: String!
+}
+
+# Presigned S3 upload target returned by createMediaUploadUrl. The client PUTs the
+# file bytes to `uploadUrl`, then registers it via createMediaAsset with `s3Key`.
+type MediaUploadTarget {
+  uploadUrl: String!
+  s3Key: String!
+  expiresIn: Int!
+}
+
+# Short-lived presigned GET URL for a private media object (getMediaDownloadUrl).
+type MediaDownloadTarget {
+  downloadUrl: String!
+  s3Key: String!
+  expiresIn: Int!
+}
+
+# ─── AI step generation (Bedrock KB + RAG) ──────────────────────────────────--
+
+type Citation {
+  chunkId: String!
+  title: String!
+  url: String
+  snippet: String
+}
+
+# An AI-generated, source-cited step — distinct from the persisted TaskStep entity.
+type GeneratedStep {
+  text: String!
+  citations: [Citation!]!
+}
+
+type TaskStepsResponse {
+  steps: [GeneratedStep!]!
+  model: String!
+  inputTokens: Int
+  outputTokens: Int
+}
+
+# ─── Inputs ───────────────────────────────────────────────────────────────────
+
+input CreateUserProfileInput {
+  userId: ID!
+  role: UserRole!
+  displayName: String
+  email: String
+  organizationId: ID
+  accessibilitySettings: AWSJSON
+}
+
+input CreateSupportLinkInput {
+  supporterId: ID!
+  primaryUserId: ID!
+  status: SupportLinkStatus
+  permissions: AWSJSON
+}
+
+input CreateTaskInput {
+  ownerId: ID!
+  title: String!
+  categoryId: ID
+  description: String
+  scheduleRule: String
+  status: TaskStatus
+  steps: [CreateTaskStepNestedInput!]
+}
+
+input CreateTaskStepNestedInput {
+  text: String!
+  mediaRefs: [ID!]
+  expectedDuration: Int
+}
+
+input CreateTaskStepInput {
+  taskId: ID!
+  order: Int!
+  text: String!
+  mediaRefs: [ID!]
+  expectedDuration: Int
+}
+
+input CreateAssignmentInput {
+  taskId: ID!
+  userId: ID!
+  assignedBy: ID
+  dueDate: String
+  recurrence: String
+  scheduleRule: String
+  active: Boolean
+  status: AssignmentStatus
+}
+
+input UpdateAssignmentStatusInput {
+  userId: ID!
+  assignmentId: ID!
+  status: AssignmentStatus!
+  active: Boolean
+}
+
+input CreateProgressEventInput {
+  userId: ID!
+  assignmentId: ID
+  taskId: ID
+  eventType: ProgressEventType!
+  timestamp: String
+  source: String
+  metadata: AWSJSON
+}
+
+input CreateMediaAssetInput {
+  taskId: ID!
+  stepId: ID
+  s3Key: String!
+  type: MediaType!
+  mimeType: String!
+  ownerId: ID!
+  size: Int
+}
+
+input CreateMediaUploadUrlInput {
+  taskId: ID!
+  contentType: String!
+  fileName: String
+}
+
+# AI step generation
 input QueryContext {
   role: String
   organizationId: String
@@ -21,34 +281,95 @@ input GenerateTaskStepsInput {
   context: QueryContext
 }
 
-type Citation {
-  chunkId: String!
-  title: String!
-  url: String
-  snippet: String
+# ─── Pagination / connections ───────────────────────────────────────────────--
+# Every list query is paginated: pass an optional `limit` (page size) and the
+# `nextToken` from the previous page. `nextToken` is an opaque, base64-encoded
+# DynamoDB key; it is null when there are no more pages.
+
+type UserProfileConnection {
+  items: [UserProfile!]!
+  nextToken: String
 }
 
-type TaskStep {
-  text: String!
-  citations: [Citation!]!
+type SupportLinkConnection {
+  items: [SupportLink!]!
+  nextToken: String
 }
 
-type TaskStepsResponse {
-  steps: [TaskStep!]!
-  model: String!
-  inputTokens: Int
-  outputTokens: Int
+type TaskConnection {
+  items: [Task!]!
+  nextToken: String
+}
+
+type TaskStepConnection {
+  items: [TaskStep!]!
+  nextToken: String
+}
+
+type AssignmentConnection {
+  items: [Assignment!]!
+  nextToken: String
+}
+
+type ProgressEventConnection {
+  items: [ProgressEvent!]!
+  nextToken: String
+}
+
+type MediaAssetConnection {
+  items: [MediaAsset!]!
+  nextToken: String
+}
+
+# ─── Operations ─────────────────────────────────────────────────────────────--
+
+type Query {
+  # Liveness probe — reachable with the API key (monitors/CI) OR a Cognito JWT.
+  # Every other field uses the API's default Cognito User Pool auth.
+  healthCheck: String! @aws_api_key @aws_cognito_user_pools
+
+  getUserProfile(userId: ID!): UserProfile
+  listUsersByOrganization(organizationId: ID!, limit: Int, nextToken: String): UserProfileConnection!
+  listPrimaryUsersBySupporter(supporterId: ID!, limit: Int, nextToken: String): SupportLinkConnection!
+
+  getTask(taskId: ID!): Task
+  listTaskSteps(taskId: ID!, limit: Int, nextToken: String): TaskStepConnection!
+  listTasksByOwner(ownerId: ID!, limit: Int, nextToken: String): TaskConnection!
+
+  listAssignmentsForUser(userId: ID!, limit: Int, nextToken: String): AssignmentConnection!
+  listProgressEventsForUser(userId: ID!, assignmentId: ID, limit: Int, nextToken: String): ProgressEventConnection!
+  getMediaDownloadUrl(taskId: ID!, assetId: ID!): MediaDownloadTarget
+  listMediaForTask(taskId: ID!, limit: Int, nextToken: String): MediaAssetConnection!
+
+  # SystemAdmin-only admin/debug listings — query entityTypeIndex (no Scan),
+  # paginated. Gated to the SystemAdmin Cognito group at the edge; the resolver
+  # re-checks the group as defense-in-depth.
+  listAllUsers(limit: Int, nextToken: String): UserProfileConnection!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  listAllTasks(limit: Int, nextToken: String): TaskConnection!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 }
 
 type Mutation {
-  createTask(input: CreateTaskInput!): Task!
-  # Break a daily-living task into ordered, source-cited steps via Bedrock KB + RAG
-  generateTaskSteps(input: GenerateTaskStepsInput!): TaskStepsResponse!
-}
+  createUserProfile(input: CreateUserProfileInput!): UserProfile
+  createSupportLink(input: CreateSupportLinkInput!): SupportLink
 
-type Query {
-  # TODO: Add getTask, listTasks queries in a future milestone
-  healthCheck: String!
+  # Create a reusable task template (and optionally its ordered steps).
+  createTask(input: CreateTaskInput!): Task
+  createTaskStep(input: CreateTaskStepInput!): TaskStep
+
+  createAssignment(input: CreateAssignmentInput!): Assignment
+  updateAssignmentStatus(input: UpdateAssignmentStatusInput!): Assignment
+
+  createProgressEvent(input: CreateProgressEventInput!): ProgressEvent
+
+  # Mint a presigned S3 upload URL; the client uploads the file, then calls
+  # createMediaAsset with the returned s3Key to register the metadata.
+  createMediaUploadUrl(input: CreateMediaUploadUrlInput!): MediaUploadTarget
+  createMediaAsset(input: CreateMediaAssetInput!): MediaAsset
+
+  # Break a daily-living task into ordered, source-cited steps via Bedrock KB + RAG.
+  generateTaskSteps(input: GenerateTaskStepsInput!): TaskStepsResponse!
 }
 
 schema {

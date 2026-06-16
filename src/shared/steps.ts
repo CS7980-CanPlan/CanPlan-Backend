@@ -1,4 +1,4 @@
-import type { Citation, RetrievedPassage, TaskStep } from './types';
+import type { Citation, GeneratedStep, RetrievedPassage } from './types';
 
 /** Round-3 system prompt — copied verbatim from prototype generator.py `_SYSTEM`. */
 export const SYSTEM_PROMPT =
@@ -76,7 +76,7 @@ export function resolveCitations(chunkIds: string[], passages: RetrievedPassage[
   return resolved;
 }
 
-/** Convenience: map raw parsed steps + retrieved passages into resolved TaskSteps. */
-export function toTaskSteps(raw: RawSteps, passages: RetrievedPassage[]): TaskStep[] {
+/** Convenience: map raw parsed steps + retrieved passages into resolved GeneratedSteps. */
+export function toTaskSteps(raw: RawSteps, passages: RetrievedPassage[]): GeneratedStep[] {
   return raw.steps.map((s) => ({ text: s.text, citations: resolveCitations(s.citations, passages) }));
 }

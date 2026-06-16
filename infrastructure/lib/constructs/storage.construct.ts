@@ -23,6 +23,17 @@ export class Storage extends Construct {
       bucketName: `canplan-media-${envName}-${account}-${region}`,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
+      // Allow browser clients to PUT to presigned upload URLs (createMediaUploadUrl)
+      // and GET media back. `*` origins are fine for dev — restrict to the web
+      // portal origin(s) for prod.
+      cors: [
+        {
+          allowedMethods: [s3.HttpMethods.PUT, s3.HttpMethods.GET, s3.HttpMethods.HEAD],
+          allowedOrigins: ['*'],
+          allowedHeaders: ['*'],
+          maxAge: 3000,
+        },
+      ],
       // Sandbox: empty + delete on teardown. dev / prod: retain.
       removalPolicy: isSandbox ? cdk.RemovalPolicy.DESTROY : cdk.RemovalPolicy.RETAIN,
       autoDeleteObjects: isSandbox,

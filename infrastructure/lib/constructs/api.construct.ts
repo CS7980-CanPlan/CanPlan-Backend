@@ -11,6 +11,19 @@ export interface ApiProps {
   readonly userPool: cognito.IUserPool;
   readonly createTaskFn: lambda.IFunction;
   readonly generateTaskStepsFn: lambda.IFunction;
+  /** Domain Lambdas — each backs several fields, routed internally by fieldName. */
+  readonly usersFn: lambda.IFunction;
+  readonly tasksFn: lambda.IFunction;
+  readonly assignmentsFn: lambda.IFunction;
+  readonly progressFn: lambda.IFunction;
+  readonly mediaFn: lambda.IFunction;
+  readonly adminFn: lambda.IFunction;
+}
+
+/** A (typeName, fieldName) pair wired to a Lambda data source. */
+interface FieldBinding {
+  readonly typeName: 'Query' | 'Mutation';
+  readonly fieldName: string;
 }
 
 /** AppSync GraphQL API and its resolvers. */
@@ -21,7 +34,7 @@ export class Api extends Construct {
   constructor(scope: Construct, id: string, props: ApiProps) {
     super(scope, id);
 
-    const { envName, userPool, createTaskFn, generateTaskStepsFn } = props;
+    const { envName, userPool } = props;
 
     const api = new appsync.GraphqlApi(this, 'CanPlanApi', {
       name: `canplan-api-${envName}`,
@@ -50,19 +63,67 @@ export class Api extends Construct {
       xrayEnabled: false,
     });
 
-    // createTask mutation → Lambda data source
-    const createTaskDs = api.addLambdaDataSource('CreateTaskDataSource', createTaskFn);
-    createTaskDs.createResolver('CreateTaskResolver', {
-      typeName: 'Mutation',
-      fieldName: 'createTask',
-    });
+    // Wire a Lambda to one or more (typeName, fieldName) resolvers via a single
+    // data source. Domain Lambdas route on info.fieldName, so they back several fields.
+    const wire = (dsId: string, fn: lambda.IFunction, bindings: FieldBinding[]): void => {
+      const ds = api.addLambdaDataSource(dsId, fn);
+      for (const { typeName, fieldName } of bindings) {
+        ds.createResolver(`${fieldName}Resolver`, { typeName, fieldName });
+      }
+    };
 
-    // generateTaskSteps mutation → Lambda data source
-    const generateTaskStepsDs = api.addLambdaDataSource('GenerateTaskStepsDataSource', generateTaskStepsFn);
-    generateTaskStepsDs.createResolver('GenerateTaskStepsResolver', {
-      typeName: 'Mutation',
-      fieldName: 'generateTaskSteps',
-    });
+    // createTask — dedicated Lambda (writes a task + its steps atomically).
+    wire('CreateTaskDataSource', props.createTaskFn, [{ typeName: 'Mutation', fieldName: 'createTask' }]);
+
+    // generateTaskSteps — Bedrock KB + RAG.
+    wire('GenerateTaskStepsDataSource', props.generateTaskStepsFn, [
+      { typeName: 'Mutation', fieldName: 'generateTaskSteps' },
+    ]);
+
+    // UserProfile + SupportLink.
+    wire('UsersDataSource', props.usersFn, [
+      { typeName: 'Mutation', fieldName: 'createUserProfile' },
+      { typeName: 'Mutation', fieldName: 'createSupportLink' },
+      { typeName: 'Query', fieldName: 'getUserProfile' },
+      { typeName: 'Query', fieldName: 'listUsersByOrganization' },
+      { typeName: 'Query', fieldName: 'listPrimaryUsersBySupporter' },
+    ]);
+
+    // Task reads + standalone step creation.
+    wire('TasksDataSource', props.tasksFn, [
+      { typeName: 'Mutation', fieldName: 'createTaskStep' },
+      { typeName: 'Query', fieldName: 'getTask' },
+      { typeName: 'Query', fieldName: 'listTaskSteps' },
+      { typeName: 'Query', fieldName: 'listTasksByOwner' },
+    ]);
+
+    // Assignments.
+    wire('AssignmentsDataSource', props.assignmentsFn, [
+      { typeName: 'Mutation', fieldName: 'createAssignment' },
+      { typeName: 'Mutation', fieldName: 'updateAssignmentStatus' },
+      { typeName: 'Query', fieldName: 'listAssignmentsForUser' },
+    ]);
+
+    // Progress events.
+    wire('ProgressDataSource', props.progressFn, [
+      { typeName: 'Mutation', fieldName: 'createProgressEvent' },
+      { typeName: 'Query', fieldName: 'listProgressEventsForUser' },
+    ]);
+
+    // Media assets — presigned upload + download URLs, metadata registration, listing.
+    wire('MediaDataSource', props.mediaFn, [
+      { typeName: 'Mutation', fieldName: 'createMediaUploadUrl' },
+      { typeName: 'Mutation', fieldName: 'createMediaAsset' },
+      { typeName: 'Query', fieldName: 'getMediaDownloadUrl' },
+      { typeName: 'Query', fieldName: 'listMediaForTask' },
+    ]);
+
+    // SystemAdmin-only list-all APIs (the schema also gates these to the SystemAdmin
+    // group via @aws_cognito_user_pools; the Lambda re-checks as defense-in-depth).
+    wire('AdminDataSource', props.adminFn, [
+      { typeName: 'Query', fieldName: 'listAllUsers' },
+      { typeName: 'Query', fieldName: 'listAllTasks' },
+    ]);
 
     // healthCheck query — returns a static string, no data source needed
     const noneDs = api.addNoneDataSource('NoneDataSource');
