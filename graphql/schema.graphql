@@ -260,10 +260,26 @@ input GenerateTaskStepsInput {
   context: QueryContext
 }
 
+# ─── Admin / debug pagination ───────────────────────────────────────────────--
+# `nextToken` is an opaque, base64-encoded DynamoDB key; pass it back to fetch the
+# next page. null when there are no more pages.
+
+type UserProfileConnection {
+  items: [UserProfile!]!
+  nextToken: String
+}
+
+type TaskConnection {
+  items: [Task!]!
+  nextToken: String
+}
+
 # ─── Operations ─────────────────────────────────────────────────────────────--
 
 type Query {
-  healthCheck: String!
+  # Liveness probe — reachable with the API key (monitors/CI) OR a Cognito JWT.
+  # Every other field uses the API's default Cognito User Pool auth.
+  healthCheck: String! @aws_api_key @aws_cognito_user_pools
 
   getUserProfile(userId: ID!): UserProfile
   listUsersByOrganization(organizationId: ID!): [UserProfile!]!
@@ -276,6 +292,14 @@ type Query {
   listAssignmentsForUser(userId: ID!): [Assignment!]!
   listProgressEventsForUser(userId: ID!, assignmentId: ID): [ProgressEvent!]!
   listMediaForTask(taskId: ID!): [MediaAsset!]!
+
+  # SystemAdmin-only admin/debug listings — query entityTypeIndex (no Scan),
+  # paginated. Gated to the SystemAdmin Cognito group at the edge; the resolver
+  # re-checks the group as defense-in-depth.
+  listAllUsers(limit: Int, nextToken: String): UserProfileConnection!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  listAllTasks(limit: Int, nextToken: String): TaskConnection!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 }
 
 type Mutation {

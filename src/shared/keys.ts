@@ -8,6 +8,7 @@
 export const ENTITY = {
   USER_PROFILE: 'UserProfile',
   SUPPORT_LINK: 'SupportLink',
+  ORGANIZATION: 'Organization',
   TASK: 'Task',
   TASK_STEP: 'TaskStep',
   ASSIGNMENT: 'Assignment',
@@ -22,6 +23,10 @@ export type EntityType = (typeof ENTITY)[keyof typeof ENTITY];
 export const SUPPORTER_INDEX = 'supporterIndex';
 export const ORG_INDEX = 'orgIndex';
 export const TASK_OWNER_INDEX = 'taskOwnerIndex';
+// General-purpose index keyed by entityType — backs SystemAdmin/admin listing APIs
+// (list-all-by-type) without scanning the table. Every item carries entityType +
+// createdAt, so all entities are queryable by type, newest-first.
+export const ENTITY_TYPE_INDEX = 'entityTypeIndex';
 
 // ── Fixed sort-key values ─────────────────────────────────────────────────────
 export const PROFILE_SK = '#PROFILE';

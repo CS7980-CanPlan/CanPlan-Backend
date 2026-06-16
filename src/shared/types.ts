@@ -178,11 +178,22 @@ export interface CreateMediaAssetInput {
   size?: number;
 }
 
+// Cognito User Pool identity AppSync passes to a Lambda resolver. `groups` is the
+// caller's Cognito groups surfaced as a top-level array; the raw claim lives under
+// claims['cognito:groups'].
+export interface AppSyncIdentity {
+  sub?: string;
+  username?: string;
+  groups?: string[] | null;
+  claims?: Record<string, unknown>;
+  sourceIp?: string[];
+}
+
 // Shape of the AppSync event passed to Lambda resolvers. `info.fieldName` lets a
 // single Lambda back several fields of one domain (routing on the resolved field).
 export interface AppSyncEvent<TArgs = Record<string, unknown>> {
   arguments: TArgs;
-  identity?: unknown;
+  identity?: AppSyncIdentity;
   source?: unknown;
   info?: {
     fieldName: string;
@@ -191,6 +202,13 @@ export interface AppSyncEvent<TArgs = Record<string, unknown>> {
   request?: {
     headers: Record<string, string>;
   };
+}
+
+// A paginated list result (mirrors the GraphQL *Connection types). `nextToken` is an
+// opaque, base64-encoded DynamoDB LastEvaluatedKey; null when there are no more pages.
+export interface Connection<T> {
+  items: T[];
+  nextToken: string | null;
 }
 
 // Step generation: a task query in, ordered source-cited steps out

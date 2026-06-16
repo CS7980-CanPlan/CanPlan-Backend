@@ -62,6 +62,7 @@ export class CanPlanBackendStack extends cdk.Stack {
       assignmentsFn: functions.assignmentsFn,
       progressFn: functions.progressFn,
       mediaFn: functions.mediaFn,
+      adminFn: functions.adminFn,
     });
 
     // ── Outputs ───────────────────────────────────────────────────────────────

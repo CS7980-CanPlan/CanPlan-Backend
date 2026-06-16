@@ -84,9 +84,10 @@ GraphQL types below. The key layout (for reference):
 | ProgressEvent | `USER#<userId>` | `PROGRESS#<timestamp>#<eventId>` |
 | MediaAsset | `TASK#<taskId>` | `MEDIA#<assetId>` |
 
-Three GSIs serve the cross-cutting lists: `supporterIndex` (users managed by a
+Four GSIs serve the cross-cutting lists: `supporterIndex` (users managed by a
 supporter), `orgIndex` (users in an organization), `taskOwnerIndex` (task templates
-by owner).
+by owner), and `entityTypeIndex` (every item of one `entityType`, newest-first —
+backs the SystemAdmin list-all APIs without a Scan).
 
 ---
 
@@ -94,11 +95,21 @@ by owner).
 
 ### `healthCheck` — query
 
-Liveness probe. Returns the static string `"OK"`. Works with the API key, so it's
-useful for verifying connectivity before wiring up Cognito.
+Liveness probe. Returns the static string `"OK"`. It's the one field annotated with
+both `@aws_api_key` and `@aws_cognito_user_pools`, so it accepts **either** the API
+key (`x-api-key`) **or** a Cognito JWT — letting monitors/CI verify connectivity
+without a signed-in user. (Every other field requires a Cognito JWT.)
 
 ```graphql
 query { healthCheck }
+```
+
+```bash
+# With the API key (no login required):
+curl -s "$GRAPHQL_URL" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $API_KEY" \
+  -d '{"query":"query { healthCheck }"}'
 ```
 
 ---
@@ -200,6 +211,46 @@ These follow the same request/response conventions. See
 
 > **Media:** binaries live in the S3 media bucket; DynamoDB stores only the `s3Key`
 > and descriptive metadata (`type`, `mimeType`, `ownerId`, `size`, optional `stepId`).
+
+---
+
+### Admin listings — queries (SystemAdmin only)
+
+`list-all-by-entity-type` endpoints for admin/debug tooling. They query the
+`entityTypeIndex` (never a Scan), return newest-first, and are **restricted to the
+`SystemAdmin` Cognito group** — both at the AppSync edge (`@aws_cognito_user_pools`)
+and re-checked in the resolver. A non-SystemAdmin caller gets an authorization error.
+
+| Operation | Returns |
+|---|---|
+| `listAllUsers(limit, nextToken)` | `UserProfileConnection` |
+| `listAllTasks(limit, nextToken)` | `TaskConnection` |
+
+Both take an optional `limit` (page size) and `nextToken`, and return
+`{ items, nextToken }`. `nextToken` is an **opaque, base64-encoded** cursor — pass
+the value you got back to fetch the next page; it's `null` on the last page.
+
+```graphql
+query ListUsers($limit: Int, $nextToken: String) {
+  listAllUsers(limit: $limit, nextToken: $nextToken) {
+    items { userId role displayName organizationId createdAt }
+    nextToken
+  }
+}
+```
+
+```ts
+// Page through every user (requires a SystemAdmin JWT in Authorization):
+let nextToken: string | undefined;
+do {
+  const page = await graphql(LIST_USERS, { limit: 50, nextToken }, systemAdminToken);
+  process(page.listAllUsers.items);
+  nextToken = page.listAllUsers.nextToken ?? undefined;
+} while (nextToken);
+```
+
+`listAllTasks` returns Task `#META` items only (TaskStep items have
+`entityType = "TaskStep"`, so they don't appear here).
 
 ---
 

@@ -61,5 +61,18 @@ export class Database extends Construct {
       sortKey: { name: 'createdAt', type: dynamodb.AttributeType.STRING },
       projectionType: dynamodb.ProjectionType.ALL,
     });
+
+    // entityTypeIndex — general-purpose index for SystemAdmin/admin listing APIs:
+    // list every item of one entityType (UserProfile, Task, Assignment, MediaAsset,
+    // …) newest-first, without scanning the table. Every item carries entityType +
+    // createdAt. NOTE: partitioning by entityType concentrates each type on one
+    // partition (a hot-partition trade-off acceptable for low-volume admin/debug
+    // reads — see follow-up notes).
+    this.table.addGlobalSecondaryIndex({
+      indexName: 'entityTypeIndex',
+      partitionKey: { name: 'entityType', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'createdAt', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
   }
 }

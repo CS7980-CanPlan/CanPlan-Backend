@@ -29,6 +29,8 @@ export class Functions extends Construct {
   public readonly assignmentsFn: NodejsFunction;
   public readonly progressFn: NodejsFunction;
   public readonly mediaFn: NodejsFunction;
+  /** SystemAdmin-only list-all-by-entityType APIs (read-only). */
+  public readonly adminFn: NodejsFunction;
 
   constructor(scope: Construct, id: string, props: FunctionsProps) {
     super(scope, id);
@@ -67,6 +69,10 @@ export class Functions extends Construct {
       // grantReadWriteData also covers the table's GSIs (table-arn/index/*).
       table.grantReadWriteData(fn);
     }
+
+    // admin — read-only list-all-by-entityType (queries entityTypeIndex; never writes).
+    this.adminFn = dataFn('AdminFunction', 'admin', 'admin');
+    table.grantReadData(this.adminFn);
 
     // ── generateTaskSteps (Bedrock KB + RAG) ────────────────────────────────────
     this.generateTaskStepsFn = new NodejsFunction(this, 'GenerateTaskStepsFunction', {

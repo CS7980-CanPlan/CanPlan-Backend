@@ -23,6 +23,7 @@ ProgressEvent, MediaAsset, Report. The item-key conventions live in
 | `createAssignment`, `updateAssignmentStatus`, `listAssignmentsForUser` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB |
 | `createProgressEvent`, `listProgressEventsForUser` | Query/Mutation | `canplan-progress-<env>` Lambda + DynamoDB |
 | `createMediaAsset`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB |
+| `listAllUsers`, `listAllTasks` | Query | `canplan-admin-<env>` Lambda + DynamoDB `entityTypeIndex` (SystemAdmin only, paginated) |
 | `generateTaskSteps` | Mutation | `canplan-generateTaskSteps-<env>` Lambda + Bedrock KB RAG |
 
 Domain Lambdas back several fields each, routing on the resolved GraphQL field
@@ -53,7 +54,7 @@ region:
 
 | Region | Lambda functions you should expect |
 | ------ | ---------------------------------- |
-| Backend region | `canplan-createTask-<env>`, `canplan-users-<env>`, `canplan-tasks-<env>`, `canplan-assignments-<env>`, `canplan-progress-<env>`, `canplan-media-<env>`, `canplan-generateTaskSteps-<env>`, CDK cross-region reader, sandbox S3 auto-delete helper |
+| Backend region | `canplan-createTask-<env>`, `canplan-users-<env>`, `canplan-tasks-<env>`, `canplan-assignments-<env>`, `canplan-progress-<env>`, `canplan-media-<env>`, `canplan-admin-<env>`, `canplan-generateTaskSteps-<env>`, CDK cross-region reader, sandbox S3 auto-delete helper |
 | Knowledge Base region | OpenSearch index custom-resource provider, bucket deployment helper, CDK cross-region writer, sandbox S3 auto-delete helper |
 
 ## Prerequisites
@@ -227,8 +228,10 @@ infrastructure/lib/constructs/                 CDK constructs
 scripts/build-corpus.ts                        seed.jsonl -> data/corpus/dist
 src/lambdas/createTask/handler.ts              createTask resolver (Task + steps)
 src/lambdas/{users,tasks,assignments,progress,media}/handler.ts   Domain resolvers (routed by fieldName)
+src/lambdas/admin/handler.ts                   SystemAdmin list-all-by-entityType resolvers
 src/lambdas/generateTaskSteps/handler.ts       KB Retrieve -> Converse resolver
 src/shared/keys.ts                             Single-table PK/SK + entityType conventions
+src/shared/{auth,pagination}.ts                Cognito group checks + nextToken cursors
 src/shared/                                    Shared AWS clients/types/helpers
 docs/API.md                                    Frontend API reference
 ```

@@ -17,6 +17,7 @@ export interface ApiProps {
   readonly assignmentsFn: lambda.IFunction;
   readonly progressFn: lambda.IFunction;
   readonly mediaFn: lambda.IFunction;
+  readonly adminFn: lambda.IFunction;
 }
 
 /** A (typeName, fieldName) pair wired to a Lambda data source. */
@@ -113,6 +114,13 @@ export class Api extends Construct {
     wire('MediaDataSource', props.mediaFn, [
       { typeName: 'Mutation', fieldName: 'createMediaAsset' },
       { typeName: 'Query', fieldName: 'listMediaForTask' },
+    ]);
+
+    // SystemAdmin-only list-all APIs (the schema also gates these to the SystemAdmin
+    // group via @aws_cognito_user_pools; the Lambda re-checks as defense-in-depth).
+    wire('AdminDataSource', props.adminFn, [
+      { typeName: 'Query', fieldName: 'listAllUsers' },
+      { typeName: 'Query', fieldName: 'listAllTasks' },
     ]);
 
     // healthCheck query — returns a static string, no data source needed

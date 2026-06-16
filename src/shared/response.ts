@@ -14,3 +14,11 @@ export class NotFoundError extends Error {
     this.name = 'NotFoundError';
   }
 }
+
+/** Caller is authenticated but lacks the required role/group (e.g. SystemAdmin). */
+export class UnauthorizedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UnauthorizedError';
+  }
+}
