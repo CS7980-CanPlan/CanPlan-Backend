@@ -110,10 +110,11 @@ export class Api extends Construct {
       { typeName: 'Query', fieldName: 'listProgressEventsForUser' },
     ]);
 
-    // Media assets — presigned upload URL, metadata registration, and listing.
+    // Media assets — presigned upload + download URLs, metadata registration, listing.
     wire('MediaDataSource', props.mediaFn, [
       { typeName: 'Mutation', fieldName: 'createMediaUploadUrl' },
       { typeName: 'Mutation', fieldName: 'createMediaAsset' },
+      { typeName: 'Query', fieldName: 'getMediaDownloadUrl' },
       { typeName: 'Query', fieldName: 'listMediaForTask' },
     ]);
 

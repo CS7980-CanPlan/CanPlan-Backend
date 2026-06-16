@@ -154,6 +154,13 @@ type MediaUploadTarget {
   expiresIn: Int!
 }
 
+# Short-lived presigned GET URL for a private media object (getMediaDownloadUrl).
+type MediaDownloadTarget {
+  downloadUrl: String!
+  s3Key: String!
+  expiresIn: Int!
+}
+
 # ─── AI step generation (Bedrock KB + RAG) ──────────────────────────────────--
 
 type Citation {
@@ -331,6 +338,7 @@ type Query {
 
   listAssignmentsForUser(userId: ID!, limit: Int, nextToken: String): AssignmentConnection!
   listProgressEventsForUser(userId: ID!, assignmentId: ID, limit: Int, nextToken: String): ProgressEventConnection!
+  getMediaDownloadUrl(taskId: ID!, assetId: ID!): MediaDownloadTarget
   listMediaForTask(taskId: ID!, limit: Int, nextToken: String): MediaAssetConnection!
 
   # SystemAdmin-only admin/debug listings — query entityTypeIndex (no Scan),

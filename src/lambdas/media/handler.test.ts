@@ -1,7 +1,7 @@
 import { handler } from './handler';
 import { dynamo } from '../../shared/dynamodb';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import type { Connection, MediaAsset, MediaUploadTarget } from '../../shared/types';
+import type { Connection, MediaAsset, MediaDownloadTarget, MediaUploadTarget } from '../../shared/types';
 
 jest.mock('../../shared/dynamodb', () => ({
   dynamo: { send: jest.fn() },
@@ -13,6 +13,7 @@ jest.mock('../../shared/s3', () => ({
   s3: {},
   MEDIA_BUCKET: 'canplan-media-test',
   UPLOAD_URL_TTL_SECONDS: 900,
+  DOWNLOAD_URL_TTL_SECONDS: 900,
 }));
 
 jest.mock('@aws-sdk/s3-request-presigner', () => ({
@@ -116,5 +117,38 @@ describe('media handler — createMediaUploadUrl', () => {
       handler(event('createMediaUploadUrl', { input: { taskId: 't1' } })),
     ).rejects.toThrow('contentType is required');
     expect(mockGetSignedUrl).not.toHaveBeenCalled();
+  });
+});
+
+describe('media handler — getMediaDownloadUrl', () => {
+  it('looks the asset up, then presigns a GET for its s3Key', async () => {
+    mockSend.mockResolvedValueOnce({ Item: { assetId: 'a1', taskId: 't1', s3Key: 'media/t1/abc.png' } });
+    const result = (await handler(
+      event('getMediaDownloadUrl', { taskId: 't1', assetId: 'a1' }),
+    )) as MediaDownloadTarget;
+
+    // Asset lookup by PK/SK first.
+    expect(lastInput().Key).toEqual({ PK: 'TASK#t1', SK: 'MEDIA#a1' });
+    // Then a presigned GetObject for the asset's real s3Key.
+    const [, command] = mockGetSignedUrl.mock.calls[0];
+    expect(command.constructor.name).toBe('GetObjectCommand');
+    expect(command.input.Bucket).toBe('canplan-media-test');
+    expect(command.input.Key).toBe('media/t1/abc.png');
+    expect(result.downloadUrl).toBe('https://signed.example/upload');
+    expect(result.s3Key).toBe('media/t1/abc.png');
+    expect(result.expiresIn).toBe(900);
+  });
+
+  it('throws NotFound when the asset does not exist (never signs an arbitrary key)', async () => {
+    mockSend.mockResolvedValueOnce({}); // no Item
+    await expect(handler(event('getMediaDownloadUrl', { taskId: 't1', assetId: 'missing' }))).rejects.toThrow(
+      'media asset not found',
+    );
+    expect(mockGetSignedUrl).not.toHaveBeenCalled();
+  });
+
+  it('validates taskId and assetId', async () => {
+    await expect(handler(event('getMediaDownloadUrl', { assetId: 'a1' }))).rejects.toThrow('taskId is required');
+    await expect(handler(event('getMediaDownloadUrl', { taskId: 't1' }))).rejects.toThrow('assetId is required');
   });
 });

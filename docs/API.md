@@ -215,6 +215,7 @@ These follow the same request/response conventions. See
 | `listProgressEventsForUser(userId, assignmentId?)` | query | Query `PROGRESS#` rows; optionally filter by assignment |
 | `createMediaUploadUrl(input)` | mutation | Mint a presigned S3 **PUT** URL + server-owned `s3Key` |
 | `createMediaAsset(input)` | mutation | Register metadata for an uploaded `IMAGE` / `AUDIO` / `VIDEO` asset |
+| `getMediaDownloadUrl(taskId, assetId)` | query | Presigned **GET** URL to view/download a private asset |
 | `listMediaForTask(taskId)` | query | Query `MEDIA#` rows under the task |
 
 > **Media is upload-first.** Binaries live in the S3 media bucket; DynamoDB stores
@@ -234,6 +235,11 @@ These follow the same request/response conventions. See
 > # 2) upload the bytes to the presigned URL from step 1
 > curl -X PUT "$UPLOAD_URL" -H "Content-Type: image/png" --data-binary @photo.png
 > ```
+>
+> **Viewing/downloading is symmetric.** The bucket is private, so to render media
+> call **`getMediaDownloadUrl(taskId, assetId)`** → `{ downloadUrl, s3Key, expiresIn }`
+> and `GET` the (short-lived) `downloadUrl`. It only signs assets that are actually
+> registered — unknown ids return a not-found error rather than signing an arbitrary key.
 
 ---
 

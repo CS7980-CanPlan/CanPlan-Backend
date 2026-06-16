@@ -1,18 +1,19 @@
 import { randomUUID } from 'crypto';
-import { PutObjectCommand } from '@aws-sdk/client-s3';
-import { PutCommand } from '@aws-sdk/lib-dynamodb';
+import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
+import { GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import { ENTITY, MEDIA_PREFIX, mediaSk, taskPk } from '../../shared/keys';
 import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
-import { ValidationError } from '../../shared/response';
-import { MEDIA_BUCKET, s3, UPLOAD_URL_TTL_SECONDS } from '../../shared/s3';
+import { NotFoundError, ValidationError } from '../../shared/response';
+import { DOWNLOAD_URL_TTL_SECONDS, MEDIA_BUCKET, s3, UPLOAD_URL_TTL_SECONDS } from '../../shared/s3';
 import type {
   AppSyncEvent,
   Connection,
   CreateMediaAssetInput,
   CreateMediaUploadUrlInput,
   MediaAsset,
+  MediaDownloadTarget,
   MediaUploadTarget,
 } from '../../shared/types';
 
@@ -23,22 +24,48 @@ import type {
  *
  * Upload flow: createMediaUploadUrl → client PUTs the file to the returned uploadUrl
  * → createMediaAsset registers the metadata for the now-uploaded object.
+ * Download: getMediaDownloadUrl returns a short-lived presigned GET for private media.
  */
 export const handler = async (
   event: AppSyncEvent<Record<string, unknown>>,
-): Promise<MediaAsset | Connection<MediaAsset> | MediaUploadTarget> => {
+): Promise<MediaAsset | Connection<MediaAsset> | MediaUploadTarget | MediaDownloadTarget> => {
   const { arguments: args } = event;
   switch (event.info?.fieldName) {
     case 'createMediaUploadUrl':
       return createMediaUploadUrl(args.input as CreateMediaUploadUrlInput);
     case 'createMediaAsset':
       return createMediaAsset(args.input as CreateMediaAssetInput);
+    case 'getMediaDownloadUrl':
+      return getMediaDownloadUrl(args.taskId as string, args.assetId as string);
     case 'listMediaForTask':
       return listMediaForTask(args.taskId as string, pageArgs(args));
     default:
       throw new Error(`media handler: unsupported field "${event.info?.fieldName}"`);
   }
 };
+
+/**
+ * Presigned GET for a registered media asset. Looks the asset up first so we only
+ * ever sign keys that actually exist (no arbitrary-key probing), then signs its s3Key.
+ */
+async function getMediaDownloadUrl(taskId: string, assetId: string): Promise<MediaDownloadTarget> {
+  if (!taskId?.trim()) throw new ValidationError('taskId is required and cannot be empty');
+  if (!assetId?.trim()) throw new ValidationError('assetId is required and cannot be empty');
+
+  const result = await dynamo.send(
+    new GetCommand({ TableName: TABLE_NAME, Key: { PK: taskPk(taskId), SK: mediaSk(assetId) } }),
+  );
+  const asset = result.Item as MediaAsset | undefined;
+  if (!asset) throw new NotFoundError('media asset not found');
+
+  const downloadUrl = await getSignedUrl(
+    s3,
+    new GetObjectCommand({ Bucket: MEDIA_BUCKET, Key: asset.s3Key }),
+    { expiresIn: DOWNLOAD_URL_TTL_SECONDS },
+  );
+
+  return { downloadUrl, s3Key: asset.s3Key, expiresIn: DOWNLOAD_URL_TTL_SECONDS };
+}
 
 async function createMediaUploadUrl(input: CreateMediaUploadUrlInput): Promise<MediaUploadTarget> {
   const taskId = input?.taskId?.trim();

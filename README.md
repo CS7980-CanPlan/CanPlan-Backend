@@ -22,7 +22,7 @@ ProgressEvent, MediaAsset, Report. The item-key conventions live in
 | `getTask`, `listTaskSteps`, `listTasksByOwner`, `createTaskStep` | Query/Mutation | `canplan-tasks-<env>` Lambda + DynamoDB |
 | `createAssignment`, `updateAssignmentStatus`, `listAssignmentsForUser` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB |
 | `createProgressEvent`, `listProgressEventsForUser` | Query/Mutation | `canplan-progress-<env>` Lambda + DynamoDB |
-| `createMediaUploadUrl`, `createMediaAsset`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB + S3 media bucket (presigned upload) |
+| `createMediaUploadUrl`, `createMediaAsset`, `getMediaDownloadUrl`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB + S3 media bucket (presigned upload/download) |
 | `listAllUsers`, `listAllTasks` | Query | `canplan-admin-<env>` Lambda + DynamoDB `entityTypeIndex` (SystemAdmin only, paginated) |
 | `generateTaskSteps` | Mutation | `canplan-generateTaskSteps-<env>` Lambda + Bedrock KB RAG |
 

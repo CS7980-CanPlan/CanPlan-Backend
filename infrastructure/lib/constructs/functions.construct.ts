@@ -77,10 +77,11 @@ export class Functions extends Construct {
     this.adminFn = dataFn('AdminFunction', 'admin', 'admin');
     table.grantReadData(this.adminFn);
 
-    // The media Lambda also mints presigned S3 upload URLs (createMediaUploadUrl);
-    // the signed URL inherits the Lambda's s3:PutObject permission on this bucket.
+    // The media Lambda mints presigned S3 URLs (createMediaUploadUrl / getMediaDownloadUrl);
+    // each signed URL inherits the Lambda's s3:PutObject / s3:GetObject permission here.
     this.mediaFn.addEnvironment('MEDIA_BUCKET_NAME', mediaBucket.bucketName);
     mediaBucket.grantPut(this.mediaFn);
+    mediaBucket.grantRead(this.mediaFn);
 
     // ── generateTaskSteps (Bedrock KB + RAG) ────────────────────────────────────
     this.generateTaskStepsFn = new NodejsFunction(this, 'GenerateTaskStepsFunction', {

@@ -192,6 +192,14 @@ export interface MediaUploadTarget {
   expiresIn: number;
 }
 
+// Returned by getMediaDownloadUrl: a short-lived presigned GET URL for a private
+// media object (the bucket blocks public access).
+export interface MediaDownloadTarget {
+  downloadUrl: string;
+  s3Key: string;
+  expiresIn: number;
+}
+
 // Cognito User Pool identity AppSync passes to a Lambda resolver. `groups` is the
 // caller's Cognito groups surfaced as a top-level array; the raw claim lives under
 // claims['cognito:groups'].

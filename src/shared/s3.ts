@@ -11,3 +11,7 @@ export const MEDIA_BUCKET = process.env.MEDIA_BUCKET_NAME ?? '';
 // How long a presigned upload URL stays valid (seconds). Short by default so a
 // leaked URL is low-risk; the client uploads immediately after requesting it.
 export const UPLOAD_URL_TTL_SECONDS = Number(process.env.UPLOAD_URL_TTL_SECONDS ?? '900');
+
+// How long a presigned download (GET) URL stays valid (seconds). Kept short so a
+// link to private media can't be shared long-term; clients re-request on demand.
+export const DOWNLOAD_URL_TTL_SECONDS = Number(process.env.DOWNLOAD_URL_TTL_SECONDS ?? '900');
