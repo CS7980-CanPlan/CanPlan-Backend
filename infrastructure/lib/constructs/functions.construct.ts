@@ -28,6 +28,7 @@ export class Functions extends Construct {
   public readonly generateTaskStepsFn: NodejsFunction;
   /** Domain Lambdas — each backs several fields of one domain (routed by fieldName). */
   public readonly usersFn: NodejsFunction;
+  public readonly categoriesFn: NodejsFunction;
   public readonly tasksFn: NodejsFunction;
   public readonly assignmentsFn: NodejsFunction;
   public readonly progressFn: NodejsFunction;
@@ -63,12 +64,20 @@ export class Functions extends Construct {
 
     // ── Domain Lambdas (read + write the single table, incl. its GSIs) ──────────
     this.usersFn = dataFn('UsersFunction', 'users', 'users');
+    this.categoriesFn = dataFn('CategoriesFunction', 'categories', 'categories');
     this.tasksFn = dataFn('TasksFunction', 'tasks', 'tasks');
     this.assignmentsFn = dataFn('AssignmentsFunction', 'assignments', 'assignments');
     this.progressFn = dataFn('ProgressFunction', 'progress', 'progress');
     this.mediaFn = dataFn('MediaFunction', 'media', 'media');
 
-    for (const fn of [this.usersFn, this.tasksFn, this.assignmentsFn, this.progressFn, this.mediaFn]) {
+    for (const fn of [
+      this.usersFn,
+      this.categoriesFn,
+      this.tasksFn,
+      this.assignmentsFn,
+      this.progressFn,
+      this.mediaFn,
+    ]) {
       // grantReadWriteData also covers the table's GSIs (table-arn/index/*).
       table.grantReadWriteData(fn);
     }

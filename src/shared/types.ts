@@ -10,6 +10,7 @@ export type TaskStatus = 'DRAFT' | 'ACTIVE' | 'ARCHIVED';
 export type AssignmentStatus = 'ACTIVE' | 'COMPLETED' | 'PAUSED' | 'CANCELLED';
 export type ProgressEventType = 'STARTED' | 'PAUSED' | 'RESUMED' | 'SKIPPED' | 'COMPLETED' | 'SYNCED';
 export type MediaType = 'IMAGE' | 'AUDIO' | 'VIDEO';
+export type RepeatUnit = 'MINUTE' | 'HOUR' | 'DAY' | 'WEEK' | 'MONTH';
 
 // ── Entities ──────────────────────────────────────────────────────────────────
 export interface UserProfile {
@@ -34,14 +35,46 @@ export interface SupportLink {
   updatedAt?: string;
 }
 
+/** A user-owned grouping for tasks (folder-like). PK = USER#<ownerId>, SK = CATEGORY#<categoryId>. */
+export interface Category {
+  categoryId: string;
+  ownerId: string;
+  name: string;
+  color?: string;
+  sortOrder?: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Recurring-schedule metadata persisted on a Task (phase 1 stores it; delivery is later). */
+export interface TaskSchedule {
+  repeatEvery: number;
+  repeatUnit: RepeatUnit;
+  firstOccurrenceAt: string;
+  timezone: string;
+  enabled: boolean;
+}
+
 export interface Task {
   taskId: string;
   ownerId: string;
   title: string;
+  /** Defaults to the NO_CATEGORY sentinel when the client supplies none. */
   categoryId?: string;
+  /**
+   * Denormalized taskCategoryIndex partition key (<ownerId>#<categoryId>). Written by
+   * createTask; not part of the GraphQL Task type — clients query by ownerId/categoryId.
+   */
+  taskCategoryKey?: string;
   description?: string;
   scheduleRule?: string;
   status: TaskStatus;
+  /** Recurring-schedule metadata; present only when the task was created with a schedule. */
+  schedule?: TaskSchedule;
+  /** First (next) fire time — equals schedule.firstOccurrenceAt at creation. */
+  nextOccurrenceAt?: string;
+  /** Whether reminders are enabled; defaults to true when a schedule is provided. */
+  notificationEnabled?: boolean;
   createdAt: string;
   updatedAt?: string;
   /** Populated by createTask with the steps it just wrote; null on plain getTask. */
@@ -116,10 +149,26 @@ export interface CreateSupportLinkInput {
   permissions?: Record<string, unknown>;
 }
 
+export interface CreateCategoryInput {
+  ownerId: string;
+  name: string;
+  color?: string;
+  sortOrder?: number;
+}
+
 export interface CreateTaskStepNestedInput {
   text: string;
   mediaRefs?: string[];
   expectedDuration?: number;
+}
+
+/** Schedule metadata accepted at task creation. `enabled` defaults to true when stored. */
+export interface TaskScheduleInput {
+  repeatEvery: number;
+  repeatUnit: RepeatUnit;
+  firstOccurrenceAt: string;
+  timezone: string;
+  enabled?: boolean;
 }
 
 export interface CreateTaskInput {
@@ -130,6 +179,23 @@ export interface CreateTaskInput {
   scheduleRule?: string;
   status?: TaskStatus;
   steps?: CreateTaskStepNestedInput[];
+  schedule?: TaskScheduleInput;
+  notificationEnabled?: boolean;
+}
+
+/**
+ * Partial edit of a Task `#META` item. Only fields that are present (non-null) are
+ * changed; `ownerId` and `taskId` are immutable, and steps are edited separately.
+ */
+export interface UpdateTaskInput {
+  taskId: string;
+  title?: string;
+  categoryId?: string;
+  description?: string;
+  scheduleRule?: string;
+  status?: TaskStatus;
+  schedule?: TaskScheduleInput;
+  notificationEnabled?: boolean;
 }
 
 export interface CreateTaskStepInput {
