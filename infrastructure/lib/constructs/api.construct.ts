@@ -13,6 +13,7 @@ export interface ApiProps {
   readonly generateTaskStepsFn: lambda.IFunction;
   /** Domain Lambdas — each backs several fields, routed internally by fieldName. */
   readonly usersFn: lambda.IFunction;
+  readonly categoriesFn: lambda.IFunction;
   readonly tasksFn: lambda.IFunction;
   readonly assignmentsFn: lambda.IFunction;
   readonly progressFn: lambda.IFunction;
@@ -89,12 +90,20 @@ export class Api extends Construct {
       { typeName: 'Query', fieldName: 'listPrimaryUsersBySupporter' },
     ]);
 
-    // Task reads + standalone step creation.
+    // User-owned task categories.
+    wire('CategoriesDataSource', props.categoriesFn, [
+      { typeName: 'Mutation', fieldName: 'createCategory' },
+      { typeName: 'Query', fieldName: 'listCategoriesByOwner' },
+    ]);
+
+    // Task reads + edits + standalone step creation.
     wire('TasksDataSource', props.tasksFn, [
+      { typeName: 'Mutation', fieldName: 'updateTask' },
       { typeName: 'Mutation', fieldName: 'createTaskStep' },
       { typeName: 'Query', fieldName: 'getTask' },
       { typeName: 'Query', fieldName: 'listTaskSteps' },
       { typeName: 'Query', fieldName: 'listTasksByOwner' },
+      { typeName: 'Query', fieldName: 'listTasksByCategory' },
     ]);
 
     // Assignments.

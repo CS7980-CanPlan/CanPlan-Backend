@@ -4,14 +4,25 @@ import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import {
   ENTITY,
   META_SK,
+  NO_CATEGORY,
   STEP_PREFIX,
   stepSk,
+  TASK_CATEGORY_INDEX,
+  taskCategoryKey,
   TASK_OWNER_INDEX,
   taskPk,
 } from '../../shared/keys';
 import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
-import { ValidationError } from '../../shared/response';
-import type { AppSyncEvent, Connection, CreateTaskStepInput, Task, TaskStep } from '../../shared/types';
+import { NotFoundError, ValidationError } from '../../shared/response';
+import { normalizeSchedule } from '../../shared/schedule';
+import type {
+  AppSyncEvent,
+  Connection,
+  CreateTaskStepInput,
+  Task,
+  TaskStep,
+  UpdateTaskInput,
+} from '../../shared/types';
 
 /**
  * Tasks domain Lambda — task reads plus standalone step creation, routed by the
@@ -29,6 +40,14 @@ export const handler = async (
       return listTaskSteps(args.taskId as string, pageArgs(args));
     case 'listTasksByOwner':
       return listTasksByOwner(args.ownerId as string, pageArgs(args));
+    case 'listTasksByCategory':
+      return listTasksByCategory(
+        args.ownerId as string,
+        args.categoryId as string | undefined,
+        pageArgs(args),
+      );
+    case 'updateTask':
+      return updateTask(args.input as UpdateTaskInput);
     case 'createTaskStep':
       return createTaskStep(args.input as CreateTaskStepInput);
     default:
@@ -71,6 +90,82 @@ async function listTasksByOwner(ownerId: string, page: PageArgs): Promise<Connec
     },
     page,
   );
+}
+
+async function listTasksByCategory(
+  ownerId: string,
+  categoryId: string | undefined,
+  page: PageArgs,
+): Promise<Connection<Task>> {
+  if (!ownerId?.trim()) throw new ValidationError('ownerId is required');
+  // Blank/omitted category mirrors createTask's NO_CATEGORY default so the
+  // "uncategorized" bucket is queryable with the same key it was written under.
+  const category = categoryId?.trim() || NO_CATEGORY;
+  // taskCategoryIndex is sparse — only Task items carry taskCategoryKey — so no
+  // entityType filter is needed (unlike listTasksByOwner).
+  return queryPage<Task>(
+    {
+      TableName: TABLE_NAME,
+      IndexName: TASK_CATEGORY_INDEX,
+      KeyConditionExpression: 'taskCategoryKey = :key',
+      ExpressionAttributeValues: { ':key': taskCategoryKey(ownerId.trim(), category) },
+    },
+    page,
+  );
+}
+
+/**
+ * updateTask — partial edit of a Task `#META` item. Read-modify-write so the coupled
+ * derived fields stay consistent: changing categoryId recomputes taskCategoryKey (so
+ * the task moves buckets in taskCategoryIndex), and a new schedule re-derives
+ * nextOccurrenceAt. Only fields present (non-null) on the input change; ownerId,
+ * createdAt, and the task's steps are left untouched.
+ */
+async function updateTask(input: UpdateTaskInput): Promise<Task> {
+  const taskId = input?.taskId?.trim();
+  if (!taskId) throw new ValidationError('taskId is required and cannot be empty');
+  // title is required on a Task, so a supplied title may not be blanked out.
+  if (input.title != null && !input.title.trim()) {
+    throw new ValidationError('title cannot be empty');
+  }
+  // Validate any schedule before the read so invalid input fails fast (no wasted read).
+  const scheduleUpdate = input.schedule != null ? normalizeSchedule(input.schedule) : undefined;
+
+  const existing = await dynamo.send(
+    new GetCommand({ TableName: TABLE_NAME, Key: { PK: taskPk(taskId), SK: META_SK } }),
+  );
+  const stored = existing.Item as Task | undefined;
+  if (!stored) throw new NotFoundError(`task ${taskId} not found`);
+
+  // Spread the stored item (carries PK/SK/entityType + every untouched field), then
+  // overlay only the provided changes.
+  const updated: Task = { ...stored, updatedAt: new Date().toISOString() };
+  if (input.title != null) updated.title = input.title.trim();
+  if (input.description != null) updated.description = input.description.trim();
+  if (input.scheduleRule != null) updated.scheduleRule = input.scheduleRule.trim();
+  if (input.status != null) updated.status = input.status;
+  if (input.notificationEnabled != null) updated.notificationEnabled = input.notificationEnabled;
+  if (input.categoryId != null) {
+    // Blank collapses to NO_CATEGORY (as in createTask); recompute the GSI key.
+    const categoryId = input.categoryId.trim() || NO_CATEGORY;
+    updated.categoryId = categoryId;
+    updated.taskCategoryKey = taskCategoryKey(stored.ownerId, categoryId);
+  }
+  if (scheduleUpdate) {
+    updated.schedule = scheduleUpdate.schedule;
+    updated.nextOccurrenceAt = scheduleUpdate.nextOccurrenceAt;
+  }
+
+  await dynamo.send(
+    new PutCommand({
+      TableName: TABLE_NAME,
+      Item: updated,
+      // Fail loudly if the row vanished between the read and the write.
+      ConditionExpression: 'attribute_exists(PK)',
+    }),
+  );
+
+  return updated;
 }
 
 async function createTaskStep(input: CreateTaskStepInput): Promise<TaskStep> {

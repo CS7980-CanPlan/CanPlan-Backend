@@ -78,16 +78,19 @@ GraphQL types below. The key layout (for reference):
 |---|---|---|
 | UserProfile | `USER#<userId>` | `#PROFILE` |
 | SupportLink | `SUPPORTER#<supporterId>` | `USER#<primaryUserId>` |
+| Category | `USER#<ownerId>` | `CATEGORY#<categoryId>` |
 | Task (template) | `TASK#<taskId>` | `#META` |
 | TaskStep | `TASK#<taskId>` | `STEP#<order>` (zero-padded, e.g. `STEP#001`) |
 | Assignment | `USER#<userId>` | `ASSIGN#<assignmentId>` |
 | ProgressEvent | `USER#<userId>` | `PROGRESS#<timestamp>#<eventId>` |
 | MediaAsset | `TASK#<taskId>` | `MEDIA#<assetId>` |
 
-Four GSIs serve the cross-cutting lists: `supporterIndex` (users managed by a
+Five GSIs serve the cross-cutting lists: `supporterIndex` (users managed by a
 supporter), `orgIndex` (users in an organization), `taskOwnerIndex` (task templates
-by owner), and `entityTypeIndex` (every item of one `entityType`, newest-first —
-backs the SystemAdmin list-all APIs without a Scan).
+by owner), `taskCategoryIndex` (tasks within one owner's category — keyed on a
+denormalized `<ownerId>#<categoryId>`, newest-first), and `entityTypeIndex` (every
+item of one `entityType`, newest-first — backs the SystemAdmin list-all APIs without
+a Scan).
 
 ---
 
@@ -101,6 +104,7 @@ backs the SystemAdmin list-all APIs without a Scan).
 | `ProgressEventType` | `STARTED`, `PAUSED`, `RESUMED`, `SKIPPED`, `COMPLETED`, `SYNCED` |
 | `MediaType` | `IMAGE`, `AUDIO`, `VIDEO` |
 | `SupportLinkStatus` | `PENDING`, `ACTIVE`, `REVOKED` |
+| `RepeatUnit` | `MINUTE`, `HOUR`, `DAY`, `WEEK`, `MONTH` |
 
 Free-form object fields (`accessibilitySettings`, `permissions`, `metadata`) are the
 AppSync `AWSJSON` scalar — send/receive them as JSON objects.
@@ -142,13 +146,40 @@ user is a separate operation — see `createAssignment`.
 |---|---|---|---|
 | `ownerId` | `ID!` | ✅ | The support person / org admin who owns the template |
 | `title` | `String!` | ✅ | Non-empty after trimming |
-| `categoryId` | `ID` | — | Optional category |
+| `categoryId` | `ID` | — | Optional; blank/omitted falls back to the reserved `NO_CATEGORY` bucket (see below) |
 | `description` | `String` | — | Optional |
 | `scheduleRule` | `String` | — | Optional (e.g. an RRULE) |
 | `status` | `TaskStatus` | — | Defaults to `DRAFT` |
 | `steps` | `[CreateTaskStepNestedInput!]` | — | Ordered; each becomes a `STEP#NNN` item |
+| `schedule` | `TaskScheduleInput` | — | Optional recurring schedule (stored only — see below) |
+| `notificationEnabled` | `Boolean` | — | Defaults to `true` when `schedule` is set; otherwise left unset unless you pass it |
 
 `CreateTaskStepNestedInput`: `text: String!`, `mediaRefs: [ID!]`, `expectedDuration: Int`.
+
+**Category behavior.** Every task is filed under a category so it stays queryable by
+`listTasksByCategory`. If you omit `categoryId` (or send a blank string), the task is
+stored under the reserved id **`NO_CATEGORY`** — the implicit "uncategorized" bucket.
+`NO_CATEGORY` is never a real `Category` row; it's just the default key. The returned
+`Task.categoryId` reflects the stored value (so it's `"NO_CATEGORY"`, not `null`, when
+you didn't supply one).
+
+**Schedule behavior.** Pass `schedule` to attach recurring-reminder metadata. It is
+**stored only** in this phase — no reminders are delivered yet (see _Not available
+yet_). `TaskScheduleInput` fields:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `repeatEvery` | `Int!` | ✅ | Must be a positive integer (e.g. `2` for "every 2 …") |
+| `repeatUnit` | `RepeatUnit!` | ✅ | `MINUTE` · `HOUR` · `DAY` · `WEEK` · `MONTH` |
+| `firstOccurrenceAt` | `String!` | ✅ | Non-empty ISO-8601 timestamp of the first occurrence |
+| `timezone` | `String!` | ✅ | Non-empty IANA tz (e.g. `America/Toronto`) |
+| `enabled` | `Boolean` | — | Defaults to `true` when stored |
+
+When a schedule is supplied, the task is stored with `schedule` (its `enabled`
+defaulted to `true`), `nextOccurrenceAt` set equal to `schedule.firstOccurrenceAt`,
+and `notificationEnabled` defaulted to `true` (unless you pass `false`). Invalid
+schedules are rejected before any write (e.g. `repeatEvery: 0`, or a missing
+`firstOccurrenceAt`/`timezone`).
 
 **Returns — `Task`** (with the `steps` it just created)
 
@@ -209,6 +240,18 @@ fields are marked `!` and everything else is optional; see
 | `createSupportLink` | `input: { supporterId!, primaryUserId!, status, permissions }` | `SupportLink` · `status` defaults to `PENDING` |
 | `listPrimaryUsersBySupporter` | `supporterId!, limit, nextToken` | `SupportLinkConnection!` |
 
+**Categories**
+
+| Operation | Input | Returns |
+|---|---|---|
+| `createCategory` | `input: { ownerId!, name!, color, sortOrder }` | `Category` · `ownerId`/`name`/`color` are trimmed; `categoryId` is server-generated |
+| `listCategoriesByOwner` | `ownerId!, limit, nextToken` | `CategoryConnection!` — the owner's categories (`USER#<ownerId>` partition, `CATEGORY#` prefix) |
+
+> Categories are folder-like groupings owned by one user. A task's `categoryId`
+> points at one of these; tasks created without one fall into the reserved
+> `NO_CATEGORY` bucket (which is **not** returned by `listCategoriesByOwner` — it has
+> no `Category` row).
+
 **Tasks & steps**
 
 | Operation | Input | Returns |
@@ -216,7 +259,29 @@ fields are marked `!` and everything else is optional; see
 | `getTask` | `taskId!` | `Task` · `null` if not found · `steps` is `null` here (use `listTaskSteps`) |
 | `listTaskSteps` | `taskId!, limit, nextToken` | `TaskStepConnection!` — steps in ascending `order` |
 | `listTasksByOwner` | `ownerId!, limit, nextToken` | `TaskConnection!` |
+| `listTasksByCategory` | `ownerId!, categoryId, limit, nextToken` | `TaskConnection!` — tasks in one category; omit/blank `categoryId` for the `NO_CATEGORY` bucket |
+| `updateTask` | `input: { taskId!, title, categoryId, description, scheduleRule, status, schedule, notificationEnabled }` | `Task` — **partial edit**; see below |
 | `createTaskStep` | `input: { taskId!, order!, text!, mediaRefs, expectedDuration }` | `TaskStep` |
+
+> **`updateTask` is a partial edit.** Only the fields you include change; omitted
+> fields keep their current value. `ownerId` is immutable and **steps are not edited
+> here** (use `createTaskStep`; per-step editing isn't exposed yet). A missing
+> `taskId` returns a not-found error rather than creating a row. Two coupled fields are
+> kept consistent for you: changing `categoryId` recomputes the internal category key
+> (so the task moves buckets in `listTasksByCategory`), and supplying a new `schedule`
+> re-derives `nextOccurrenceAt`. A blank/omitted `categoryId` collapses to
+> `NO_CATEGORY`, exactly as in `createTask`; `title`, if supplied, must be non-empty;
+> and `notificationEnabled` only changes when you pass it explicitly. The `schedule`
+> fields and validation are the same as [`createTask`](#createtask--mutation).
+>
+> ```graphql
+> mutation UpdateTask($input: UpdateTaskInput!) {
+>   updateTask(input: $input) { taskId title status categoryId updatedAt }
+> }
+> ```
+> ```json
+> { "input": { "taskId": "task-123", "title": "Wash hands well", "status": "ACTIVE", "categoryId": "cat-hygiene" } }
+> ```
 
 **Assignments**
 
@@ -338,12 +403,19 @@ reached a resolver returns **HTTP 200** with the failure in an `errors` array;
 
 Planned but not implemented — don't build against them:
 
+- **Push notifications / reminder delivery** — `createTask` and `updateTask` accept
+  and persist `schedule` metadata (and derive `nextOccurrenceAt` /
+  `notificationEnabled`), but **nothing fires reminders yet**. There is no scheduling
+  engine (EventBridge), no device-token registration, and no push-notification Lambda
+  in this phase — only the query-ready fields are stored.
 - **Per-role/owner authorization on domain operations** — the `SystemAdmin` admin
   queries are group-gated (enforced), but the regular create/get/list resolvers
   don't yet verify the caller (e.g. that a primary user only reads their own data,
   or that a supporter owns the task). The schema and single-table keys are
   structured to support these rules.
-- **Update/delete** for entities other than `updateAssignmentStatus`.
+- **Delete** for any entity, and **update** for entities other than tasks
+  (`updateTask`) and assignment status (`updateAssignmentStatus`) — including
+  per-step editing (steps can only be created, via `createTaskStep`).
 - **Report generation** — the `Report` type exists in the schema, but no query or
   mutation is exposed for it yet.
 - **Streaming AI responses** — `generateTaskSteps` is request/response only.

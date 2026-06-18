@@ -9,6 +9,7 @@ export const ENTITY = {
   USER_PROFILE: 'UserProfile',
   SUPPORT_LINK: 'SupportLink',
   ORGANIZATION: 'Organization',
+  CATEGORY: 'Category',
   TASK: 'Task',
   TASK_STEP: 'TaskStep',
   ASSIGNMENT: 'Assignment',
@@ -23,6 +24,10 @@ export type EntityType = (typeof ENTITY)[keyof typeof ENTITY];
 export const SUPPORTER_INDEX = 'supporterIndex';
 export const ORG_INDEX = 'orgIndex';
 export const TASK_OWNER_INDEX = 'taskOwnerIndex';
+// Tasks within one owner's category, newest-sortable by createdAt. Keyed on the
+// denormalized `taskCategoryKey` (<ownerId>#<categoryId>) so a single Query scopes
+// to both owner and category. Sparse: only Task items carry taskCategoryKey.
+export const TASK_CATEGORY_INDEX = 'taskCategoryIndex';
 // General-purpose index keyed by entityType — backs SystemAdmin/admin listing APIs
 // (list-all-by-type) without scanning the table. Every item carries entityType +
 // createdAt, so all entities are queryable by type, newest-first.
@@ -33,11 +38,20 @@ export const PROFILE_SK = '#PROFILE';
 export const META_SK = '#META';
 
 // ── Sort-key prefixes (for begins_with queries) ──────────────────────────────
+export const CATEGORY_PREFIX = 'CATEGORY#';
 export const STEP_PREFIX = 'STEP#';
 export const ASSIGN_PREFIX = 'ASSIGN#';
 export const PROGRESS_PREFIX = 'PROGRESS#';
 export const MEDIA_PREFIX = 'MEDIA#';
 export const USER_LINK_PREFIX = 'USER#';
+
+// ── Reserved ids ──────────────────────────────────────────────────────────────
+/**
+ * Default category a Task falls into when none is supplied. Stored verbatim (not a
+ * null) so every Task carries a queryable taskCategoryKey and "uncategorized" is a
+ * first-class bucket in taskCategoryIndex, not a missing-attribute special case.
+ */
+export const NO_CATEGORY = 'NO_CATEGORY';
 
 // ── Partition keys ────────────────────────────────────────────────────────────
 export const userPk = (userId: string): string => `USER#${userId}`;
@@ -45,7 +59,17 @@ export const supporterPk = (supporterId: string): string => `SUPPORTER#${support
 export const taskPk = (taskId: string): string => `TASK#${taskId}`;
 export const reportPk = (reportId: string): string => `REPORT#${reportId}`;
 
+// ── GSI partition keys (denormalized onto items at write time) ────────────────
+/**
+ * taskCategoryIndex partition key — scopes a Task to both its owner and category in
+ * one composite so listTasksByCategory needs neither a filter nor a second key.
+ */
+export const taskCategoryKey = (ownerId: string, categoryId: string): string =>
+  `${ownerId}#${categoryId}`;
+
 // ── Sort keys ─────────────────────────────────────────────────────────────────
+/** Category SK — one row per category under its owning user (PK = USER#<ownerId>). */
+export const categorySk = (categoryId: string): string => `${CATEGORY_PREFIX}${categoryId}`;
 /** SupportLink SK — one row per managed primary user under a supporter. */
 export const userLinkSk = (primaryUserId: string): string => `USER#${primaryUserId}`;
 /** TaskStep SK — zero-padded order keeps steps lexicographically ordered (STEP#001). */

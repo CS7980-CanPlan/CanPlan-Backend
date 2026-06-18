@@ -47,6 +47,15 @@ enum MediaType {
   VIDEO
 }
 
+# Unit a task schedule repeats on (repeatEvery × repeatUnit, e.g. every 2 WEEKs).
+enum RepeatUnit {
+  MINUTE
+  HOUR
+  DAY
+  WEEK
+  MONTH
+}
+
 # ─── Domain types ───────────────────────────────────────────────────────────--
 
 type UserProfile {
@@ -72,14 +81,44 @@ type SupportLink {
   updatedAt: String
 }
 
+# A user-owned grouping for tasks (folder-like). Owned by one user; queried via
+# listCategoriesByOwner. The reserved id "NO_CATEGORY" is never stored as a Category
+# row — it's the implicit bucket for tasks created without one.
+type Category {
+  categoryId: ID!
+  ownerId: ID!
+  name: String!
+  color: String
+  sortOrder: Int
+  createdAt: String!
+  updatedAt: String!
+}
+
+# Recurring-schedule metadata stored on a Task. Phase 1 persists this only — reminder
+# delivery (EventBridge / push) is not implemented yet.
+type TaskSchedule {
+  repeatEvery: Int!
+  repeatUnit: RepeatUnit!
+  firstOccurrenceAt: String!
+  timezone: String!
+  enabled: Boolean
+}
+
 type Task {
   taskId: ID!
   ownerId: ID!
   title: String!
+  # Defaults to "NO_CATEGORY" when the client supplies none at creation.
   categoryId: ID
   description: String
   scheduleRule: String
   status: TaskStatus!
+  # Recurring-schedule metadata; null unless the task was created with a schedule.
+  schedule: TaskSchedule
+  # First/next fire time — equals schedule.firstOccurrenceAt at creation.
+  nextOccurrenceAt: String
+  # Whether reminders are enabled; defaults to true when a schedule is provided.
+  notificationEnabled: Boolean
   createdAt: String!
   updatedAt: String
   # Populated by createTask with the steps it just wrote; use listTaskSteps otherwise.
@@ -201,14 +240,49 @@ input CreateSupportLinkInput {
   permissions: AWSJSON
 }
 
+input CreateCategoryInput {
+  ownerId: ID!
+  name: String!
+  color: String
+  sortOrder: Int
+}
+
+# Schedule metadata accepted at task creation. `enabled` defaults to true when stored.
+input TaskScheduleInput {
+  repeatEvery: Int!
+  repeatUnit: RepeatUnit!
+  firstOccurrenceAt: String!
+  timezone: String!
+  enabled: Boolean
+}
+
 input CreateTaskInput {
   ownerId: ID!
   title: String!
+  # Optional; blank/omitted falls back to the "NO_CATEGORY" bucket.
   categoryId: ID
   description: String
   scheduleRule: String
   status: TaskStatus
   steps: [CreateTaskStepNestedInput!]
+  # Optional recurring schedule (stored only in phase 1; no delivery yet).
+  schedule: TaskScheduleInput
+  # Optional; defaults to true when a schedule is provided, otherwise left unset.
+  notificationEnabled: Boolean
+}
+
+# Partial edit of an existing task. Only fields you include are changed; omitted
+# fields keep their current value. `ownerId` and the task's steps are not editable
+# here (steps have their own createTaskStep). Errors if the task doesn't exist.
+input UpdateTaskInput {
+  taskId: ID!
+  title: String
+  categoryId: ID
+  description: String
+  scheduleRule: String
+  status: TaskStatus
+  schedule: TaskScheduleInput
+  notificationEnabled: Boolean
 }
 
 input CreateTaskStepNestedInput {
@@ -296,6 +370,11 @@ type SupportLinkConnection {
   nextToken: String
 }
 
+type CategoryConnection {
+  items: [Category!]!
+  nextToken: String
+}
+
 type TaskConnection {
   items: [Task!]!
   nextToken: String
@@ -332,9 +411,13 @@ type Query {
   listUsersByOrganization(organizationId: ID!, limit: Int, nextToken: String): UserProfileConnection!
   listPrimaryUsersBySupporter(supporterId: ID!, limit: Int, nextToken: String): SupportLinkConnection!
 
+  listCategoriesByOwner(ownerId: ID!, limit: Int, nextToken: String): CategoryConnection!
+
   getTask(taskId: ID!): Task
   listTaskSteps(taskId: ID!, limit: Int, nextToken: String): TaskStepConnection!
   listTasksByOwner(ownerId: ID!, limit: Int, nextToken: String): TaskConnection!
+  # Tasks in one of an owner's categories. Omit/blank categoryId for the "NO_CATEGORY" bucket.
+  listTasksByCategory(ownerId: ID!, categoryId: ID, limit: Int, nextToken: String): TaskConnection!
 
   listAssignmentsForUser(userId: ID!, limit: Int, nextToken: String): AssignmentConnection!
   listProgressEventsForUser(userId: ID!, assignmentId: ID, limit: Int, nextToken: String): ProgressEventConnection!
@@ -354,8 +437,13 @@ type Mutation {
   createUserProfile(input: CreateUserProfileInput!): UserProfile
   createSupportLink(input: CreateSupportLinkInput!): SupportLink
 
+  # Create a user-owned task category (folder-like grouping).
+  createCategory(input: CreateCategoryInput!): Category
+
   # Create a reusable task template (and optionally its ordered steps).
   createTask(input: CreateTaskInput!): Task
+  # Edit an existing task template's fields (partial update). Errors if not found.
+  updateTask(input: UpdateTaskInput!): Task
   createTaskStep(input: CreateTaskStepInput!): TaskStep
 
   createAssignment(input: CreateAssignmentInput!): Assignment

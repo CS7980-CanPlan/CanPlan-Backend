@@ -34,14 +34,35 @@ describe('Database construct — DynamoDB single table', () => {
     });
   });
 
-  it('still defines the original three GSIs', () => {
+  it('defines the taskCategoryIndex GSI with taskCategoryKey (HASH) + createdAt (RANGE), projection ALL', () => {
+    synth().hasResourceProperties('AWS::DynamoDB::Table', {
+      GlobalSecondaryIndexes: Match.arrayWith([
+        Match.objectLike({
+          IndexName: 'taskCategoryIndex',
+          KeySchema: [
+            { AttributeName: 'taskCategoryKey', KeyType: 'HASH' },
+            { AttributeName: 'createdAt', KeyType: 'RANGE' },
+          ],
+          Projection: { ProjectionType: 'ALL' },
+        }),
+      ]),
+    });
+  });
+
+  it('still defines the original GSIs alongside taskCategoryIndex', () => {
     const template = synth();
     const table = Object.values(template.findResources('AWS::DynamoDB::Table'))[0];
     const indexNames = table.Properties.GlobalSecondaryIndexes.map(
       (g: { IndexName: string }) => g.IndexName,
     );
     expect(indexNames).toEqual(
-      expect.arrayContaining(['supporterIndex', 'orgIndex', 'taskOwnerIndex', 'entityTypeIndex']),
+      expect.arrayContaining([
+        'supporterIndex',
+        'orgIndex',
+        'taskOwnerIndex',
+        'taskCategoryIndex',
+        'entityTypeIndex',
+      ]),
     );
   });
 });

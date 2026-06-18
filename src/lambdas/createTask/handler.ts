@@ -1,8 +1,9 @@
 import { randomUUID } from 'crypto';
 import { TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
-import { ENTITY, META_SK, stepSk, taskPk } from '../../shared/keys';
+import { ENTITY, META_SK, NO_CATEGORY, stepSk, taskCategoryKey, taskPk } from '../../shared/keys';
 import { ValidationError } from '../../shared/response';
+import { normalizeSchedule } from '../../shared/schedule';
 import type { AppSyncEvent, CreateTaskInput, Task, TaskStep } from '../../shared/types';
 
 /**
@@ -26,14 +27,27 @@ export const handler = async (event: AppSyncEvent<{ input: CreateTaskInput }>): 
   const taskId = randomUUID();
   const now = new Date().toISOString();
 
+  const ownerId = input.ownerId.trim();
+  // Blank/omitted category collapses to the reserved NO_CATEGORY bucket so every
+  // Task has a queryable taskCategoryKey (no missing-attribute special case).
+  const categoryId = input.categoryId?.trim() || NO_CATEGORY;
+
+  const { schedule, nextOccurrenceAt } = normalizeSchedule(input.schedule);
+
   const task: Task = {
     taskId,
-    ownerId: input.ownerId.trim(),
+    ownerId,
     title: input.title.trim(),
-    categoryId: input.categoryId?.trim(),
+    categoryId,
+    taskCategoryKey: taskCategoryKey(ownerId, categoryId),
     description: input.description?.trim(),
     scheduleRule: input.scheduleRule?.trim(),
     status: input.status ?? 'DRAFT',
+    schedule,
+    nextOccurrenceAt,
+    // Default to enabled alongside a schedule; otherwise leave whatever the client sent
+    // (undefined is dropped by the document client's removeUndefinedValues).
+    notificationEnabled: schedule ? (input.notificationEnabled ?? true) : input.notificationEnabled,
     createdAt: now,
     updatedAt: now,
   };

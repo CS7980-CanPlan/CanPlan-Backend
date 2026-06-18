@@ -11,8 +11,8 @@ export interface DatabaseProps {
 
 /**
  * Single-table DynamoDB store for CanPlan. Every entity (UserProfile, SupportLink,
- * Task, TaskStep, Assignment, ProgressEvent, MediaAsset, Report) lives in one table
- * keyed by a composite PK/SK plus an `entityType` discriminator — see
+ * Category, Task, TaskStep, Assignment, ProgressEvent, MediaAsset, Report) lives in
+ * one table keyed by a composite PK/SK plus an `entityType` discriminator — see
  * src/shared/keys.ts for the item-key conventions and the access patterns each GSI
  * serves. The table name keeps the historical CanPlanTasks-<env> pattern.
  */
@@ -58,6 +58,17 @@ export class Database extends Construct {
     this.table.addGlobalSecondaryIndex({
       indexName: 'taskOwnerIndex',
       partitionKey: { name: 'ownerId', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'createdAt', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
+    // taskCategoryIndex — all tasks in one owner's category, newest-sortable by
+    // createdAt. Keyed on the denormalized taskCategoryKey (<ownerId>#<categoryId>),
+    // which only Task items carry — so this GSI is sparse and listTasksByCategory
+    // needs no entityType filter (unlike taskOwnerIndex, whose ownerId is shared).
+    this.table.addGlobalSecondaryIndex({
+      indexName: 'taskCategoryIndex',
+      partitionKey: { name: 'taskCategoryKey', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'createdAt', type: dynamodb.AttributeType.STRING },
       projectionType: dynamodb.ProjectionType.ALL,
     });

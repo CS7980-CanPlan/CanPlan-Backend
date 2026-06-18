@@ -1,14 +1,17 @@
 import {
   assignSk,
+  categorySk,
   ENTITY,
   mediaSk,
   META_SK,
+  NO_CATEGORY,
   padOrder,
   PROFILE_SK,
   progressSk,
   reportPk,
   stepSk,
   supporterPk,
+  taskCategoryKey,
   taskPk,
   userLinkSk,
   userPk,
@@ -41,6 +44,7 @@ describe('sort keys', () => {
   it('build the documented SK formats', () => {
     expect(PROFILE_SK).toBe('#PROFILE');
     expect(META_SK).toBe('#META');
+    expect(categorySk('c1')).toBe('CATEGORY#c1');
     expect(userLinkSk('u1')).toBe('USER#u1');
     expect(stepSk(1)).toBe('STEP#001');
     expect(assignSk('a1')).toBe('ASSIGN#a1');
@@ -49,10 +53,18 @@ describe('sort keys', () => {
   });
 });
 
+describe('taskCategoryKey', () => {
+  it('joins owner and category into the taskCategoryIndex partition key', () => {
+    expect(taskCategoryKey('o1', 'c1')).toBe('o1#c1');
+    expect(taskCategoryKey('o1', NO_CATEGORY)).toBe('o1#NO_CATEGORY');
+  });
+});
+
 describe('ENTITY discriminators', () => {
   it('match the entity-type strings stored on items', () => {
     expect(ENTITY.USER_PROFILE).toBe('UserProfile');
     expect(ENTITY.SUPPORT_LINK).toBe('SupportLink');
+    expect(ENTITY.CATEGORY).toBe('Category');
     expect(ENTITY.TASK).toBe('Task');
     expect(ENTITY.TASK_STEP).toBe('TaskStep');
     expect(ENTITY.ASSIGNMENT).toBe('Assignment');

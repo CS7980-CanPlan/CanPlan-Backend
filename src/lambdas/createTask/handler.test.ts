@@ -89,6 +89,134 @@ describe('createTask handler', () => {
     expect(result.status).toBe('ACTIVE');
   });
 
+  it('defaults a missing categoryId to NO_CATEGORY and derives taskCategoryKey', async () => {
+    const result = await handler(makeEvent({ ownerId: 'sup-1', title: 'T' }));
+    const meta = writtenItems().find((i) => i.SK === '#META')!;
+    expect(meta.categoryId).toBe('NO_CATEGORY');
+    expect(meta.taskCategoryKey).toBe('sup-1#NO_CATEGORY');
+    expect(result.categoryId).toBe('NO_CATEGORY');
+  });
+
+  it('defaults a blank categoryId to NO_CATEGORY', async () => {
+    await handler(makeEvent({ ownerId: 'sup-1', title: 'T', categoryId: '   ' }));
+    const meta = writtenItems().find((i) => i.SK === '#META')!;
+    expect(meta.categoryId).toBe('NO_CATEGORY');
+    expect(meta.taskCategoryKey).toBe('sup-1#NO_CATEGORY');
+  });
+
+  it('stores an explicit categoryId and the matching taskCategoryKey', async () => {
+    await handler(makeEvent({ ownerId: 'sup-1', title: 'T', categoryId: 'cat-9' }));
+    const meta = writtenItems().find((i) => i.SK === '#META')!;
+    expect(meta.categoryId).toBe('cat-9');
+    expect(meta.taskCategoryKey).toBe('sup-1#cat-9');
+  });
+
+  it('stores valid schedule metadata, defaults enabled, and sets nextOccurrenceAt', async () => {
+    const result = await handler(
+      makeEvent({
+        ownerId: 'o',
+        title: 'Take meds',
+        schedule: {
+          repeatEvery: 2,
+          repeatUnit: 'DAY',
+          firstOccurrenceAt: '2026-07-01T09:00:00Z',
+          timezone: 'America/Toronto',
+        },
+      }),
+    );
+    const meta = writtenItems().find((i) => i.SK === '#META')!;
+    expect(meta.schedule).toEqual({
+      repeatEvery: 2,
+      repeatUnit: 'DAY',
+      firstOccurrenceAt: '2026-07-01T09:00:00Z',
+      timezone: 'America/Toronto',
+      enabled: true,
+    });
+    expect(meta.nextOccurrenceAt).toBe('2026-07-01T09:00:00Z');
+    // notificationEnabled defaults to true alongside a schedule.
+    expect(meta.notificationEnabled).toBe(true);
+    expect(result.nextOccurrenceAt).toBe('2026-07-01T09:00:00Z');
+  });
+
+  it('honors an explicit schedule.enabled=false and notificationEnabled=false', async () => {
+    await handler(
+      makeEvent({
+        ownerId: 'o',
+        title: 'T',
+        notificationEnabled: false,
+        schedule: {
+          repeatEvery: 1,
+          repeatUnit: 'WEEK',
+          firstOccurrenceAt: '2026-07-01T09:00:00Z',
+          timezone: 'UTC',
+          enabled: false,
+        },
+      }),
+    );
+    const meta = writtenItems().find((i) => i.SK === '#META')!;
+    expect((meta.schedule as { enabled: boolean }).enabled).toBe(false);
+    expect(meta.notificationEnabled).toBe(false);
+  });
+
+  it('leaves schedule fields unset when no schedule is provided', async () => {
+    const result = await handler(makeEvent({ ownerId: 'o', title: 'T' }));
+    const meta = writtenItems().find((i) => i.SK === '#META')!;
+    expect(meta.schedule).toBeUndefined();
+    expect(meta.nextOccurrenceAt).toBeUndefined();
+    expect(meta.notificationEnabled).toBeUndefined();
+    expect(result.schedule).toBeUndefined();
+  });
+
+  it('rejects a schedule with a non-positive repeatEvery', async () => {
+    await expect(
+      handler(
+        makeEvent({
+          ownerId: 'o',
+          title: 'T',
+          schedule: {
+            repeatEvery: 0,
+            repeatUnit: 'DAY',
+            firstOccurrenceAt: '2026-07-01T09:00:00Z',
+            timezone: 'UTC',
+          },
+        }),
+      ),
+    ).rejects.toThrow('repeatEvery must be a positive integer');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('rejects a schedule missing firstOccurrenceAt or timezone', async () => {
+    await expect(
+      handler(
+        makeEvent({
+          ownerId: 'o',
+          title: 'T',
+          schedule: {
+            repeatEvery: 1,
+            repeatUnit: 'DAY',
+            firstOccurrenceAt: '   ',
+            timezone: 'UTC',
+          },
+        }),
+      ),
+    ).rejects.toThrow('firstOccurrenceAt is required');
+    await expect(
+      handler(
+        makeEvent({
+          ownerId: 'o',
+          title: 'T',
+          schedule: {
+            repeatEvery: 1,
+            repeatUnit: 'DAY',
+            firstOccurrenceAt: '2026-07-01T09:00:00Z',
+            timezone: '',
+          },
+        }),
+      ),
+    ).rejects.toThrow('timezone is required');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
   it('throws ValidationError when ownerId is missing', async () => {
     await expect(handler(makeEvent({ title: 'T' }))).rejects.toThrow('ownerId is required');
     expect(mockSend).not.toHaveBeenCalled();
