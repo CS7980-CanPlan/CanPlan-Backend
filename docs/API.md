@@ -1,5 +1,7 @@
 # CanPlan 2.0 — Frontend API Reference
 
+_Last updated: 2026-06-19. Version: phase 1 (pre-authorization)._
+
 The backend exposes a single **AWS AppSync GraphQL** endpoint backed by a single
 DynamoDB table. This document covers how to connect, the available operations, and
 how errors come back.
@@ -7,6 +9,47 @@ how errors come back.
 The schema lives at [graphql/schema.graphql](../graphql/schema.graphql) — it is the
 canonical source of truth for exact types and nullability; this doc is its
 human-readable companion.
+
+> ## ⚠️ No authorization is enforced yet (read this first)
+>
+> Outside the `SystemAdmin` admin queries and the self-scoped `createUserProfile`,
+> **no domain operation verifies the caller.** Any authenticated caller can act on
+> **any `id`** — read another user's profile, create a task under any `ownerId`,
+> append a progress event for any `userId`, link any supporter to any primary user.
+> The schema and single-table keys are structured to support per-role/owner rules,
+> but they are **not implemented in this phase**.
+>
+> **Do not bake "the server lets me, so it's allowed" into the client.** When
+> enforcement ships, calls that succeed today will start returning a `NOT_AUTHORIZED`
+> error (see [Error handling](#error-handling)). Write the client so an authorization
+> denial is a normal, handleable outcome — not an exception. In particular, always
+> pass the caller's own id for self-scoped operations (see below); don't rely on the
+> server tolerating someone else's id.
+
+---
+
+## Identity & the `userId` field
+
+**Invariant: for any self-scoped operation, the `id` you pass MUST equal your own
+Cognito `sub`.** This is not currently enforced — it is load-bearing anyway, because
+of how data is keyed and read back:
+
+- A user's profile is stored at the key derived from their Cognito `sub`
+  (`USER#<sub>`), and `getUserProfile(userId)` looks it up by **exactly that
+  `userId`**. There is no secondary lookup.
+- `createUserProfile` does the right thing automatically — it ignores any
+  client-supplied id and uses your `sub` from the session (see below). So your
+  profile always lands at `USER#<sub>`.
+- But the **read** and every other self-scoped write (`getUserProfile`,
+  `createAssignment`, `createProgressEvent`, `listAssignmentsForUser`,
+  `listProgressEventsForUser`, …) take a `userId`/`ownerId` **argument**. If you pass
+  anything other than your own `sub` there, you will write rows you can never read
+  back through your own profile, or read an empty result — silently, with no error.
+
+**Rule of thumb:** decode the `sub` claim from your Cognito ID token once at sign-in
+and use it as the `userId`/`ownerId` for everything that is "about me." Treat ids
+that come from a list response (e.g. a supporter acting on a primary user) as the
+only legitimate source of *someone else's* id.
 
 ---
 
@@ -106,8 +149,36 @@ a Scan).
 | `SupportLinkStatus` | `PENDING`, `ACTIVE`, `REVOKED` |
 | `RepeatUnit` | `MINUTE`, `HOUR`, `DAY`, `WEEK`, `MONTH` |
 
+### `AWSJSON` fields — encoding (foot-gun)
+
 Free-form object fields (`accessibilitySettings`, `permissions`, `metadata`) are the
-AppSync `AWSJSON` scalar — send/receive them as JSON objects.
+AppSync `AWSJSON` scalar. **`AWSJSON` is transported as a JSON-encoded _string_, not
+a nested object.** In your `variables`, the value must be a string whose contents are
+valid JSON — AppSync parses that string before the resolver sees it. Passing a nested
+object instead is the most common mistake here and is rejected at the AppSync edge.
+
+```jsonc
+// ✅ correct — the value is a string containing JSON
+{
+  "input": {
+    "displayName": "Sam",
+    "accessibilitySettings": "{\"fontScale\":1.5,\"highContrast\":true}"
+  }
+}
+
+// ❌ wrong — nested object; AppSync rejects this for an AWSJSON field
+{
+  "input": {
+    "displayName": "Sam",
+    "accessibilitySettings": { "fontScale": 1.5, "highContrast": true }
+  }
+}
+```
+
+In practice: `accessibilitySettings: JSON.stringify(settings)` on the way in. The same
+applies to `permissions` (`createSupportLink`) and `metadata` (`createProgressEvent`).
+**Responses are symmetric** — these fields come back as JSON strings, so
+`JSON.parse(profile.accessibilitySettings)` on the way out.
 
 ---
 
@@ -229,6 +300,13 @@ fields are marked `!` and everything else is optional; see
 > `AssignmentConnection`). `nextToken` is an opaque, base64-encoded cursor — pass it
 > back to fetch the next page; it's `null` on the last page. (See the
 > `listAllUsers` example below for the paging loop — every list query works the same way.)
+>
+> **Index-backed lists return a partial projection.** As a general rule, any list that
+> reads from a GSI returns only the fields that index projects, not the full entity —
+> non-projected fields come back `null`. `listUsersByOrganization` is the canonical
+> example (it populates only `userId`, `displayName`, `role`). Use these lists for
+> rosters/pickers, then `get*` the full entity by id when you need the rest; don't
+> assume a list item is fully hydrated.
 
 **Users & support**
 
@@ -239,6 +317,32 @@ fields are marked `!` and everything else is optional; see
 | `listUsersByOrganization` | `organizationId!, limit, nextToken` | `UserProfileConnection!` — **roster only**: just `userId`, `displayName`, `role` are populated (orgIndex projection); other fields are `null` |
 | `createSupportLink` | `input: { supporterId!, primaryUserId!, status, permissions }` | `SupportLink` · `status` defaults to `PENDING` |
 | `listPrimaryUsersBySupporter` | `supporterId!, limit, nextToken` | `SupportLinkConnection!` |
+
+> **Profile bootstrap — the client must create the profile on first run.** There is
+> **no automatic profile creation.** The Cognito Post Confirmation trigger does one
+> thing: it adds a newly-confirmed self-registered user to the `PrimaryUser` group. It
+> does **not** write a `UserProfile` row. So after a user's first sign-in, the app must
+> call **`createUserProfile`** itself (a "first-run, create my profile" step) before
+> `getUserProfile(mySub)` will return anything. A typical flow:
+>
+> 1. Sign in → obtain the ID token; decode its `sub`.
+> 2. `getUserProfile(sub)` → if `null`, the profile doesn't exist yet.
+> 3. `createUserProfile({ displayName, … })` → creates it at `USER#<sub>` using the
+>    session identity (no id is passed; see [Identity](#identity--the-userid-field)).
+>
+> **`createUserProfile` semantics.** The write is an unconditional put keyed on your
+> `sub` — it is **last-write-wins, not create-only**. Calling it again **overwrites**
+> the existing profile (and resets `createdAt`/`updatedAt` to "now"); it does **not**
+> error on a pre-existing profile and does **not** merge. So guard it behind the
+> `getUserProfile` null-check above, or treat a second call as a deliberate full
+> replace. It is **not** idempotent in the value sense (timestamps change), though
+> repeating it is harmless to the keying.
+>
+> **`createSupportLink` semantics.** Same shape: an unconditional put keyed on
+> `(supporterId, primaryUserId)`. Re-creating the same pair **overwrites** the prior
+> link — including resetting `status` back to its default `PENDING` if you omit
+> `status` — rather than erroring on a duplicate. Pass `status` explicitly if you
+> re-issue a link you don't want demoted.
 
 **Categories**
 
@@ -390,12 +494,32 @@ GraphQL does **not** use HTTP status codes for field-level problems. A request t
 reached a resolver returns **HTTP 200** with the failure in an `errors` array;
 `data` for the failed field is `null`. Always check `errors` before reading `data`.
 
-| Situation | How it surfaces |
-|---|---|
-| Validation failure (missing required input) | HTTP 200, `errors: [{ message }]` from the resolver |
-| Bedrock or KB failure (`generateTaskSteps`) | HTTP 200, `errors: [{ message }]` from the resolver |
-| Missing/invalid/expired credentials | HTTP 401, `{ "errors": [{ "errorType": "UnauthorizedException" }] }` |
-| Malformed query / unknown field | HTTP 200 (or 400), `errors` with a parse/validation message |
+Each entry in `errors` carries a `message` (prose, human-readable) and an `errorType`
+(a code). **Branch on `errorType`, not on `message`** — message strings are not a
+stable contract and may be reworded at any time.
+
+### `errorType` codes
+
+| `errorType` | HTTP | Meaning | Client should |
+|---|---|---|---|
+| `UnauthorizedException` | 401 | Missing/invalid/expired token at the AppSync edge — never reached a resolver | Re-authenticate (refresh the Cognito session) |
+| `NOT_AUTHORIZED` | 200 | Authenticated, but not allowed to act on this id/resource | Handle as a normal denial — **see caveat below** |
+| `VALIDATION` | 200 | Bad input (missing/empty required field, invalid schedule, etc.) | Fix the input; surface to the user |
+| `NOT_FOUND` | 200 | The referenced id doesn't exist (e.g. `updateTask` on an unknown `taskId`, signing a download URL for an unregistered asset) | Treat as "gone"; distinct from a successful `null` on `get*` |
+| `INTERNAL` | 200 | Resolver failure (Bedrock/KB error, downstream AWS error, unexpected bug) | Retry/backoff; report if persistent |
+| (parse/validation) | 200/400 | Malformed query or unknown field — a client bug, not runtime data | Fix the query |
+
+> ⚠️ **Stability caveat — current vs. intended.** The codes above are the **intended,
+> stable contract**; build your client to branch on them. But in **this phase**, only
+> the edge-level `UnauthorizedException` is emitted as shown. Resolver-level failures
+> (validation, not-found, internal) are currently surfaced by AppSync as
+> **`errorType: "Lambda:Unhandled"`**, with the specific cause only in `message`. The
+> server already distinguishes these cases internally (`ValidationError` /
+> `NotFoundError` / `UnauthorizedError`); wiring them through to the codes above is
+> tracked under [Not available yet](#not-available-yet). Until then, if you must
+> branch today, do so defensively (e.g. fall back to matching `message`) and migrate
+> to `errorType` once the codes land. `NOT_AUTHORIZED` in particular does **not** fire
+> yet — see the authorization warning at the top.
 
 ---
 
@@ -413,7 +537,13 @@ Planned but not implemented — don't build against them:
   derives `userId`/`email`/`role` from the caller's Cognito session). The other
   create/get/list resolvers don't yet verify the caller (e.g. that a primary user
   only reads their own data, or that a supporter owns the task). The schema and
-  single-table keys are structured to support these rules.
+  single-table keys are structured to support these rules. **See the authorization
+  warning at the top of this doc** — when these land, currently-succeeding calls on
+  someone else's id will start returning a `NOT_AUTHORIZED` error.
+- **Stable resolver `errorType` codes** — `VALIDATION` / `NOT_FOUND` / `NOT_AUTHORIZED`
+  / `INTERNAL` (see [Error handling](#error-handling)) are the intended contract, but
+  resolver errors currently surface as `Lambda:Unhandled` with the cause only in
+  `message`. Branch defensively until the codes are wired through.
 - **Delete** for any entity, and **update** for entities other than tasks
   (`updateTask`) and assignment status (`updateAssignmentStatus`) — including
   per-step editing (steps can only be created, via `createTaskStep`).
