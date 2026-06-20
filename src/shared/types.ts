@@ -133,11 +133,11 @@ export interface MediaAsset {
 }
 
 // ── Mutation inputs ───────────────────────────────────────────────────────────
-export interface CreateUserProfileInput {
-  userId: string;
-  role: UserRole;
-  displayName?: string;
-  email?: string;
+// Caller creates only their own profile. userId, email, and role are derived
+// server-side from the Cognito identity (role from group membership) — they are
+// intentionally absent here so a client cannot supply another user's id/email/role.
+export interface CreateMyUserProfileInput {
+  displayName: string;
   organizationId?: string;
   accessibilitySettings?: Record<string, unknown>;
 }

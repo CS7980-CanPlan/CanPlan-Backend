@@ -224,11 +224,12 @@ type TaskStepsResponse {
 
 # ─── Inputs ───────────────────────────────────────────────────────────────────
 
-input CreateUserProfileInput {
-  userId: ID!
-  role: UserRole!
-  displayName: String
-  email: String
+# A signed-in user creates only their OWN profile. Identity (userId), email, and
+# role are derived server-side from the Cognito session — never client-supplied —
+# so this input carries only user-editable fields. Cognito group membership is the
+# source of truth for role; UserProfile.role is a server-derived projection of it.
+input CreateMyUserProfileInput {
+  displayName: String!
   organizationId: ID
   accessibilitySettings: AWSJSON
 }
@@ -434,7 +435,9 @@ type Query {
 }
 
 type Mutation {
-  createUserProfile(input: CreateUserProfileInput!): UserProfile
+  # Create the signed-in caller's own profile. userId, email, and role are taken
+  # from the Cognito session (role derived from group membership), not the input.
+  createUserProfile(input: CreateMyUserProfileInput!): UserProfile
   createSupportLink(input: CreateSupportLinkInput!): SupportLink
 
   # Create a user-owned task category (folder-like grouping).

@@ -13,36 +13,104 @@ const mockSend = dynamo.send as jest.Mock;
 beforeEach(() => mockSend.mockResolvedValue({}));
 afterEach(() => jest.clearAllMocks());
 
-function event(fieldName: string, args: Record<string, unknown>) {
-  return { arguments: args, info: { fieldName } } as Parameters<typeof handler>[0];
+function event(
+  fieldName: string,
+  args: Record<string, unknown>,
+  identity?: { sub?: string; groups?: string[] | null; claims?: Record<string, unknown> },
+) {
+  return { arguments: args, info: { fieldName }, identity } as Parameters<typeof handler>[0];
 }
+
+// A signed-in caller: Cognito sub + group membership + email claim.
+const caller = (groups: string[], sub = 'cognito-sub-1', email = 'me@example.com') => ({
+  sub,
+  groups,
+  claims: { email },
+});
 
 const lastInput = () => mockSend.mock.calls[0][0].input;
 
 describe('users handler — UserProfile', () => {
-  it('createUserProfile writes USER#<id>/#PROFILE carrying the orgIndex fields (organizationId, userId)', async () => {
+  it('createUserProfile derives userId from the Cognito sub, role from group, email from the claim', async () => {
     await handler(
-      event('createUserProfile', {
-        input: { userId: 'u1', role: 'PRIMARY_USER', displayName: 'Sam', organizationId: 'org-1' },
-      }),
+      event(
+        'createUserProfile',
+        { input: { displayName: 'Sam', organizationId: 'org-1' } },
+        caller(['PrimaryUser'], 'sub-123', 'sam@example.com'),
+      ),
     );
     const { Item } = lastInput();
-    expect(Item.PK).toBe('USER#u1');
+    expect(Item.PK).toBe('USER#sub-123');
     expect(Item.SK).toBe('#PROFILE');
     expect(Item.entityType).toBe('UserProfile');
-    expect(Item.userId).toBe('u1');
-    expect(Item.organizationId).toBe('org-1');
+    // userId comes from the Cognito sub, never the input.
+    expect(Item.userId).toBe('sub-123');
     expect(Item.role).toBe('PRIMARY_USER');
+    expect(Item.email).toBe('sam@example.com');
+    expect(Item.displayName).toBe('Sam');
+    expect(Item.organizationId).toBe('org-1');
     expect(typeof Item.createdAt).toBe('string');
   });
 
-  it('createUserProfile requires userId and role', async () => {
-    await expect(handler(event('createUserProfile', { input: { role: 'PRIMARY_USER' } }))).rejects.toThrow(
-      'userId is required',
+  it('createUserProfile maps SupportPerson → SUPPORT_PERSON and OrganizationAdmin → ORG_ADMIN', async () => {
+    await handler(event('createUserProfile', { input: { displayName: 'Supporter' } }, caller(['SupportPerson'])));
+    expect(lastInput().Item.role).toBe('SUPPORT_PERSON');
+
+    await handler(
+      event('createUserProfile', { input: { displayName: 'Organization admin' } }, caller(['OrganizationAdmin'])),
     );
-    await expect(handler(event('createUserProfile', { input: { userId: 'u1' } }))).rejects.toThrow(
-      'role is required',
+    expect(mockSend.mock.calls[1][0].input.Item.role).toBe('ORG_ADMIN');
+  });
+
+  it('createUserProfile requires a non-empty displayName', async () => {
+    await expect(
+      handler(event('createUserProfile', { input: { displayName: '   ' } }, caller(['PrimaryUser']))),
+    ).rejects.toThrow('displayName is required');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('createUserProfile ignores any client-supplied id/email/role — only identity is trusted', async () => {
+    await handler(
+      event(
+        'createUserProfile',
+        // Attacker tries to inject another user's id/email/role; these fields are not
+        // part of the input type and must be ignored entirely.
+        {
+          input: {
+            displayName: 'My profile',
+            userId: 'victim',
+            email: 'victim@evil.com',
+            role: 'ORG_ADMIN',
+          } as Record<string, unknown>,
+        },
+        caller(['PrimaryUser'], 'sub-me', 'me@example.com'),
+      ),
     );
+    const { Item } = lastInput();
+    expect(Item.userId).toBe('sub-me'); // not 'victim'
+    expect(Item.email).toBe('me@example.com'); // not 'victim@evil.com'
+    expect(Item.role).toBe('PRIMARY_USER'); // not the injected ORG_ADMIN
+  });
+
+  it('createUserProfile rejects an unauthenticated caller (no sub)', async () => {
+    await expect(handler(event('createUserProfile', { input: {} }, undefined))).rejects.toThrow(
+      'authenticated user is required',
+    );
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('createUserProfile rejects a caller with no base-role group', async () => {
+    await expect(
+      handler(event('createUserProfile', { input: {} }, caller(['SystemAdmin']))),
+    ).rejects.toThrow(/exactly one base-role/);
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('createUserProfile rejects a caller with multiple base-role groups', async () => {
+    await expect(
+      handler(event('createUserProfile', { input: {} }, caller(['PrimaryUser', 'OrganizationAdmin']))),
+    ).rejects.toThrow(/multiple base-role/);
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
   it('getUserProfile reads PK=USER#<id>, SK=#PROFILE and returns null when absent', async () => {
