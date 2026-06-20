@@ -1,6 +1,11 @@
 import * as cdk from 'aws-cdk-lib';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as logs from 'aws-cdk-lib/aws-logs';
+import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 import { Construct } from 'constructs';
+import * as path from 'path';
 
 export interface AuthProps {
   /** Environment name (e.g. 'sandbox', 'dev', 'prod') — namespaces the pool. */
@@ -65,5 +70,40 @@ export class Auth extends Construct {
         groupName,
       });
     }
+
+    // Post Confirmation trigger — once a self-registered user verifies their email,
+    // automatically add them to the `PrimaryUser` group. Lives here (not in the
+    // Functions construct) because it's tied to the user pool, not the GraphQL API.
+    const postConfirmationFn = new NodejsFunction(this, 'PostConfirmationFunction', {
+      functionName: `canplan-postConfirmation-${envName}`,
+      entry: path.join(__dirname, '../../../src/lambdas/postConfirmation/handler.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      environment: {
+        AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
+      },
+      logRetention: logs.RetentionDays.ONE_WEEK,
+      timeout: cdk.Duration.seconds(10),
+    });
+
+    // Least-privilege: only AdminAddUserToGroup. The resource is a generated ARN
+    // scoped to user pools in this account+region — NOT this.userPool.userPoolArn,
+    // which would create a UserPool → Lambda → policy → UserPool circular dependency
+    // (the policy references the pool ARN, while the pool references the trigger Lambda).
+    postConfirmationFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['cognito-idp:AdminAddUserToGroup'],
+        resources: [
+          cdk.Stack.of(this).formatArn({
+            service: 'cognito-idp',
+            resource: 'userpool',
+            resourceName: '*',
+          }),
+        ],
+      }),
+    );
+
+    // addTrigger also grants Cognito permission to invoke the Lambda.
+    this.userPool.addTrigger(cognito.UserPoolOperation.POST_CONFIRMATION, postConfirmationFn);
   }
 }

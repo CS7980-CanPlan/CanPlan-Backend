@@ -53,13 +53,18 @@ The frontend needs the `UserPoolId` and `UserPoolClientId` deploy outputs to run
 Cognito sign-in flow. Per-role/owner authorization on the domain operations (e.g.
 "only the task owner may edit it") is not enforced yet.
 
+Self-registered users who verify their email and confirm sign-up are automatically
+added to the `PrimaryUser` group — a Cognito Post Confirmation trigger
+(`canplan-postConfirmation-<env>` Lambda) assigns the group on the
+`PostConfirmation_ConfirmSignUp` event.
+
 ## Region Layout
 
 The app deploys two CDK stacks with `--all`.
 
 | Region | Stack | Main resources |
 | ------ | ----- | -------------- |
-| `CANPLAN_BACKEND_REGION` default `ca-central-1` | `canplan-backend-<env>` | AppSync, Cognito, single-table DynamoDB `CanPlanTasks-<env>`, media S3 bucket, `createTask` + domain Lambdas (`users`/`categories`/`tasks`/`assignments`/`progress`/`media`/`admin`) + `generateTaskSteps` Lambda, CloudWatch logs |
+| `CANPLAN_BACKEND_REGION` default `ca-central-1` | `canplan-backend-<env>` | AppSync, Cognito, single-table DynamoDB `CanPlanTasks-<env>`, media S3 bucket, `createTask` + domain Lambdas (`users`/`categories`/`tasks`/`assignments`/`progress`/`media`/`admin`) + `generateTaskSteps` Lambda, `postConfirmation` Cognito trigger Lambda, CloudWatch logs |
 | `CANPLAN_KNOWLEDGE_BASE_REGION` default `us-east-1` | `canplan-knowledge-base-<env>` | Bedrock Knowledge Base, S3 corpus bucket, Bedrock S3 data source, OpenSearch Serverless vector collection/index |
 
 `generateTaskSteps` runs in `ca-central-1` by default, but calls Bedrock Agent
