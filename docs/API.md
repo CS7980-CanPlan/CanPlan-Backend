@@ -98,7 +98,7 @@ a Scan).
 
 | Enum | Values |
 |---|---|
-| `UserRole` | `PRIMARY_USER`, `SUPPORT_PERSON`, `ORG_ADMIN` |
+| `UserRole` | `PRIMARY_USER`, `SUPPORT_PERSON`, `ORG_ADMIN` — a server-derived projection of Cognito group membership (`PrimaryUser`/`SupportPerson`/`OrganizationAdmin`); **Cognito groups are the authorization source of truth**. `SystemAdmin` is an elevated group, not a `UserRole`. |
 | `TaskStatus` | `DRAFT`, `ACTIVE`, `ARCHIVED` |
 | `AssignmentStatus` | `ACTIVE`, `COMPLETED`, `PAUSED`, `CANCELLED` |
 | `ProgressEventType` | `STARTED`, `PAUSED`, `RESUMED`, `SKIPPED`, `COMPLETED`, `SYNCED` |
@@ -234,7 +234,7 @@ fields are marked `!` and everything else is optional; see
 
 | Operation | Input | Returns |
 |---|---|---|
-| `createUserProfile` | `input: { userId!, role!, displayName, email, organizationId, accessibilitySettings }` | `UserProfile` |
+| `createUserProfile` | `input: { displayName!, organizationId, accessibilitySettings }` (`CreateMyUserProfileInput`) | `UserProfile` — creates the **caller's own** profile; `displayName` is required, while `userId` (Cognito `sub`), `email`, and `role` are derived server-side and cannot be supplied by the client |
 | `getUserProfile` | `userId!` | `UserProfile` · `null` if not found |
 | `listUsersByOrganization` | `organizationId!, limit, nextToken` | `UserProfileConnection!` — **roster only**: just `userId`, `displayName`, `role` are populated (orgIndex projection); other fields are `null` |
 | `createSupportLink` | `input: { supporterId!, primaryUserId!, status, permissions }` | `SupportLink` · `status` defaults to `PENDING` |
@@ -409,10 +409,11 @@ Planned but not implemented — don't build against them:
   engine (EventBridge), no device-token registration, and no push-notification Lambda
   in this phase — only the query-ready fields are stored.
 - **Per-role/owner authorization on domain operations** — the `SystemAdmin` admin
-  queries are group-gated (enforced), but the regular create/get/list resolvers
-  don't yet verify the caller (e.g. that a primary user only reads their own data,
-  or that a supporter owns the task). The schema and single-table keys are
-  structured to support these rules.
+  queries are group-gated (enforced), and `createUserProfile` is self-scoped (it
+  derives `userId`/`email`/`role` from the caller's Cognito session). The other
+  create/get/list resolvers don't yet verify the caller (e.g. that a primary user
+  only reads their own data, or that a supporter owns the task). The schema and
+  single-table keys are structured to support these rules.
 - **Delete** for any entity, and **update** for entities other than tasks
   (`updateTask`) and assignment status (`updateAssignmentStatus`) — including
   per-step editing (steps can only be created, via `createTaskStep`).

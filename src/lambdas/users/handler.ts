@@ -10,12 +10,14 @@ import {
   userPk,
 } from '../../shared/keys';
 import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
-import { ValidationError } from '../../shared/response';
+import { ValidationError, UnauthorizedError } from '../../shared/response';
+import { roleFromIdentity } from '../../shared/roles';
 import type {
   AppSyncEvent,
+  AppSyncIdentity,
   Connection,
+  CreateMyUserProfileInput,
   CreateSupportLinkInput,
-  CreateUserProfileInput,
   SupportLink,
   UserProfile,
 } from '../../shared/types';
@@ -31,7 +33,7 @@ export const handler = async (
   const { arguments: args } = event;
   switch (event.info?.fieldName) {
     case 'createUserProfile':
-      return createUserProfile(args.input as CreateUserProfileInput);
+      return createMyUserProfile(event.identity, args.input as CreateMyUserProfileInput);
     case 'getUserProfile':
       return getUserProfile(args.userId as string);
     case 'listUsersByOrganization':
@@ -45,19 +47,34 @@ export const handler = async (
   }
 };
 
-async function createUserProfile(input: CreateUserProfileInput): Promise<UserProfile> {
-  const userId = input?.userId?.trim();
-  if (!userId) throw new ValidationError('userId is required and cannot be empty');
-  if (!input?.role) throw new ValidationError('role is required');
+/**
+ * Create the signed-in caller's OWN profile. Identity is the source of truth:
+ * `userId` comes from the Cognito `sub`, `email` from the caller's email claim, and
+ * `role` is derived from Cognito group membership (see roleFromIdentity). No
+ * client-supplied id, email, or role is accepted — a caller cannot create a profile
+ * for someone else or pick their own role.
+ */
+async function createMyUserProfile(
+  identity: AppSyncIdentity | undefined,
+  input: CreateMyUserProfileInput,
+): Promise<UserProfile> {
+  const userId = identity?.sub?.trim();
+  if (!userId) throw new UnauthorizedError('Unauthorized: an authenticated user is required');
+
+  // Throws ValidationError unless the caller has exactly one base-role group.
+  const role = roleFromIdentity(identity);
+  const email = (identity?.claims?.email as string | undefined)?.trim();
+  const displayName = input?.displayName?.trim();
+  if (!displayName) throw new ValidationError('displayName is required and cannot be empty');
 
   const now = new Date().toISOString();
   const profile: UserProfile = {
     userId,
-    role: input.role,
-    displayName: input.displayName?.trim(),
-    email: input.email?.trim(),
-    organizationId: input.organizationId?.trim(),
-    accessibilitySettings: input.accessibilitySettings,
+    role,
+    displayName,
+    email,
+    organizationId: input?.organizationId?.trim(),
+    accessibilitySettings: input?.accessibilitySettings,
     createdAt: now,
     updatedAt: now,
   };

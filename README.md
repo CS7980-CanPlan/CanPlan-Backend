@@ -58,6 +58,16 @@ added to the `PrimaryUser` group — a Cognito Post Confirmation trigger
 (`canplan-postConfirmation-<env>` Lambda) assigns the group on the
 `PostConfirmation_ConfirmSignUp` event.
 
+**Cognito group membership is the authorization source of truth.** `UserProfile.role`
+is a server-derived projection of it: the base groups `PrimaryUser` / `SupportPerson` /
+`OrganizationAdmin` map to `PRIMARY_USER` / `SUPPORT_PERSON` / `ORG_ADMIN`, and the
+mapping is mutually exclusive (zero or multiple base groups is rejected). `SystemAdmin`
+is an independent elevated group, not a `UserRole`. Accordingly, `createUserProfile`
+creates only the **caller's own** profile: `userId` (Cognito `sub`), `email`, and `role`
+are taken from the authenticated session — clients send only `displayName`,
+`organizationId`, and `accessibilitySettings` (`CreateMyUserProfileInput`); `displayName`
+is required.
+
 ## Region Layout
 
 The app deploys two CDK stacks with `--all`.
