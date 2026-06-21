@@ -214,6 +214,20 @@ export interface CreateTaskStepInput {
   mediaRefs?: string[];
 }
 
+/**
+ * Partial edit of one TaskStep. The step is located by (taskId, stepId) — the storage
+ * SK is derived from `order`, not stepId, so the row is found by query, not key build.
+ * Only the fields that are present (non-null) change; `stepId`, `taskId`, `order`, and
+ * `createdAt` are immutable. At least one editable field (`text` or `mediaRefs`) must
+ * be supplied. `mediaRefs` may be an empty list (replaces the value with none).
+ */
+export interface UpdateTaskStepInput {
+  taskId: string;
+  stepId: string;
+  text?: string;
+  mediaRefs?: string[];
+}
+
 export interface CreateAssignmentInput {
   taskId: string;
   userId: string;
@@ -235,6 +249,16 @@ export interface SetAssignmentStepCompletionInput {
   assignmentId: string;
   stepId: string;
   completed: boolean;
+}
+
+/**
+ * Identifies one Assignment for deletion by its composite key (userId + assignmentId).
+ * Deleting an assignment also removes all of its AssignmentStep snapshots; the source
+ * Task and its TaskSteps are never touched.
+ */
+export interface DeleteAssignmentInput {
+  userId: string;
+  assignmentId: string;
 }
 
 export interface CreateMediaAssetInput {

@@ -99,6 +99,8 @@ export class Api extends Construct {
     wire('TasksDataSource', props.tasksFn, [
       { typeName: 'Mutation', fieldName: 'updateTask' },
       { typeName: 'Mutation', fieldName: 'createTaskStep' },
+      { typeName: 'Mutation', fieldName: 'updateTaskStep' },
+      { typeName: 'Mutation', fieldName: 'deleteTask' },
       { typeName: 'Query', fieldName: 'getTask' },
       { typeName: 'Query', fieldName: 'listTaskSteps' },
       { typeName: 'Query', fieldName: 'listTasksByOwner' },
@@ -110,6 +112,7 @@ export class Api extends Construct {
       { typeName: 'Mutation', fieldName: 'createAssignment' },
       { typeName: 'Mutation', fieldName: 'updateAssignmentStatus' },
       { typeName: 'Mutation', fieldName: 'setAssignmentStepCompletion' },
+      { typeName: 'Mutation', fieldName: 'deleteAssignment' },
       { typeName: 'Query', fieldName: 'listAssignmentsForUser' },
       { typeName: 'Query', fieldName: 'listAssignmentSteps' },
     ]);

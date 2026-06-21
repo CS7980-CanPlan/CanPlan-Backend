@@ -386,6 +386,8 @@ fields are marked `!` and everything else is optional; see
 | `listTasksByCategory` | `ownerId!, categoryId, limit, nextToken` | `TaskConnection!` — tasks in one category; omit/blank `categoryId` for the `NO_CATEGORY` bucket |
 | `updateTask` | `input: { taskId!, title, categoryId, description, scheduleRule, status, schedule, notificationEnabled }` | `Task` — **partial edit**; see below |
 | `createTaskStep` | `input: { taskId!, order!, text!, mediaRefs }` | `TaskStep` |
+| `updateTaskStep` | `input: { taskId!, stepId!, text, mediaRefs }` | `TaskStep` — **partial edit** of one step; see below |
+| `deleteTask` | `taskId!` | `Task` — the deleted template (minus internal fields); deletes all its `TaskStep`s; see below |
 
 > **`updateTask` is a partial edit.** Only the fields you include change; omitted
 > fields keep their current value. `ownerId` is immutable and **steps are not edited
@@ -407,6 +409,49 @@ fields are marked `!` and everything else is optional; see
 > { "input": { "taskId": "task-123", "title": "Wash hands well", "status": "ACTIVE", "categoryId": "cat-hygiene" } }
 > ```
 
+> **`updateTaskStep` is a partial edit of one step.** Identify the step by `taskId` +
+> `stepId`. **Supply at least one of `text` / `mediaRefs`** — a request with neither is
+> rejected. A supplied `text` is trimmed and may **not** be empty; a supplied `mediaRefs`
+> **replaces** the list and **may be empty** (`[]` clears all media). `stepId`, `taskId`,
+> `order`, and `createdAt` are immutable; `updatedAt` is bumped. A missing step (no step
+> with that `stepId` under the task) returns a not-found error. There is **no API for
+> deleting an individual `TaskStep`** — steps are removed only by deleting their parent
+> `Task`.
+>
+> ```graphql
+> mutation UpdateTaskStep($input: UpdateTaskStepInput!) {
+>   updateTaskStep(input: $input) { stepId taskId order text mediaRefs updatedAt }
+> }
+> ```
+> ```json
+> { "input": { "taskId": "task-123", "stepId": "step-9", "text": "Scrub for 20 seconds", "mediaRefs": [] } }
+> ```
+
+> **`deleteTask` removes a template and all its steps.** Deletes the `Task` `#META` item
+> **and every `TaskStep`** under it, then returns the deleted `Task` (with internal
+> storage fields such as `PK`/`SK`/`entityType` stripped). A missing `taskId` returns a
+> not-found error. Two things are **deliberately NOT deleted**:
+>
+> - **Historical `Assignment`s and `AssignmentStep`s** created from this task. They are
+>   immutable snapshots and **remain readable after the template is deleted** — deleting a
+>   template never rewrites history. (To remove an assignment, use `deleteAssignment`.)
+> - **`MediaAsset` metadata and the underlying S3 objects** referenced by the task or its
+>   steps. **Media cleanup is intentionally out of scope** for `deleteTask`: it does not
+>   delete S3 files or `MediaAsset` rows. Orphaned media must be reclaimed separately (no
+>   API for that yet) — this avoids silently destroying binaries that may be shared or
+>   still referenced elsewhere.
+>
+> _Consistency note:_ a task with **>99 steps** exceeds DynamoDB's 100-item transaction
+> limit, so deletion is **not** a single atomic transaction. Steps are bulk-deleted in
+> batches (children first), then the `#META` item is deleted last, so the operation is
+> safely **idempotent/retryable** and never leaves a `TaskStep` orphaned without its task.
+>
+> ```graphql
+> mutation DeleteTask($taskId: ID!) {
+>   deleteTask(taskId: $taskId) { taskId title status }
+> }
+> ```
+
 **Assignments & progress tracking**
 
 | Operation | Input | Returns |
@@ -414,8 +459,29 @@ fields are marked `!` and everything else is optional; see
 | `createAssignment` | `input: { taskId!, userId!, assignedBy, dueDate, recurrence, scheduleRule }` | `Assignment` · always created with persisted status `TO_DO`. Validates the `Task` exists, then snapshots its `TaskStep`s into one `AssignmentStep` per step (all `completed: false`), atomically. Errors if the task is missing or has > 99 steps (DynamoDB's 100-item transaction limit). |
 | `updateAssignmentStatus` | `input: { userId!, assignmentId!, status! }` | `Assignment` · `status` accepts only `TO_DO`/`COMPLETED`/`SKIPPED` (`OVERDUE` is rejected). **Needs both `userId` and `assignmentId`** (they form the item key); errors if the assignment doesn't exist. Setting `COMPLETED` is rejected while any `AssignmentStep` is still incomplete (a zero-step assignment may be completed). Marking all steps complete does **not** auto-complete the assignment — the client sets `COMPLETED` explicitly. |
 | `setAssignmentStepCompletion` | `input: { userId!, assignmentId!, stepId!, completed! }` | `AssignmentStep` · toggles one step. Sets `completedAt` to now when `completed: true`, clears it when `false`. Rejected if the assignment is `COMPLETED` or `SKIPPED`; 404s if the assignment or step doesn't exist for the user. |
+| `deleteAssignment` | `input: { userId!, assignmentId! }` | `Assignment` · the deleted assignment (internal fields stripped); deletes all its `AssignmentStep`s. See below. |
 | `listAssignmentsForUser` | `userId!, limit, nextToken` | `AssignmentConnection!` · `status` is returned with `OVERDUE` derived and legacy values mapped (see [breaking changes](#breaking-changes-progress--assignment-rework)). |
 | `listAssignmentSteps` | `userId!, assignmentId!, limit, nextToken` | `AssignmentStepConnection!` · one assignment's step snapshots, sorted by `order`. |
+
+> **`deleteAssignment` removes an assignment and all its steps.** Identify it by `userId`
+> + `assignmentId` (its composite key). Deletes the `Assignment` row **and every
+> `AssignmentStep` snapshot** under it, then returns the deleted `Assignment` (internal
+> storage fields stripped; `status` is derived/legacy-mapped as on reads). A missing
+> assignment for that user returns a not-found error. The **source `Task` and its
+> `TaskSteps` are never touched**. There is **no API for deleting an `AssignmentStep`
+> independently** — a step snapshot is removed only when its parent assignment is deleted
+> (its completion can be toggled with `setAssignmentStepCompletion`, nothing more).
+>
+> _Consistency note:_ identical to `deleteTask` — an assignment with **>99 step
+> snapshots** can't be deleted in one atomic transaction (DynamoDB's 100-item limit), so
+> steps are batch-deleted first and the assignment row last, making the call idempotent/
+> retryable and never leaving an orphaned `AssignmentStep`.
+>
+> ```graphql
+> mutation DeleteAssignment($input: DeleteAssignmentInput!) {
+>   deleteAssignment(input: $input) { assignmentId userId taskId status }
+> }
+> ```
 
 **Media**
 
@@ -564,9 +630,15 @@ Planned but not implemented — don't build against them:
   / `INTERNAL` (see [Error handling](#error-handling)) are the intended contract, but
   resolver errors currently surface as `Lambda:Unhandled` with the cause only in
   `message`. Branch defensively until the codes are wired through.
-- **Delete** for any entity, and **update** for entities other than tasks
-  (`updateTask`) and assignment status (`updateAssignmentStatus`) — including
-  per-step editing (steps can only be created, via `createTaskStep`).
+- **Delete** for entities other than tasks (`deleteTask`) and assignments
+  (`deleteAssignment`); there is no standalone delete for a `TaskStep` or
+  `AssignmentStep` (they are removed only with their parent). **Update** exists for
+  tasks (`updateTask`), task steps (`updateTaskStep`), and assignment status
+  (`updateAssignmentStatus`); other entities have no update yet.
+- **Media cleanup on delete** — `deleteTask` does **not** delete `MediaAsset` metadata
+  or the S3 objects referenced by a task/its steps (intentionally out of scope, to
+  avoid destroying possibly-shared binaries). There is no orphaned-media reclamation
+  API yet.
 - **Report generation** — the `Report` type exists in the schema, but no query or
   mutation is exposed for it yet.
 - **Streaming AI responses** — `generateTaskSteps` is request/response only.

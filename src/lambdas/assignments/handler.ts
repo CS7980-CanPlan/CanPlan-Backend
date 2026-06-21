@@ -1,10 +1,12 @@
 import { randomUUID } from 'crypto';
 import {
+  DeleteCommand,
   GetCommand,
   QueryCommand,
   TransactWriteCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
+import { batchDelete, queryAllKeys } from '../../shared/batch';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import {
   ASSIGN_PREFIX,
@@ -26,6 +28,7 @@ import type {
   AssignmentStep,
   Connection,
   CreateAssignmentInput,
+  DeleteAssignmentInput,
   PersistedAssignmentStatus,
   SetAssignmentStepCompletionInput,
   TaskStep,
@@ -105,6 +108,8 @@ export const handler = async (
       return updateAssignmentStatus(args.input as UpdateAssignmentStatusInput);
     case 'setAssignmentStepCompletion':
       return setAssignmentStepCompletion(args.input as SetAssignmentStepCompletionInput);
+    case 'deleteAssignment':
+      return deleteAssignment(args.input as DeleteAssignmentInput);
     case 'listAssignmentsForUser':
       return listAssignmentsForUser(args.userId as string, pageArgs(args));
     case 'listAssignmentSteps':
@@ -302,6 +307,47 @@ async function setAssignmentStepCompletion(
     }
     throw err;
   }
+}
+
+/**
+ * deleteAssignment — delete an Assignment row and all of its AssignmentStep snapshots.
+ *
+ * Same delete-children-first strategy as deleteTask (see tasks/handler.ts): a >99-step
+ * assignment exceeds DynamoDB's 100-item transaction cap, so we bulk-delete via
+ * BatchWriteItem (chunks of 25, non-transactional — see src/shared/batch.ts). The
+ * ASSIGN_STEP# child rows go FIRST and the ASSIGN# row LAST so an interrupted run leaves
+ * the assignment findable and the whole operation idempotently retryable, never orphaning
+ * a step snapshot. Step keys are collected with full Query pagination. The source Task
+ * and its TaskSteps live under TASK#<taskId> and are never touched here.
+ */
+async function deleteAssignment(input: DeleteAssignmentInput): Promise<Assignment> {
+  const userId = input?.userId?.trim();
+  const assignmentId = input?.assignmentId?.trim();
+  if (!userId) throw new ValidationError('userId is required and cannot be empty');
+  if (!assignmentId) throw new ValidationError('assignmentId is required and cannot be empty');
+
+  // The user-scoped key both verifies existence and confirms the assignment is this user's.
+  const existing = await dynamo.send(
+    new GetCommand({ TableName: TABLE_NAME, Key: { PK: userPk(userId), SK: assignSk(assignmentId) } }),
+  );
+  if (!existing.Item) {
+    throw new NotFoundError(`assignment ${assignmentId} not found for user ${userId}`);
+  }
+
+  // 1) child ASSIGN_STEP# rows first …
+  const stepKeys = await queryAllKeys(userPk(userId), assignStepPrefix(assignmentId));
+  await batchDelete(stepKeys);
+  // 2) … then the assignment row last, guarded so it never resurrects.
+  await dynamo.send(
+    new DeleteCommand({
+      TableName: TABLE_NAME,
+      Key: { PK: userPk(userId), SK: assignSk(assignmentId) },
+      ConditionExpression: 'attribute_exists(PK)',
+    }),
+  );
+
+  // Return the deleted assignment in API shape (strips PK/SK/entityType, derives status).
+  return presentAssignment(existing.Item, Date.now());
 }
 
 async function listAssignmentsForUser(

@@ -272,6 +272,92 @@ describe('setAssignmentStepCompletion', () => {
   });
 });
 
+// ── deleteAssignment ────────────────────────────────────────────────────────--
+describe('deleteAssignment', () => {
+  const stored = { PK: 'USER#u1', SK: 'ASSIGN#a1', entityType: 'Assignment', assignmentId: 'a1', taskId: 't1', userId: 'u1', status: 'TO_DO' };
+  const batchInputs = () => inputs().filter((i) => i.RequestItems);
+  const deleteRowInputs = () => inputs().filter((i) => i.Key && i.ConditionExpression && !i.UpdateExpression);
+
+  it('deletes the assignment and all of its AssignmentSteps (steps first, row last)', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { ...stored } }) // GET assignment
+      .mockResolvedValueOnce({ Items: [{ PK: 'USER#u1', SK: 'ASSIGN_STEP#a1#STEP#s1' }, { PK: 'USER#u1', SK: 'ASSIGN_STEP#a1#STEP#s2' }] })
+      .mockResolvedValueOnce({}) // BatchWrite
+      .mockResolvedValueOnce({}); // Delete assignment
+
+    const result = (await handler(
+      event('deleteAssignment', { input: { userId: 'u1', assignmentId: 'a1' } }),
+    )) as Assignment;
+
+    // Step snapshots scoped to this assignment only.
+    const stepQuery = inputs().find((i) => i.KeyConditionExpression)!;
+    expect(stepQuery.ExpressionAttributeValues).toEqual({ ':pk': 'USER#u1', ':prefix': 'ASSIGN_STEP#a1#STEP#' });
+    // One batch carrying both step keys.
+    expect(batchInputs()[0].RequestItems['CanPlan-test']).toHaveLength(2);
+    // The assignment row delete is the last call.
+    const lastCall = mockSend.mock.calls[mockSend.mock.calls.length - 1][0].input;
+    expect(lastCall.Key).toEqual({ PK: 'USER#u1', SK: 'ASSIGN#a1' });
+    expect(lastCall.ConditionExpression).toBe('attribute_exists(PK)');
+    // Returned deleted assignment, internal fields stripped.
+    expect(result.assignmentId).toBe('a1');
+    const out = result as unknown as Record<string, unknown>;
+    expect(out.PK).toBeUndefined();
+    expect(out.SK).toBeUndefined();
+    expect(out.entityType).toBeUndefined();
+  });
+
+  it('returns NotFound and writes nothing when the assignment does not exist', async () => {
+    mockSend.mockResolvedValueOnce({}); // GET → no Item
+    await expect(
+      handler(event('deleteAssignment', { input: { userId: 'u1', assignmentId: 'gone' } })),
+    ).rejects.toThrow('assignment gone not found for user u1');
+    expect(mockSend).toHaveBeenCalledTimes(1);
+  });
+
+  it('never modifies the source Task or its TaskSteps (no TASK# key)', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { ...stored } })
+      .mockResolvedValueOnce({ Items: [{ PK: 'USER#u1', SK: 'ASSIGN_STEP#a1#STEP#s1' }] })
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({});
+    await handler(event('deleteAssignment', { input: { userId: 'u1', assignmentId: 'a1' } }));
+    expect(JSON.stringify(inputs())).not.toContain('TASK#');
+  });
+
+  it('deletes >99 step snapshots across query pages in batches of 25', async () => {
+    const page = (n: number, last?: boolean) => ({
+      Items: Array.from({ length: n }, (_, i) => ({ PK: 'USER#u1', SK: `ASSIGN_STEP#a1#STEP#${i}` })),
+      LastEvaluatedKey: last ? undefined : { PK: 'USER#u1', SK: 'last' },
+    });
+    mockSend
+      .mockResolvedValueOnce({ Item: { ...stored } }) // GET assignment
+      .mockResolvedValueOnce(page(70)) // step page 1 (more)
+      .mockResolvedValueOnce(page(70, true)) // step page 2 (last)
+      .mockResolvedValue({}); // BatchWrites + final Delete
+    await handler(event('deleteAssignment', { input: { userId: 'u1', assignmentId: 'a1' } }));
+
+    // 140 keys / 25 → 6 BatchWrite calls; row deleted once afterward.
+    expect(batchInputs()).toHaveLength(6);
+    expect(batchInputs().reduce((n, i) => n + i.RequestItems['CanPlan-test'].length, 0)).toBe(140);
+    expect(deleteRowInputs()).toHaveLength(1);
+  });
+
+  it('validates userId and assignmentId', async () => {
+    await expect(handler(event('deleteAssignment', { input: { assignmentId: 'a1' } }))).rejects.toThrow(
+      'userId is required',
+    );
+    await expect(handler(event('deleteAssignment', { input: { userId: 'u1' } }))).rejects.toThrow(
+      'assignmentId is required',
+    );
+  });
+
+  it('exposes no API for deleting an AssignmentStep independently', async () => {
+    await expect(
+      handler(event('deleteAssignmentStep', { input: { userId: 'u1', assignmentId: 'a1', stepId: 's1' } })),
+    ).rejects.toThrow('unsupported field');
+  });
+});
+
 // ── listAssignmentsForUser (status derivation + legacy mapping) ──────────────--
 describe('listAssignmentsForUser', () => {
   const PAST = '2000-01-01T00:00:00.000Z';

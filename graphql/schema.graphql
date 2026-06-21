@@ -294,6 +294,17 @@ input CreateTaskStepInput {
   mediaRefs: [ID!]
 }
 
+# Partial edit of one TaskStep, located by (taskId, stepId). Only the fields you
+# include change; supply at least one of `text` / `mediaRefs`. A supplied `text` is
+# trimmed and may not be empty; a supplied `mediaRefs` replaces the value and may be
+# an empty list. `stepId`, `taskId`, `order`, and `createdAt` are immutable.
+input UpdateTaskStepInput {
+  taskId: ID!
+  stepId: ID!
+  text: String
+  mediaRefs: [ID!]
+}
+
 # createAssignment always persists status TO_DO; status is not client-supplied.
 input CreateAssignmentInput {
   taskId: ID!
@@ -316,6 +327,13 @@ input SetAssignmentStepCompletionInput {
   assignmentId: ID!
   stepId: ID!
   completed: Boolean!
+}
+
+# Identifies one Assignment for deletion by its composite key. Deleting it also
+# removes every AssignmentStep snapshot under it; the source Task is untouched.
+input DeleteAssignmentInput {
+  userId: ID!
+  assignmentId: ID!
 }
 
 input CreateMediaAssetInput {
@@ -439,11 +457,19 @@ type Mutation {
   # Edit an existing task template's fields (partial update). Errors if not found.
   updateTask(input: UpdateTaskInput!): Task
   createTaskStep(input: CreateTaskStepInput!): TaskStep
+  # Partial edit of one TaskStep (text and/or mediaRefs). Errors if not found.
+  updateTaskStep(input: UpdateTaskStepInput!): TaskStep
+  # Delete a task template and all of its TaskSteps. Historical Assignments and
+  # AssignmentSteps snapshotted from it are NOT deleted. Returns the deleted Task.
+  deleteTask(taskId: ID!): Task
 
   createAssignment(input: CreateAssignmentInput!): Assignment
   updateAssignmentStatus(input: UpdateAssignmentStatusInput!): Assignment
   # Toggle one assignment step's completion. Rejected on COMPLETED/SKIPPED assignments.
   setAssignmentStepCompletion(input: SetAssignmentStepCompletionInput!): AssignmentStep
+  # Delete an assignment and all of its AssignmentStep snapshots. The source Task is
+  # untouched. Returns the deleted Assignment.
+  deleteAssignment(input: DeleteAssignmentInput!): Assignment
 
   # Mint a presigned S3 upload URL; the client uploads the file, then calls
   # createMediaAsset with the returned s3Key to register the metadata.
