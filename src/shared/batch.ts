@@ -46,6 +46,29 @@ export async function queryAllKeys(pk: string, skPrefix: string): Promise<ItemKe
 }
 
 /**
+ * Collect every full item under `pk` whose SK begins with `skPrefix`, following Query
+ * pagination. Unlike `queryAllKeys` this returns the whole row (e.g. so a cascade delete
+ * can read each MediaAsset's `s3Key`), at the cost of reading every attribute.
+ */
+export async function queryAllItems<T>(pk: string, skPrefix: string): Promise<T[]> {
+  const items: T[] = [];
+  let startKey: Record<string, unknown> | undefined;
+  do {
+    const result = await dynamo.send(
+      new QueryCommand({
+        TableName: TABLE_NAME,
+        KeyConditionExpression: 'PK = :pk AND begins_with(SK, :prefix)',
+        ExpressionAttributeValues: { ':pk': pk, ':prefix': skPrefix },
+        ExclusiveStartKey: startKey,
+      }),
+    );
+    items.push(...((result.Items as T[]) ?? []));
+    startKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+  } while (startKey);
+  return items;
+}
+
+/**
  * Delete many items by key in BatchWriteItem chunks of 25, retrying any
  * UnprocessedItems DynamoDB hands back under throttling (capacity pressure, not a
  * logical failure). This is NOT transactional: chunks commit independently, so a
@@ -76,6 +99,36 @@ export async function batchDelete(keys: ItemKey[]): Promise<void> {
     if (requestItems[TABLE_NAME]?.length) {
       throw new Error(
         `batchDelete: ${requestItems[TABLE_NAME].length} item(s) still unprocessed after retries`,
+      );
+    }
+  }
+}
+
+/**
+ * Write many complete rows with BatchWriteItem, in 25-item chunks and with the same
+ * bounded retry policy as batchDelete. Journal rows use this before a cascade deletes
+ * the source metadata, so a later retry still knows which S3 objects to clean up.
+ */
+export async function batchPut(items: Record<string, unknown>[]): Promise<void> {
+  for (let i = 0; i < items.length; i += BATCH_WRITE_LIMIT) {
+    const chunk = items.slice(i, i + BATCH_WRITE_LIMIT);
+    let requestItems: NonNullable<
+      ConstructorParameters<typeof BatchWriteCommand>[0]['RequestItems']
+    > = {
+      [TABLE_NAME]: chunk.map((Item) => ({ PutRequest: { Item } })),
+    };
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const result = await dynamo.send(new BatchWriteCommand({ RequestItems: requestItems }));
+      const unprocessed = result.UnprocessedItems;
+      if (!unprocessed?.[TABLE_NAME]?.length) {
+        requestItems = {};
+        break;
+      }
+      requestItems = unprocessed;
+    }
+    if (requestItems[TABLE_NAME]?.length) {
+      throw new Error(
+        `batchPut: ${requestItems[TABLE_NAME].length} item(s) still unprocessed after retries`,
       );
     }
   }

@@ -1,5 +1,6 @@
 import { handler } from './handler';
 import { dynamo } from '../../shared/dynamodb';
+import { deleteS3ObjectBestEffort, prepareCoverImageAsset } from '../../shared/media';
 
 // Mock the DynamoDB document client so tests never hit AWS.
 jest.mock('../../shared/dynamodb', () => ({
@@ -7,7 +8,16 @@ jest.mock('../../shared/dynamodb', () => ({
   TABLE_NAME: 'CanPlan-test',
 }));
 
+// Cover-image S3 work (HeadObject/CopyObject/DeleteObject) is unit-tested in
+// shared/media.test.ts; here we stub it to focus on the create transaction + rollback.
+jest.mock('../../shared/media', () => ({
+  prepareCoverImageAsset: jest.fn(),
+  deleteS3ObjectBestEffort: jest.fn().mockResolvedValue(true),
+}));
+
 const mockSend = dynamo.send as jest.Mock;
+const mockPrepare = prepareCoverImageAsset as jest.Mock;
+const mockDeleteS3 = deleteS3ObjectBestEffort as jest.Mock;
 
 beforeEach(() => {
   mockSend.mockResolvedValue({});
@@ -232,5 +242,85 @@ describe('createTask handler', () => {
       handler(makeEvent({ ownerId: 'o', title: 'T', steps: [{ text: '  ' }] })),
     ).rejects.toThrow('step 1: text is required');
     expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { coverImageS3Key: undefined, stepCount: 100, maxSteps: 99 },
+    { coverImageS3Key: 'media/pending/task-cover/u.png', stepCount: 99, maxSteps: 98 },
+  ])('rejects $stepCount steps when the limit is $maxSteps', async ({ coverImageS3Key, stepCount, maxSteps }) => {
+    const steps = Array.from({ length: stepCount }, (_, i) => ({ text: `Step ${i + 1}` }));
+
+    await expect(handler(makeEvent({ ownerId: 'o', title: 'T', steps, coverImageS3Key }))).rejects.toThrow(
+      `at most ${maxSteps} steps`,
+    );
+    expect(mockPrepare).not.toHaveBeenCalled();
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  describe('cover image', () => {
+    it('does not touch S3 / cover logic when no coverImageS3Key is supplied', async () => {
+      const result = await handler(makeEvent({ ownerId: 'o', title: 'T' }));
+      expect(mockPrepare).not.toHaveBeenCalled();
+      const meta = writtenItems().find((i) => i.SK === '#META')!;
+      expect(meta.coverImageAssetId).toBeUndefined();
+      expect(result.coverImageAssetId).toBeUndefined();
+    });
+
+    it('promotes the upload and writes the cover MediaAsset in the same transaction', async () => {
+      mockPrepare.mockResolvedValueOnce({
+        assetId: 'cover-1',
+        taskId: 'placeholder',
+        s3Key: 'media/placeholder/cover-1.png',
+        type: 'IMAGE',
+        mimeType: 'image/png',
+        ownerId: 'sup-1',
+        size: 2048,
+        createdAt: 'now',
+        updatedAt: 'now',
+      });
+
+      const result = await handler(
+        makeEvent({ ownerId: 'sup-1', title: 'T', coverImageS3Key: 'media/pending/task-cover/u.png' }),
+      );
+
+      // prepare was called with the server-generated taskId + owner + pending key.
+      expect(mockPrepare).toHaveBeenCalledWith({
+        taskId: result.taskId,
+        ownerId: 'sup-1',
+        coverImageS3Key: 'media/pending/task-cover/u.png',
+      });
+
+      // One transaction carrying the Task (+coverImageAssetId) and the MediaAsset row.
+      expect(mockSend).toHaveBeenCalledTimes(1);
+      const items = writtenItems();
+      const meta = items.find((i) => i.SK === '#META')!;
+      expect(meta.coverImageAssetId).toBe('cover-1');
+      const media = items.find((i) => i.entityType === 'MediaAsset')!;
+      expect(media.SK).toBe('MEDIA#cover-1');
+      expect(media.PK).toBe(`TASK#${result.taskId}`);
+      expect(media.type).toBe('IMAGE');
+      expect(media.s3Key).toBe('media/placeholder/cover-1.png');
+      expect(result.coverImageAssetId).toBe('cover-1');
+    });
+
+    it('best-effort deletes the copied S3 object and rethrows when the write fails', async () => {
+      mockPrepare.mockResolvedValueOnce({
+        assetId: 'cover-1',
+        s3Key: 'media/x/cover-1.png',
+        type: 'IMAGE',
+        mimeType: 'image/png',
+        ownerId: 'o',
+        taskId: 'x',
+        createdAt: 'now',
+        updatedAt: 'now',
+      });
+      mockSend.mockRejectedValueOnce(new Error('transaction canceled'));
+
+      await expect(
+        handler(makeEvent({ ownerId: 'o', title: 'T', coverImageS3Key: 'media/pending/task-cover/u.png' })),
+      ).rejects.toThrow('transaction canceled');
+      // The orphaned final object is cleaned up; original error preserved.
+      expect(mockDeleteS3).toHaveBeenCalledWith('media/x/cover-1.png', expect.objectContaining({ event: 'createTask.coverRollback' }));
+    });
   });
 });

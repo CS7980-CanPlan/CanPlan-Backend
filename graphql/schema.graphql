@@ -113,6 +113,10 @@ type Task {
   nextOccurrenceAt: String
   # Whether reminders are enabled; defaults to true when a schedule is provided.
   notificationEnabled: Boolean
+  # Optional single cover image — the id of an IMAGE MediaAsset under this task. Null
+  # when the task has no cover. Fetch a viewable URL via getMediaDownloadUrl(taskId,
+  # coverImageAssetId); no cover URL is exposed directly on the Task.
+  coverImageAssetId: ID
   createdAt: String!
   updatedAt: String
   # Populated by createTask with the steps it just wrote; use listTaskSteps otherwise.
@@ -266,6 +270,9 @@ input CreateTaskInput {
   schedule: TaskScheduleInput
   # Optional; defaults to true when a schedule is provided, otherwise left unset.
   notificationEnabled: Boolean
+  # Optional cover image: the pending s3Key from createTaskCoverImageUploadUrl (after
+  # the client PUT the bytes). Omitted ⇒ the task has no cover image.
+  coverImageS3Key: String
 }
 
 # Partial edit of an existing task. Only fields you include are changed; omitted
@@ -280,6 +287,10 @@ input UpdateTaskInput {
   status: TaskStatus
   schedule: TaskScheduleInput
   notificationEnabled: Boolean
+  # Optional new cover image: the pending s3Key from createTaskCoverImageUploadUrl.
+  # Supplied ⇒ replace the cover (old asset/binary cleaned up after the new one is
+  # registered); omitted ⇒ leave the current cover image unchanged.
+  coverImageS3Key: String
 }
 
 input CreateTaskStepNestedInput {
@@ -350,6 +361,21 @@ input CreateMediaUploadUrlInput {
   taskId: ID!
   contentType: String!
   fileName: String
+}
+
+# Cover-image upload URL input. No taskId — a task may not exist yet at create time.
+# contentType must be an image type (image/jpeg, image/png, image/webp); the server
+# also re-verifies the uploaded object before registering it.
+input CreateTaskCoverImageUploadUrlInput {
+  contentType: String!
+  fileName: String
+}
+
+# Identifies one MediaAsset to delete (its S3 binary + metadata row). Also clears any
+# dangling references (Task.coverImageAssetId, TaskStep.mediaRefs).
+input DeleteMediaAssetInput {
+  taskId: ID!
+  assetId: ID!
 }
 
 # AI step generation
@@ -475,6 +501,14 @@ type Mutation {
   # createMediaAsset with the returned s3Key to register the metadata.
   createMediaUploadUrl(input: CreateMediaUploadUrlInput!): MediaUploadTarget
   createMediaAsset(input: CreateMediaAssetInput!): MediaAsset
+  # Mint a presigned PUT URL + temporary pending s3Key for a task cover image. Reject
+  # non-image content types. Pass the returned s3Key as coverImageS3Key to createTask/
+  # updateTask, which verifies and promotes the upload to a task-owned MediaAsset.
+  createTaskCoverImageUploadUrl(input: CreateTaskCoverImageUploadUrlInput!): MediaUploadTarget!
+  # Delete one MediaAsset: its S3 binary and metadata row, plus any dangling references
+  # (clears Task.coverImageAssetId / removes it from TaskStep.mediaRefs). Returns the
+  # deleted asset; NotFound if it doesn't exist. Does not delete the Task or its steps.
+  deleteMediaAsset(input: DeleteMediaAssetInput!): MediaAsset
 
   # Break a daily-living task into ordered, source-cited steps via Bedrock KB + RAG.
   generateTaskSteps(input: GenerateTaskStepsInput!): TaskStepsResponse!

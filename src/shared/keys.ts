@@ -15,6 +15,7 @@ export const ENTITY = {
   ASSIGNMENT: 'Assignment',
   ASSIGNMENT_STEP: 'AssignmentStep',
   MEDIA_ASSET: 'MediaAsset',
+  TASK_MEDIA_CLEANUP: 'TaskMediaCleanup',
   REPORT: 'Report',
 } as const;
 
@@ -46,6 +47,9 @@ export const ASSIGN_PREFIX = 'ASSIGN#';
 // user's assignments never returns these step rows.
 export const ASSIGN_STEP_PREFIX = 'ASSIGN_STEP#';
 export const MEDIA_PREFIX = 'MEDIA#';
+// Durable journal rows used while cascading a Task's media deletion. They retain the
+// S3 key across retries even after the MediaAsset row has been removed.
+export const TASK_MEDIA_CLEANUP_PREFIX = 'CLEANUP_MEDIA#';
 export const USER_LINK_PREFIX = 'USER#';
 
 // ── Reserved ids ──────────────────────────────────────────────────────────────
@@ -87,6 +91,8 @@ export const assignStepPrefix = (assignmentId: string): string =>
   `${ASSIGN_STEP_PREFIX}${assignmentId}#${STEP_PREFIX}`;
 /** MediaAsset SK — keyed by the unique assetId under the owning task. */
 export const mediaSk = (assetId: string): string => `${MEDIA_PREFIX}${assetId}`;
+/** Task-media cleanup journal SK — retains an S3 key until the binary is deleted. */
+export const taskMediaCleanupSk = (assetId: string): string => `${TASK_MEDIA_CLEANUP_PREFIX}${assetId}`;
 
 /** Zero-pad a step order to three digits: 1 → "001". Keeps STEP#001 < STEP#010 < STEP#100. */
 export function padOrder(order: number): string {

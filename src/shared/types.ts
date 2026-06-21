@@ -80,6 +80,12 @@ export interface Task {
   nextOccurrenceAt?: string;
   /** Whether reminders are enabled; defaults to true when a schedule is provided. */
   notificationEnabled?: boolean;
+  /**
+   * Optional single cover image. The id of an IMAGE MediaAsset (PK=TASK#<taskId>,
+   * SK=MEDIA#<assetId>); fetch a viewable URL with getMediaDownloadUrl(taskId, assetId).
+   * Null/absent when the task has no cover image.
+   */
+  coverImageAssetId?: string;
   createdAt: string;
   updatedAt?: string;
   /** Populated by createTask with the steps it just wrote; null on plain getTask. */
@@ -190,6 +196,11 @@ export interface CreateTaskInput {
   steps?: CreateTaskStepNestedInput[];
   schedule?: TaskScheduleInput;
   notificationEnabled?: boolean;
+  /**
+   * Optional cover image: the pending s3Key returned by createTaskCoverImageUploadUrl
+   * (after the client PUT the bytes). Omitted ⇒ no cover image.
+   */
+  coverImageS3Key?: string;
 }
 
 /**
@@ -205,6 +216,12 @@ export interface UpdateTaskInput {
   status?: TaskStatus;
   schedule?: TaskScheduleInput;
   notificationEnabled?: boolean;
+  /**
+   * Optional new cover image: the pending s3Key from createTaskCoverImageUploadUrl.
+   * Supplied ⇒ replace the cover image (old one is cleaned up after the new one is
+   * safely registered); omitted ⇒ leave the current cover image unchanged.
+   */
+  coverImageS3Key?: string;
 }
 
 export interface CreateTaskStepInput {
@@ -275,6 +292,20 @@ export interface CreateMediaUploadUrlInput {
   taskId: string;
   contentType: string;
   fileName?: string;
+}
+
+// Cover-image upload URL: no taskId (a task may not exist yet at create time). The
+// returned s3Key is a server-owned pending key; the client PUTs bytes to the URL, then
+// passes the key as coverImageS3Key to createTask/updateTask.
+export interface CreateTaskCoverImageUploadUrlInput {
+  contentType: string;
+  fileName?: string;
+}
+
+// Identifies one MediaAsset for deletion (its binary + metadata row + dangling refs).
+export interface DeleteMediaAssetInput {
+  taskId: string;
+  assetId: string;
 }
 
 // Returned by createMediaUploadUrl: a presigned PUT URL the client uploads the

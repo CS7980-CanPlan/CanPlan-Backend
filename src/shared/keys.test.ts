@@ -78,6 +78,7 @@ describe('ENTITY discriminators', () => {
     expect(ENTITY.ASSIGNMENT).toBe('Assignment');
     expect(ENTITY.ASSIGNMENT_STEP).toBe('AssignmentStep');
     expect(ENTITY.MEDIA_ASSET).toBe('MediaAsset');
+    expect(ENTITY.TASK_MEDIA_CLEANUP).toBe('TaskMediaCleanup');
     expect(ENTITY.REPORT).toBe('Report');
   });
 });

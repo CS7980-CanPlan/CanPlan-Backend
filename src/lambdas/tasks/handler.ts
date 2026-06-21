@@ -1,18 +1,30 @@
 import { randomUUID } from 'crypto';
-import { DeleteCommand, GetCommand, PutCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
-import { batchDelete, queryAllKeys } from '../../shared/batch';
+import {
+  DeleteCommand,
+  GetCommand,
+  PutCommand,
+  QueryCommand,
+  TransactWriteCommand,
+  UpdateCommand,
+} from '@aws-sdk/lib-dynamodb';
+import { batchDelete, batchPut, type ItemKey, queryAllItems, queryAllKeys } from '../../shared/batch';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import {
   ENTITY,
+  MEDIA_PREFIX,
+  mediaSk,
   META_SK,
   NO_CATEGORY,
   STEP_PREFIX,
   stepSk,
   TASK_CATEGORY_INDEX,
   taskCategoryKey,
+  TASK_MEDIA_CLEANUP_PREFIX,
   TASK_OWNER_INDEX,
+  taskMediaCleanupSk,
   taskPk,
 } from '../../shared/keys';
+import { deleteS3ObjectBestEffort, prepareCoverImageAsset } from '../../shared/media';
 import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
 import { NotFoundError, ValidationError } from '../../shared/response';
 import { normalizeSchedule } from '../../shared/schedule';
@@ -20,6 +32,7 @@ import type {
   AppSyncEvent,
   Connection,
   CreateTaskStepInput,
+  MediaAsset,
   Task,
   TaskStep,
   UpdateTaskInput,
@@ -162,16 +175,94 @@ async function updateTask(input: UpdateTaskInput): Promise<Task> {
     updated.nextOccurrenceAt = scheduleUpdate.nextOccurrenceAt;
   }
 
-  await dynamo.send(
-    new PutCommand({
-      TableName: TABLE_NAME,
-      Item: updated,
-      // Fail loudly if the row vanished between the read and the write.
-      ConditionExpression: 'attribute_exists(PK)',
-    }),
-  );
+  // No cover-image change: keep the original single-Put behavior.
+  if (input.coverImageS3Key == null) {
+    await dynamo.send(
+      new PutCommand({
+        TableName: TABLE_NAME,
+        Item: updated,
+        // Fail loudly if the row vanished between the read and the write.
+        ConditionExpression: 'attribute_exists(PK)',
+      }),
+    );
+    return updated;
+  }
+
+  // ── Cover-image replacement ──────────────────────────────────────────────────
+  // Verify + promote the pending upload (S3 copy) BEFORE any DB write.
+  const oldCoverAssetId = stored.coverImageAssetId;
+  const newCover = await prepareCoverImageAsset({
+    taskId,
+    ownerId: stored.ownerId,
+    coverImageS3Key: input.coverImageS3Key,
+  });
+  updated.coverImageAssetId = newCover.assetId;
+
+  // Persist the updated Task (new coverImageAssetId) and the new MediaAsset row
+  // atomically — the new cover is "active" only once BOTH land.
+  try {
+    await dynamo.send(
+      new TransactWriteCommand({
+        TransactItems: [
+          {
+            Put: { TableName: TABLE_NAME, Item: updated, ConditionExpression: 'attribute_exists(PK)' },
+          },
+          {
+            Put: {
+              TableName: TABLE_NAME,
+              Item: {
+                PK: taskPk(taskId),
+                SK: mediaSk(newCover.assetId),
+                entityType: ENTITY.MEDIA_ASSET,
+                ...newCover,
+              },
+            },
+          },
+        ],
+      }),
+    );
+  } catch (err) {
+    // DB failed after the S3 copy — best-effort remove the new object, preserve the error.
+    await deleteS3ObjectBestEffort(newCover.s3Key, { event: 'updateTask.coverRollback', taskId });
+    throw err;
+  }
+
+  // New cover is now active. ONLY NOW remove the previous cover (row + binary). This is
+  // best-effort and never rolls back the new cover; a failure is logged (with taskId,
+  // old assetId, s3Key) for a retry/cleanup job. Skip when there was no prior cover.
+  if (oldCoverAssetId && oldCoverAssetId !== newCover.assetId) {
+    await deleteOldCoverImage(taskId, oldCoverAssetId);
+  }
 
   return updated;
+}
+
+/**
+ * Best-effort cleanup of a replaced cover image: delete its MediaAsset row then its S3
+ * object. Never throws — the new cover is already active and must not be rolled back; a
+ * failure is logged with enough context (taskId, old assetId, s3Key) to retry.
+ */
+async function deleteOldCoverImage(taskId: string, oldAssetId: string): Promise<void> {
+  try {
+    const old = await dynamo.send(
+      new GetCommand({ TableName: TABLE_NAME, Key: { PK: taskPk(taskId), SK: mediaSk(oldAssetId) } }),
+    );
+    const oldKey = (old.Item as MediaAsset | undefined)?.s3Key;
+    await dynamo.send(
+      new DeleteCommand({ TableName: TABLE_NAME, Key: { PK: taskPk(taskId), SK: mediaSk(oldAssetId) } }),
+    );
+    if (oldKey) {
+      await deleteS3ObjectBestEffort(oldKey, {
+        event: 'updateTask.oldCoverCleanup',
+        taskId,
+        oldAssetId,
+      });
+    }
+  } catch (err) {
+    console.error(
+      JSON.stringify({ event: 'updateTask.oldCoverCleanupFailed', taskId, oldAssetId, error: String(err) }),
+    );
+  }
 }
 
 async function createTaskStep(input: CreateTaskStepInput): Promise<TaskStep> {
@@ -270,20 +361,21 @@ async function updateTaskStep(input: UpdateTaskStepInput): Promise<TaskStep> {
 }
 
 /**
- * deleteTask — delete a Task `#META` item and all of its TaskStep rows.
+ * deleteTask — delete a Task and ALL of its owned children: the `#META` item, every
+ * TaskStep row, and every MediaAsset row (cover image, step media, and any task-level
+ * media without a stepId) plus each MediaAsset's S3 binary.
  *
  * Deletion strategy & consistency: a DynamoDB transaction is capped at 100 items, so a
- * task with >99 steps cannot be deleted atomically. We bulk-delete via BatchWriteItem
- * (chunks of 25, see src/shared/batch.ts), which is NOT transactional. To never leave
- * an orphaned TaskStep, we delete all STEP# child rows FIRST and the #META row LAST: if
- * the run is interrupted mid-way the task template still exists, so this function still
- * finds it and a retry safely resumes — every step always has its parent until the very
- * last delete. Steps are read with full Query pagination, so any step count is handled.
+ * task with >99 children cannot be deleted atomically. Before a MediaAsset can be
+ * removed, a durable cleanup journal retains its S3 key. We then bulk-delete child rows
+ * via BatchWriteItem (chunks of 25, see src/shared/batch.ts). Children go first; journal
+ * rows drive idempotent S3 deletion; the journal and #META are removed only after every
+ * binary delete succeeds. Thus an interruption keeps the Task + journal retryable even
+ * if some MediaAsset metadata was already removed. Children are read with full Query
+ * pagination (any count).
  *
- * Out of scope: Assignments/AssignmentSteps snapshotted from this task (under
- * USER#<userId> partitions) are intentionally left intact — they are historical records
- * that must stay readable after the template is gone. MediaAsset metadata and the
- * underlying S3 objects are also NOT deleted here (documented in docs/API.md).
+ * Preserved: Assignments/AssignmentSteps snapshotted from this task (under USER#<userId>
+ * partitions) are historical records and are intentionally never deleted here.
  */
 async function deleteTask(taskId: string): Promise<Task> {
   const id = taskId?.trim();
@@ -295,10 +387,41 @@ async function deleteTask(taskId: string): Promise<Task> {
   const stored = existing.Item as Task | undefined;
   if (!stored) throw new NotFoundError(`task ${id} not found`);
 
-  // 1) child STEP# rows first (paginated key collection + chunked batch delete) …
+  // Collect every child row (paginated). Media items carry s3Key for binary cleanup.
   const stepKeys = await queryAllKeys(taskPk(id), STEP_PREFIX);
-  await batchDelete(stepKeys);
-  // 2) … then the #META anchor last, guarded so it never resurrects.
+  const mediaItems = await queryAllItems<MediaAsset & ItemKey>(taskPk(id), MEDIA_PREFIX);
+
+  // Persist every S3 key BEFORE deleting a MediaAsset row. If a later BatchWrite
+  // partially succeeds, a retry can still read these journal records and clean up all
+  // corresponding binaries — including metadata rows already removed in the first run.
+  await journalTaskMediaCleanup(id, mediaItems);
+
+  // 1) child rows first (steps + media), chunked under the transaction/batch limits …
+  const childKeys: ItemKey[] = [
+    ...stepKeys,
+    ...mediaItems.map((m) => ({ PK: taskPk(id), SK: mediaSk(m.assetId) })),
+  ];
+  await batchDelete(childKeys);
+  // 2) S3 binaries last, driven by durable journal rows rather than the now-deleted
+  // MediaAsset rows. Do not delete #META until every S3 delete has succeeded; an error
+  // leaves the Task + journal retryable instead of losing the only copy of an S3 key.
+  const cleanupItems = await queryAllItems<TaskMediaCleanup>(taskPk(id), TASK_MEDIA_CLEANUP_PREFIX);
+  const failedS3Deletes: string[] = [];
+  for (const cleanup of cleanupItems) {
+    const deleted = await deleteS3ObjectBestEffort(cleanup.s3Key, {
+      event: 'deleteTask',
+      taskId: id,
+      assetId: cleanup.assetId,
+    });
+    if (!deleted) failedS3Deletes.push(cleanup.assetId);
+  }
+  if (failedS3Deletes.length) {
+    throw new Error(
+      `deleteTask: ${failedS3Deletes.length} media object(s) could not be deleted; retry the operation`,
+    );
+  }
+  await batchDelete(cleanupItems.map(({ PK, SK }) => ({ PK, SK })));
+  // 3) Only after children and every binary are gone, remove the parent anchor.
   await dynamo.send(
     new DeleteCommand({
       TableName: TABLE_NAME,
@@ -314,6 +437,29 @@ async function deleteTask(taskId: string): Promise<Task> {
   delete out.entityType;
   delete out.taskCategoryKey;
   return out as unknown as Task;
+}
+
+/** Durable S3-cleanup row written before a Task's MediaAsset metadata can disappear. */
+interface TaskMediaCleanup extends ItemKey {
+  assetId: string;
+  s3Key: string;
+}
+
+async function journalTaskMediaCleanup(taskId: string, mediaItems: Array<MediaAsset & ItemKey>): Promise<void> {
+  if (!mediaItems.length) return;
+  const now = new Date().toISOString();
+  await batchPut(
+    mediaItems
+      .filter((media) => !!media.s3Key)
+      .map((media) => ({
+        PK: taskPk(taskId),
+        SK: taskMediaCleanupSk(media.assetId),
+        entityType: ENTITY.TASK_MEDIA_CLEANUP,
+        assetId: media.assetId,
+        s3Key: media.s3Key,
+        createdAt: now,
+      })),
+  );
 }
 
 /** Find one TaskStep by stepId among a task's STEP# rows (follows pagination). */

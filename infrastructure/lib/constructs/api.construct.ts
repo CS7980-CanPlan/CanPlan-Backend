@@ -120,7 +120,9 @@ export class Api extends Construct {
     // Media assets — presigned upload + download URLs, metadata registration, listing.
     wire('MediaDataSource', props.mediaFn, [
       { typeName: 'Mutation', fieldName: 'createMediaUploadUrl' },
+      { typeName: 'Mutation', fieldName: 'createTaskCoverImageUploadUrl' },
       { typeName: 'Mutation', fieldName: 'createMediaAsset' },
+      { typeName: 'Mutation', fieldName: 'deleteMediaAsset' },
       { typeName: 'Query', fieldName: 'getMediaDownloadUrl' },
       { typeName: 'Query', fieldName: 'listMediaForTask' },
     ]);

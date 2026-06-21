@@ -241,7 +241,7 @@ user is a separate operation — see `createAssignment`.
 | `description` | `String` | — | Optional |
 | `scheduleRule` | `String` | — | Optional (e.g. an RRULE) |
 | `status` | `TaskStatus` | — | Defaults to `DRAFT` |
-| `steps` | `[CreateTaskStepNestedInput!]` | — | Ordered; each becomes a `STEP#NNN` item |
+| `steps` | `[CreateTaskStepNestedInput!]` | — | Ordered; each becomes a `STEP#NNN` item; max 99, or max 98 when `coverImageS3Key` is supplied |
 | `schedule` | `TaskScheduleInput` | — | Optional recurring schedule (stored only — see below) |
 | `notificationEnabled` | `Boolean` | — | Defaults to `true` when `schedule` is set; otherwise left unset unless you pass it |
 
@@ -430,21 +430,26 @@ fields are marked `!` and everything else is optional; see
 > **`deleteTask` removes a template and all its steps.** Deletes the `Task` `#META` item
 > **and every `TaskStep`** under it, then returns the deleted `Task` (with internal
 > storage fields such as `PK`/`SK`/`entityType` stripped). A missing `taskId` returns a
-> not-found error. Two things are **deliberately NOT deleted**:
+> not-found error.
 >
-> - **Historical `Assignment`s and `AssignmentStep`s** created from this task. They are
->   immutable snapshots and **remain readable after the template is deleted** — deleting a
->   template never rewrites history. (To remove an assignment, use `deleteAssignment`.)
-> - **`MediaAsset` metadata and the underlying S3 objects** referenced by the task or its
->   steps. **Media cleanup is intentionally out of scope** for `deleteTask`: it does not
->   delete S3 files or `MediaAsset` rows. Orphaned media must be reclaimed separately (no
->   API for that yet) — this avoids silently destroying binaries that may be shared or
->   still referenced elsewhere.
+> **`deleteTask` cascades to all task-owned media.** It deletes the `Task` `#META` item,
+> **every `TaskStep`**, **every `MediaAsset` row** under the task (cover image, step media,
+> and any task-level media without a `stepId`), and **each of those `MediaAsset`s' S3
+> binaries**. Nothing task-owned — DynamoDB rows, S3 objects, or cover/step references —
+> is left behind.
 >
-> _Consistency note:_ a task with **>99 steps** exceeds DynamoDB's 100-item transaction
-> limit, so deletion is **not** a single atomic transaction. Steps are bulk-deleted in
-> batches (children first), then the `#META` item is deleted last, so the operation is
-> safely **idempotent/retryable** and never leaves a `TaskStep` orphaned without its task.
+> **Historical `Assignment`s and `AssignmentStep`s are preserved.** They are immutable
+> snapshots and **remain readable after the template is deleted** — deleting a template
+> never rewrites history. (To remove an assignment, use `deleteAssignment`; to remove a
+> single media asset, use `deleteMediaAsset`.)
+>
+> _Consistency note:_ a task with **>99 children** exceeds DynamoDB's 100-item transaction
+> limit, so deletion is **not** a single atomic transaction. Before any `MediaAsset` row
+> is removed, the backend writes durable cleanup-journal rows containing its S3 key.
+> `TaskStep` and `MediaAsset` rows are then bulk-deleted in batches (children first). The
+> journal drives S3 deletion and is removed only after every binary is deleted; only then
+> is `#META` removed. If a batch or S3 delete fails, the Task and journal remain so a retry
+> can finish cleanup without losing an S3 key.
 >
 > ```graphql
 > mutation DeleteTask($taskId: ID!) {
@@ -488,7 +493,9 @@ fields are marked `!` and everything else is optional; see
 | Operation | Input | Returns |
 |---|---|---|
 | `createMediaUploadUrl` | `input: { taskId!, contentType!, fileName }` | `MediaUploadTarget` — see flow below |
+| `createTaskCoverImageUploadUrl` | `input: { contentType!, fileName }` | `MediaUploadTarget!` — temporary cover-image upload; see [cover images](#task-cover-images) |
 | `createMediaAsset` | `input: { taskId!, s3Key!, type!, mimeType!, ownerId!, size, stepId }` | `MediaAsset` — see flow below |
+| `deleteMediaAsset` | `input: { taskId!, assetId! }` | `MediaAsset` — deletes the binary + row + dangling refs; see below |
 | `getMediaDownloadUrl` | `taskId!, assetId!` | `MediaDownloadTarget` — see flow below |
 | `listMediaForTask` | `taskId!, limit, nextToken` | `MediaAssetConnection!` |
 
@@ -514,6 +521,67 @@ fields are marked `!` and everything else is optional; see
 > call **`getMediaDownloadUrl(taskId, assetId)`** → `{ downloadUrl, s3Key, expiresIn }`
 > and `GET` the (short-lived) `downloadUrl`. It only signs assets that are actually
 > registered — unknown ids return a not-found error rather than signing an arbitrary key.
+
+> **`deleteMediaAsset({ taskId, assetId })`** permanently removes one media asset: its
+> **S3 binary** and its **DynamoDB row**, after first clearing every API-visible
+> reference to it — if it was the task's cover image, `Task.coverImageAssetId` is
+> cleared; it is removed from `mediaRefs` on every `TaskStep` that listed it. The `Task`
+> and its `TaskSteps` are **not** deleted. Returns the deleted asset (internal storage
+> fields stripped); a missing asset returns a not-found error.
+>
+> _Consistency & sharing:_ DynamoDB and S3 aren't transactional, so references and the
+> metadata row are deleted **first**, then the S3 object — the API never points at a
+> file that's gone. The call is **idempotent/retryable** (a re-run returns not-found;
+> S3 delete is a no-op for an already-absent object). If the S3 delete fails after the
+> row is gone, the failure is **logged with `taskId`/`assetId`/`s3Key`** for a
+> retry/cleanup job (never silently ignored) and leaves only an orphaned binary, not a
+> dangling reference. **Each media asset belongs to exactly one `Task`** (it lives under
+> `TASK#<taskId>`) and is deleted with it — assets are not shared across tasks.
+
+---
+
+### Task cover images
+
+A `Task` may have **one optional cover image** (`Task.coverImageAssetId`, nullable). The
+file is an ordinary private-S3 object recorded as a `MediaAsset` (`type: IMAGE`, no
+`stepId`). Binary bytes never travel through GraphQL — the existing presigned-PUT flow is
+used, with a temporary key so it also works at **create** time (before a `taskId` exists).
+
+**Sequence (create or update):**
+
+1. **`createTaskCoverImageUploadUrl({ contentType, fileName? })`** → `{ uploadUrl, s3Key,
+   expiresIn }`. `contentType` must be `image/jpeg`, `image/png`, or `image/webp` (others
+   are rejected). `s3Key` is a server-owned **pending** key
+   (`media/pending/task-cover/<uuid>.<ext>`).
+2. **`PUT` the image bytes to `uploadUrl`** with that same `Content-Type` (direct to S3).
+3. Pass the pending `s3Key` as **`coverImageS3Key`** to **`createTask`** or
+   **`updateTask`**. The server then, server-side:
+   - rejects any key not under the pending prefix (no arbitrary keys);
+   - **`HeadObject`** verifies the *real* object — it must exist, be an allowed image
+     type, and be `0 < size ≤ 10 MB` (client-declared MIME/size are never trusted);
+   - copies it to a task-owned key (`media/<taskId>/<assetId>.<ext>`), deletes the temp
+     object, registers the `MediaAsset`, and sets `Task.coverImageAssetId`.
+4. **To display it:** call **`getMediaDownloadUrl(taskId, coverImageAssetId)`** — there is
+   no cover URL exposed directly on `Task`.
+
+```graphql
+mutation CoverUrl($input: CreateTaskCoverImageUploadUrlInput!) {
+  createTaskCoverImageUploadUrl(input: $input) { uploadUrl s3Key expiresIn }
+}
+# then: PUT bytes to uploadUrl, then createTask/updateTask with coverImageS3Key: <s3Key>
+```
+
+- **On `createTask`:** the cover `MediaAsset` row is written **in the same transaction**
+  as the `Task` + `TaskStep`s. If that write fails after the S3 copy, the copied object is
+  best-effort deleted and the original error is preserved.
+- **On `updateTask`:** supplying `coverImageS3Key` **replaces** the cover. The new asset
+  is verified, copied, and persisted (Task + new `MediaAsset`) atomically **first**; only
+  then is the **old** cover's row + S3 object removed (best-effort). Omitting
+  `coverImageS3Key` leaves the current cover unchanged. A new cover is never rolled back if
+  old-cover cleanup fails — that failure is logged (`taskId`, old `assetId`, `s3Key`) for
+  retry.
+- Abandoned pending uploads (`media/pending/task-cover/`) are expired by an **S3 lifecycle
+  rule after 24h**.
 
 ---
 
@@ -630,15 +698,11 @@ Planned but not implemented — don't build against them:
   / `INTERNAL` (see [Error handling](#error-handling)) are the intended contract, but
   resolver errors currently surface as `Lambda:Unhandled` with the cause only in
   `message`. Branch defensively until the codes are wired through.
-- **Delete** for entities other than tasks (`deleteTask`) and assignments
-  (`deleteAssignment`); there is no standalone delete for a `TaskStep` or
-  `AssignmentStep` (they are removed only with their parent). **Update** exists for
-  tasks (`updateTask`), task steps (`updateTaskStep`), and assignment status
-  (`updateAssignmentStatus`); other entities have no update yet.
-- **Media cleanup on delete** — `deleteTask` does **not** delete `MediaAsset` metadata
-  or the S3 objects referenced by a task/its steps (intentionally out of scope, to
-  avoid destroying possibly-shared binaries). There is no orphaned-media reclamation
-  API yet.
+- **Delete** for entities other than tasks (`deleteTask`), assignments
+  (`deleteAssignment`), and media assets (`deleteMediaAsset`); there is no standalone
+  delete for a `TaskStep` or `AssignmentStep` (they are removed only with their parent).
+  **Update** exists for tasks (`updateTask`), task steps (`updateTaskStep`), and
+  assignment status (`updateAssignmentStatus`); other entities have no update yet.
 - **Report generation** — the `Report` type exists in the schema, but no query or
   mutation is exposed for it yet.
 - **Streaming AI responses** — `generateTaskSteps` is request/response only.

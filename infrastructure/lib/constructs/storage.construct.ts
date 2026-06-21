@@ -34,6 +34,17 @@ export class Storage extends Construct {
           maxAge: 3000,
         },
       ],
+      // Expire abandoned cover-image uploads. Clients request a presigned PUT to a
+      // pending key (media/pending/task-cover/) and only some get promoted to a
+      // task-owned key by createTask/updateTask; the rest are never referenced. Reclaim
+      // them after 24h so failed/abandoned uploads don't accumulate.
+      lifecycleRules: [
+        {
+          id: 'expire-pending-task-cover-uploads',
+          prefix: 'media/pending/task-cover/',
+          expiration: cdk.Duration.days(1),
+        },
+      ],
       // Sandbox: empty + delete on teardown. dev / prod: retain.
       removalPolicy: isSandbox ? cdk.RemovalPolicy.DESTROY : cdk.RemovalPolicy.RETAIN,
       autoDeleteObjects: isSandbox,

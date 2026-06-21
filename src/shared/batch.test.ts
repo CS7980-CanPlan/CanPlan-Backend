@@ -1,4 +1,4 @@
-import { batchDelete, BATCH_WRITE_LIMIT, queryAllKeys } from './batch';
+import { batchDelete, batchPut, BATCH_WRITE_LIMIT, queryAllKeys } from './batch';
 import { dynamo } from './dynamodb';
 
 jest.mock('./dynamodb', () => ({
@@ -75,5 +75,18 @@ describe('batchDelete', () => {
       UnprocessedItems: { 'CanPlan-test': [{ DeleteRequest: { Key: { PK: 'p', SK: 's' } } }] },
     });
     await expect(batchDelete([{ PK: 'p', SK: 's' }])).rejects.toThrow('still unprocessed');
+  });
+});
+
+describe('batchPut', () => {
+  it('chunks puts into groups of 25', async () => {
+    const items = Array.from({ length: 26 }, (_, i) => ({ PK: 'TASK#t1', SK: `CLEANUP#${i}` }));
+    await batchPut(items);
+
+    expect(mockSend).toHaveBeenCalledTimes(2);
+    expect(inputs().map((i) => i.RequestItems['CanPlan-test'].length)).toEqual([25, 1]);
+    expect(inputs()[0].RequestItems['CanPlan-test'][0]).toEqual({
+      PutRequest: { Item: { PK: 'TASK#t1', SK: 'CLEANUP#0' } },
+    });
   });
 });
