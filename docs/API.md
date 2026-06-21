@@ -1,6 +1,21 @@
 # CanPlan 2.0 — Frontend API Reference
 
-_Last updated: 2026-06-19. Version: phase 1 (pre-authorization)._
+_Last updated: 2026-06-20. Version: phase 1 (pre-authorization)._
+
+> ## 🚨 Breaking change — progress model replaced
+>
+> The `ProgressEvent` model has been **removed** and the assignment model reworked.
+> See [Breaking changes](#breaking-changes-progress--assignment-rework) below for the
+> full migration notes. In short:
+>
+> - `ProgressEvent` is gone — `createProgressEvent` and `listProgressEventsForUser`,
+>   the `ProgressEvent`/`ProgressEventType` types, and the `progress` Lambda no longer
+>   exist. (Existing `ProgressEvent` rows are left in DynamoDB but are no longer served.)
+> - `AssignmentStatus` is now `TO_DO` / `OVERDUE` / `COMPLETED` / `SKIPPED`. `OVERDUE`
+>   is **derived**, never persisted. The old `ACTIVE`/`PAUSED`/`CANCELLED` values and
+>   the `active` field are gone.
+> - Progress is now tracked as per-assignment **`AssignmentStep`** snapshots, toggled
+>   with `setAssignmentStepCompletion` and read with `listAssignmentSteps`.
 
 The backend exposes a single **AWS AppSync GraphQL** endpoint backed by a single
 DynamoDB table. This document covers how to connect, the available operations, and
@@ -15,7 +30,7 @@ human-readable companion.
 > Outside the `SystemAdmin` admin queries and the self-scoped `createUserProfile`,
 > **no domain operation verifies the caller.** Any authenticated caller can act on
 > **any `id`** — read another user's profile, create a task under any `ownerId`,
-> append a progress event for any `userId`, link any supporter to any primary user.
+> assign a task to any `userId`, link any supporter to any primary user.
 > The schema and single-table keys are structured to support per-role/owner rules,
 > but they are **not implemented in this phase**.
 >
@@ -41,8 +56,8 @@ of how data is keyed and read back:
   client-supplied id and uses your `sub` from the session (see below). So your
   profile always lands at `USER#<sub>`.
 - But the **read** and every other self-scoped write (`getUserProfile`,
-  `createAssignment`, `createProgressEvent`, `listAssignmentsForUser`,
-  `listProgressEventsForUser`, …) take a `userId`/`ownerId` **argument**. If you pass
+  `createAssignment`, `setAssignmentStepCompletion`, `listAssignmentsForUser`,
+  `listAssignmentSteps`, …) take a `userId`/`ownerId` **argument**. If you pass
   anything other than your own `sub` there, you will write rows you can never read
   back through your own profile, or read an empty result — silently, with no error.
 
@@ -125,7 +140,7 @@ GraphQL types below. The key layout (for reference):
 | Task (template) | `TASK#<taskId>` | `#META` |
 | TaskStep | `TASK#<taskId>` | `STEP#<order>` (zero-padded, e.g. `STEP#001`) |
 | Assignment | `USER#<userId>` | `ASSIGN#<assignmentId>` |
-| ProgressEvent | `USER#<userId>` | `PROGRESS#<timestamp>#<eventId>` |
+| AssignmentStep | `USER#<userId>` | `ASSIGN_STEP#<assignmentId>#STEP#<stepId>` |
 | MediaAsset | `TASK#<taskId>` | `MEDIA#<assetId>` |
 
 Five GSIs serve the cross-cutting lists: `supporterIndex` (users managed by a
@@ -135,6 +150,12 @@ denormalized `<ownerId>#<categoryId>`, newest-first), and `entityTypeIndex` (eve
 item of one `entityType`, newest-first — backs the SystemAdmin list-all APIs without
 a Scan).
 
+`Assignment` and its `AssignmentStep` snapshots share the `USER#<userId>` partition.
+`ASSIGN_STEP#…` deliberately does **not** begin with `ASSIGN#` (its 7th character is
+`_`, not `#`), so `listAssignmentsForUser`'s `begins_with(SK, 'ASSIGN#')` query never
+returns step rows; `listAssignmentSteps` scopes to one assignment's steps and sorts
+them by `order`.
+
 ---
 
 ## Enums
@@ -143,8 +164,7 @@ a Scan).
 |---|---|
 | `UserRole` | `PRIMARY_USER`, `SUPPORT_PERSON`, `ORG_ADMIN` — a server-derived projection of Cognito group membership (`PrimaryUser`/`SupportPerson`/`OrganizationAdmin`); **Cognito groups are the authorization source of truth**. `SystemAdmin` is an elevated group, not a `UserRole`. |
 | `TaskStatus` | `DRAFT`, `ACTIVE`, `ARCHIVED` |
-| `AssignmentStatus` | `ACTIVE`, `COMPLETED`, `PAUSED`, `CANCELLED` |
-| `ProgressEventType` | `STARTED`, `PAUSED`, `RESUMED`, `SKIPPED`, `COMPLETED`, `SYNCED` |
+| `AssignmentStatus` | `TO_DO`, `OVERDUE`, `COMPLETED`, `SKIPPED` — only `TO_DO`/`COMPLETED`/`SKIPPED` are persisted; `OVERDUE` is **derived** at read time (a `TO_DO` assignment whose `dueDate` is in the past) and cannot be set by a mutation |
 | `MediaType` | `IMAGE`, `AUDIO`, `VIDEO` |
 | `SupportLinkStatus` | `PENDING`, `ACTIVE`, `REVOKED` |
 | `RepeatUnit` | `MINUTE`, `HOUR`, `DAY`, `WEEK`, `MONTH` |
@@ -176,7 +196,7 @@ object instead is the most common mistake here and is rejected at the AppSync ed
 ```
 
 In practice: `accessibilitySettings: JSON.stringify(settings)` on the way in. The same
-applies to `permissions` (`createSupportLink`) and `metadata` (`createProgressEvent`).
+applies to `permissions` (`createSupportLink`).
 **Responses are symmetric** — these fields come back as JSON strings, so
 `JSON.parse(profile.accessibilitySettings)` on the way out.
 
@@ -225,7 +245,7 @@ user is a separate operation — see `createAssignment`.
 | `schedule` | `TaskScheduleInput` | — | Optional recurring schedule (stored only — see below) |
 | `notificationEnabled` | `Boolean` | — | Defaults to `true` when `schedule` is set; otherwise left unset unless you pass it |
 
-`CreateTaskStepNestedInput`: `text: String!`, `mediaRefs: [ID!]`, `expectedDuration: Int`.
+`CreateTaskStepNestedInput`: `text: String!`, `mediaRefs: [ID!]`.
 
 **Category behavior.** Every task is filed under a category so it stays queryable by
 `listTasksByCategory`. If you omit `categoryId` (or send a blank string), the task is
@@ -365,7 +385,7 @@ fields are marked `!` and everything else is optional; see
 | `listTasksByOwner` | `ownerId!, limit, nextToken` | `TaskConnection!` |
 | `listTasksByCategory` | `ownerId!, categoryId, limit, nextToken` | `TaskConnection!` — tasks in one category; omit/blank `categoryId` for the `NO_CATEGORY` bucket |
 | `updateTask` | `input: { taskId!, title, categoryId, description, scheduleRule, status, schedule, notificationEnabled }` | `Task` — **partial edit**; see below |
-| `createTaskStep` | `input: { taskId!, order!, text!, mediaRefs, expectedDuration }` | `TaskStep` |
+| `createTaskStep` | `input: { taskId!, order!, text!, mediaRefs }` | `TaskStep` |
 
 > **`updateTask` is a partial edit.** Only the fields you include change; omitted
 > fields keep their current value. `ownerId` is immutable and **steps are not edited
@@ -387,20 +407,20 @@ fields are marked `!` and everything else is optional; see
 > { "input": { "taskId": "task-123", "title": "Wash hands well", "status": "ACTIVE", "categoryId": "cat-hygiene" } }
 > ```
 
-**Assignments**
+**Assignments & progress tracking**
 
 | Operation | Input | Returns |
 |---|---|---|
-| `createAssignment` | `input: { taskId!, userId!, assignedBy, dueDate, recurrence, scheduleRule, active, status }` | `Assignment` · `active` defaults `true`, `status` defaults `ACTIVE` |
-| `updateAssignmentStatus` | `input: { userId!, assignmentId!, status!, active }` | `Assignment` · **needs both `userId` and `assignmentId`** (they form the item key); errors if the assignment doesn't exist |
-| `listAssignmentsForUser` | `userId!, limit, nextToken` | `AssignmentConnection!` |
+| `createAssignment` | `input: { taskId!, userId!, assignedBy, dueDate, recurrence, scheduleRule }` | `Assignment` · always created with persisted status `TO_DO`. Validates the `Task` exists, then snapshots its `TaskStep`s into one `AssignmentStep` per step (all `completed: false`), atomically. Errors if the task is missing or has > 99 steps (DynamoDB's 100-item transaction limit). |
+| `updateAssignmentStatus` | `input: { userId!, assignmentId!, status! }` | `Assignment` · `status` accepts only `TO_DO`/`COMPLETED`/`SKIPPED` (`OVERDUE` is rejected). **Needs both `userId` and `assignmentId`** (they form the item key); errors if the assignment doesn't exist. Setting `COMPLETED` is rejected while any `AssignmentStep` is still incomplete (a zero-step assignment may be completed). Marking all steps complete does **not** auto-complete the assignment — the client sets `COMPLETED` explicitly. |
+| `setAssignmentStepCompletion` | `input: { userId!, assignmentId!, stepId!, completed! }` | `AssignmentStep` · toggles one step. Sets `completedAt` to now when `completed: true`, clears it when `false`. Rejected if the assignment is `COMPLETED` or `SKIPPED`; 404s if the assignment or step doesn't exist for the user. |
+| `listAssignmentsForUser` | `userId!, limit, nextToken` | `AssignmentConnection!` · `status` is returned with `OVERDUE` derived and legacy values mapped (see [breaking changes](#breaking-changes-progress--assignment-rework)). |
+| `listAssignmentSteps` | `userId!, assignmentId!, limit, nextToken` | `AssignmentStepConnection!` · one assignment's step snapshots, sorted by `order`. |
 
-**Progress (append-only) & media**
+**Media**
 
 | Operation | Input | Returns |
 |---|---|---|
-| `createProgressEvent` | `input: { userId!, eventType!, assignmentId, taskId, timestamp, source, metadata }` | `ProgressEvent` · append-only; `timestamp` defaults to now |
-| `listProgressEventsForUser` | `userId!, assignmentId, limit, nextToken` | `ProgressEventConnection!` — optional `assignmentId` filter |
 | `createMediaUploadUrl` | `input: { taskId!, contentType!, fileName }` | `MediaUploadTarget` — see flow below |
 | `createMediaAsset` | `input: { taskId!, s3Key!, type!, mimeType!, ownerId!, size, stepId }` | `MediaAsset` — see flow below |
 | `getMediaDownloadUrl` | `taskId!, assetId!` | `MediaDownloadTarget` — see flow below |
@@ -550,3 +570,49 @@ Planned but not implemented — don't build against them:
 - **Report generation** — the `Report` type exists in the schema, but no query or
   mutation is exposed for it yet.
 - **Streaming AI responses** — `generateTaskSteps` is request/response only.
+
+---
+
+## Breaking changes: progress & assignment rework
+
+The `ProgressEvent`-based progress model was replaced by assignment-level status plus
+per-assignment step completion. **This is a breaking API change.**
+
+**Removed**
+
+- `ProgressEvent` type, `ProgressEventType` enum, `ProgressEventConnection`,
+  `CreateProgressEventInput`, the `createProgressEvent` mutation, and the
+  `listProgressEventsForUser` query. The `canplan-progress-<env>` Lambda and its
+  resolver wiring are gone.
+- `Assignment.active` and the `active` input on `createAssignment` /
+  `updateAssignmentStatus`.
+- The `status` input on `createAssignment` — assignments are always created `TO_DO`.
+
+**Changed — `AssignmentStatus`**
+
+- New values: `TO_DO`, `OVERDUE`, `COMPLETED`, `SKIPPED`.
+- Only `TO_DO`, `COMPLETED`, and `SKIPPED` are ever persisted. `OVERDUE` is **derived**
+  at read time — an assignment is `OVERDUE` when its persisted status is `TO_DO`, it has
+  a `dueDate`, and that `dueDate` is in the past. An assignment without a `dueDate` is
+  never `OVERDUE`. Mutations reject an attempt to set `OVERDUE`.
+
+**Added — per-assignment steps**
+
+- `AssignmentStep` is an immutable snapshot of one `TaskStep` captured into one
+  `Assignment` at creation (`assignmentId`, `taskId`, `stepId`, `order`, `text`,
+  `mediaRefs`, `completed`, `completedAt`, `createdAt`, `updatedAt`).
+  Editing the `Task` template later does **not** change historical assignments.
+- `listAssignmentSteps(userId, assignmentId, …)` and
+  `setAssignmentStepCompletion(input)` (see the operations table above).
+
+**Data compatibility**
+
+- Existing `Assignment` rows with legacy statuses are mapped on read so the new enum
+  never surfaces an invalid value: `ACTIVE` → `TO_DO`, `PAUSED` → `TO_DO`,
+  `CANCELLED` → `SKIPPED`, `COMPLETED` → `COMPLETED`. A legacy `active` attribute is
+  dropped from responses.
+- Legacy assignments created before this change have **no** `AssignmentStep` rows, so
+  `listAssignmentSteps` returns empty for them. Only assignments created via the new
+  `createAssignment` carry step snapshots.
+- This is an API/code refactor only: existing `ProgressEvent` rows are **left in
+  DynamoDB** (not deleted) — they are simply no longer served by any API.

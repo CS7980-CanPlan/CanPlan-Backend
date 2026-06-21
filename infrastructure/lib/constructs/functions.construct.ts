@@ -31,7 +31,6 @@ export class Functions extends Construct {
   public readonly categoriesFn: NodejsFunction;
   public readonly tasksFn: NodejsFunction;
   public readonly assignmentsFn: NodejsFunction;
-  public readonly progressFn: NodejsFunction;
   public readonly mediaFn: NodejsFunction;
   /** SystemAdmin-only list-all-by-entityType APIs (read-only). */
   public readonly adminFn: NodejsFunction;
@@ -67,7 +66,6 @@ export class Functions extends Construct {
     this.categoriesFn = dataFn('CategoriesFunction', 'categories', 'categories');
     this.tasksFn = dataFn('TasksFunction', 'tasks', 'tasks');
     this.assignmentsFn = dataFn('AssignmentsFunction', 'assignments', 'assignments');
-    this.progressFn = dataFn('ProgressFunction', 'progress', 'progress');
     this.mediaFn = dataFn('MediaFunction', 'media', 'media');
 
     for (const fn of [
@@ -75,7 +73,6 @@ export class Functions extends Construct {
       this.categoriesFn,
       this.tasksFn,
       this.assignmentsFn,
-      this.progressFn,
       this.mediaFn,
     ]) {
       // grantReadWriteData also covers the table's GSIs (table-arn/index/*).

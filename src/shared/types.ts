@@ -7,8 +7,13 @@
 export type UserRole = 'PRIMARY_USER' | 'SUPPORT_PERSON' | 'ORG_ADMIN';
 export type SupportLinkStatus = 'PENDING' | 'ACTIVE' | 'REVOKED';
 export type TaskStatus = 'DRAFT' | 'ACTIVE' | 'ARCHIVED';
-export type AssignmentStatus = 'ACTIVE' | 'COMPLETED' | 'PAUSED' | 'CANCELLED';
-export type ProgressEventType = 'STARTED' | 'PAUSED' | 'RESUMED' | 'SKIPPED' | 'COMPLETED' | 'SYNCED';
+/**
+ * Assignment status as surfaced through the API. `OVERDUE` is derived at read time
+ * (persisted status TO_DO + a dueDate in the past) — it is never written to storage.
+ */
+export type AssignmentStatus = 'TO_DO' | 'OVERDUE' | 'COMPLETED' | 'SKIPPED';
+/** The only statuses ever persisted on an Assignment row. */
+export type PersistedAssignmentStatus = 'TO_DO' | 'COMPLETED' | 'SKIPPED';
 export type MediaType = 'IMAGE' | 'AUDIO' | 'VIDEO';
 export type RepeatUnit = 'MINUTE' | 'HOUR' | 'DAY' | 'WEEK' | 'MONTH';
 
@@ -87,7 +92,6 @@ export interface TaskStep {
   order: number;
   text: string;
   mediaRefs?: string[];
-  expectedDuration?: number;
   createdAt: string;
   updatedAt?: string;
 }
@@ -100,23 +104,29 @@ export interface Assignment {
   dueDate?: string;
   recurrence?: string;
   scheduleRule?: string;
-  active: boolean;
+  /** Persisted as TO_DO/COMPLETED/SKIPPED; surfaced as AssignmentStatus (may be OVERDUE). */
   status: AssignmentStatus;
   assignedAt: string;
   createdAt: string;
   updatedAt?: string;
 }
 
-export interface ProgressEvent {
-  eventId: string;
-  assignmentId?: string;
-  taskId?: string;
-  userId: string;
-  eventType: ProgressEventType;
-  timestamp: string;
-  source?: string;
-  metadata?: Record<string, unknown>;
+/**
+ * A snapshot of one TaskStep captured into one Assignment at creation time. The
+ * snapshot is immutable to template edits — later changes to the Task's steps must
+ * not alter historical assignments. PK = USER#<userId>, SK = ASSIGN_STEP#<assignmentId>#STEP#<stepId>.
+ */
+export interface AssignmentStep {
+  assignmentId: string;
+  taskId: string;
+  stepId: string;
+  order: number;
+  text: string;
+  mediaRefs?: string[];
+  completed: boolean;
+  completedAt?: string;
   createdAt: string;
+  updatedAt: string;
 }
 
 export interface MediaAsset {
@@ -159,7 +169,6 @@ export interface CreateCategoryInput {
 export interface CreateTaskStepNestedInput {
   text: string;
   mediaRefs?: string[];
-  expectedDuration?: number;
 }
 
 /** Schedule metadata accepted at task creation. `enabled` defaults to true when stored. */
@@ -203,7 +212,6 @@ export interface CreateTaskStepInput {
   order: number;
   text: string;
   mediaRefs?: string[];
-  expectedDuration?: number;
 }
 
 export interface CreateAssignmentInput {
@@ -213,25 +221,20 @@ export interface CreateAssignmentInput {
   dueDate?: string;
   recurrence?: string;
   scheduleRule?: string;
-  active?: boolean;
-  status?: AssignmentStatus;
 }
 
 export interface UpdateAssignmentStatusInput {
   userId: string;
   assignmentId: string;
+  /** Accepts the AssignmentStatus enum, but OVERDUE is rejected — it is a derived status. */
   status: AssignmentStatus;
-  active?: boolean;
 }
 
-export interface CreateProgressEventInput {
+export interface SetAssignmentStepCompletionInput {
   userId: string;
-  assignmentId?: string;
-  taskId?: string;
-  eventType: ProgressEventType;
-  timestamp?: string;
-  source?: string;
-  metadata?: Record<string, unknown>;
+  assignmentId: string;
+  stepId: string;
+  completed: boolean;
 }
 
 export interface CreateMediaAssetInput {

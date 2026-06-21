@@ -11,7 +11,7 @@ export interface DatabaseProps {
 
 /**
  * Single-table DynamoDB store for CanPlan. Every entity (UserProfile, SupportLink,
- * Category, Task, TaskStep, Assignment, ProgressEvent, MediaAsset, Report) lives in
+ * Category, Task, TaskStep, Assignment, AssignmentStep, MediaAsset, Report) lives in
  * one table keyed by a composite PK/SK plus an `entityType` discriminator — see
  * src/shared/keys.ts for the item-key conventions and the access patterns each GSI
  * serves. The table name keeps the historical CanPlanTasks-<env> pattern.

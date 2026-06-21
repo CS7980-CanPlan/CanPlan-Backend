@@ -61,7 +61,7 @@ async function createCategory(input: CreateCategoryInput): Promise<Category> {
 async function listCategoriesByOwner(ownerId: string, page: PageArgs): Promise<Connection<Category>> {
   if (!ownerId?.trim()) throw new ValidationError('ownerId is required');
   // SK begins_with CATEGORY# scopes the USER#<ownerId> partition to category rows
-  // (excludes #PROFILE, ASSIGN#, PROGRESS#, …).
+  // (excludes #PROFILE, ASSIGN#, ASSIGN_STEP#, …).
   return queryPage<Category>(
     {
       TableName: TABLE_NAME,

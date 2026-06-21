@@ -25,20 +25,14 @@ enum TaskStatus {
   ARCHIVED
 }
 
+# Assignment lifecycle. Only TO_DO, COMPLETED, and SKIPPED are ever persisted.
+# OVERDUE is a derived, read-only status: returned when a TO_DO assignment has a
+# dueDate in the past. Clients must never send OVERDUE to a mutation.
 enum AssignmentStatus {
-  ACTIVE
+  TO_DO
+  OVERDUE
   COMPLETED
-  PAUSED
-  CANCELLED
-}
-
-enum ProgressEventType {
-  STARTED
-  PAUSED
-  RESUMED
   SKIPPED
-  COMPLETED
-  SYNCED
 }
 
 enum MediaType {
@@ -131,7 +125,6 @@ type TaskStep {
   order: Int!
   text: String!
   mediaRefs: [ID!]
-  expectedDuration: Int
   createdAt: String!
   updatedAt: String
 }
@@ -144,23 +137,26 @@ type Assignment {
   dueDate: String
   recurrence: String
   scheduleRule: String
-  active: Boolean!
+  # Derived OVERDUE when persisted TO_DO + dueDate in the past; otherwise the persisted value.
   status: AssignmentStatus!
   assignedAt: String!
   createdAt: String!
   updatedAt: String
 }
 
-type ProgressEvent {
-  eventId: ID!
-  assignmentId: ID
-  taskId: ID
-  userId: ID!
-  eventType: ProgressEventType!
-  timestamp: String!
-  source: String
-  metadata: AWSJSON
+# A snapshot of one TaskStep captured into one Assignment at creation. Immutable to
+# later template edits, so historical assignments keep the step content as assigned.
+type AssignmentStep {
+  assignmentId: ID!
+  taskId: ID!
+  stepId: ID!
+  order: Int!
+  text: String!
+  mediaRefs: [ID!]
+  completed: Boolean!
+  completedAt: String
   createdAt: String!
+  updatedAt: String!
 }
 
 type MediaAsset {
@@ -289,7 +285,6 @@ input UpdateTaskInput {
 input CreateTaskStepNestedInput {
   text: String!
   mediaRefs: [ID!]
-  expectedDuration: Int
 }
 
 input CreateTaskStepInput {
@@ -297,9 +292,9 @@ input CreateTaskStepInput {
   order: Int!
   text: String!
   mediaRefs: [ID!]
-  expectedDuration: Int
 }
 
+# createAssignment always persists status TO_DO; status is not client-supplied.
 input CreateAssignmentInput {
   taskId: ID!
   userId: ID!
@@ -307,25 +302,20 @@ input CreateAssignmentInput {
   dueDate: String
   recurrence: String
   scheduleRule: String
-  active: Boolean
-  status: AssignmentStatus
 }
 
+# status accepts TO_DO, COMPLETED, or SKIPPED. OVERDUE is rejected (it is derived).
 input UpdateAssignmentStatusInput {
   userId: ID!
   assignmentId: ID!
   status: AssignmentStatus!
-  active: Boolean
 }
 
-input CreateProgressEventInput {
+input SetAssignmentStepCompletionInput {
   userId: ID!
-  assignmentId: ID
-  taskId: ID
-  eventType: ProgressEventType!
-  timestamp: String
-  source: String
-  metadata: AWSJSON
+  assignmentId: ID!
+  stepId: ID!
+  completed: Boolean!
 }
 
 input CreateMediaAssetInput {
@@ -391,8 +381,8 @@ type AssignmentConnection {
   nextToken: String
 }
 
-type ProgressEventConnection {
-  items: [ProgressEvent!]!
+type AssignmentStepConnection {
+  items: [AssignmentStep!]!
   nextToken: String
 }
 
@@ -421,7 +411,8 @@ type Query {
   listTasksByCategory(ownerId: ID!, categoryId: ID, limit: Int, nextToken: String): TaskConnection!
 
   listAssignmentsForUser(userId: ID!, limit: Int, nextToken: String): AssignmentConnection!
-  listProgressEventsForUser(userId: ID!, assignmentId: ID, limit: Int, nextToken: String): ProgressEventConnection!
+  # One assignment's step snapshots, sorted by `order`.
+  listAssignmentSteps(userId: ID!, assignmentId: ID!, limit: Int, nextToken: String): AssignmentStepConnection!
   getMediaDownloadUrl(taskId: ID!, assetId: ID!): MediaDownloadTarget
   listMediaForTask(taskId: ID!, limit: Int, nextToken: String): MediaAssetConnection!
 
@@ -451,8 +442,8 @@ type Mutation {
 
   createAssignment(input: CreateAssignmentInput!): Assignment
   updateAssignmentStatus(input: UpdateAssignmentStatusInput!): Assignment
-
-  createProgressEvent(input: CreateProgressEventInput!): ProgressEvent
+  # Toggle one assignment step's completion. Rejected on COMPLETED/SKIPPED assignments.
+  setAssignmentStepCompletion(input: SetAssignmentStepCompletionInput!): AssignmentStep
 
   # Mint a presigned S3 upload URL; the client uploads the file, then calls
   # createMediaAsset with the returned s3Key to register the metadata.

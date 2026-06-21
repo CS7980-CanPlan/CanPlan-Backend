@@ -183,7 +183,6 @@ async function createTaskStep(input: CreateTaskStepInput): Promise<TaskStep> {
     order: input.order,
     text: input.text.trim(),
     mediaRefs: input.mediaRefs,
-    expectedDuration: input.expectedDuration,
     createdAt: now,
     updatedAt: now,
   };

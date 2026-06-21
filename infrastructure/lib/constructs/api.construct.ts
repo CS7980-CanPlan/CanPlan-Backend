@@ -16,7 +16,6 @@ export interface ApiProps {
   readonly categoriesFn: lambda.IFunction;
   readonly tasksFn: lambda.IFunction;
   readonly assignmentsFn: lambda.IFunction;
-  readonly progressFn: lambda.IFunction;
   readonly mediaFn: lambda.IFunction;
   readonly adminFn: lambda.IFunction;
 }
@@ -106,17 +105,13 @@ export class Api extends Construct {
       { typeName: 'Query', fieldName: 'listTasksByCategory' },
     ]);
 
-    // Assignments.
+    // Assignments + per-assignment step snapshots.
     wire('AssignmentsDataSource', props.assignmentsFn, [
       { typeName: 'Mutation', fieldName: 'createAssignment' },
       { typeName: 'Mutation', fieldName: 'updateAssignmentStatus' },
+      { typeName: 'Mutation', fieldName: 'setAssignmentStepCompletion' },
       { typeName: 'Query', fieldName: 'listAssignmentsForUser' },
-    ]);
-
-    // Progress events.
-    wire('ProgressDataSource', props.progressFn, [
-      { typeName: 'Mutation', fieldName: 'createProgressEvent' },
-      { typeName: 'Query', fieldName: 'listProgressEventsForUser' },
+      { typeName: 'Query', fieldName: 'listAssignmentSteps' },
     ]);
 
     // Media assets — presigned upload + download URLs, metadata registration, listing.

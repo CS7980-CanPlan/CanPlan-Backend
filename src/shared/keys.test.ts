@@ -1,5 +1,8 @@
 import {
+  ASSIGN_PREFIX,
   assignSk,
+  assignStepPrefix,
+  assignStepSk,
   categorySk,
   ENTITY,
   mediaSk,
@@ -7,7 +10,6 @@ import {
   NO_CATEGORY,
   padOrder,
   PROFILE_SK,
-  progressSk,
   reportPk,
   stepSk,
   supporterPk,
@@ -48,8 +50,14 @@ describe('sort keys', () => {
     expect(userLinkSk('u1')).toBe('USER#u1');
     expect(stepSk(1)).toBe('STEP#001');
     expect(assignSk('a1')).toBe('ASSIGN#a1');
-    expect(progressSk('2026-06-15T10:00:00.000Z', 'e1')).toBe('PROGRESS#2026-06-15T10:00:00.000Z#e1');
+    expect(assignStepSk('a1', 's1')).toBe('ASSIGN_STEP#a1#STEP#s1');
+    expect(assignStepPrefix('a1')).toBe('ASSIGN_STEP#a1#STEP#');
     expect(mediaSk('m1')).toBe('MEDIA#m1');
+  });
+
+  it('keeps AssignmentStep rows out of a begins_with(ASSIGN#) assignment query', () => {
+    // The 7th char of ASSIGN_STEP# is `_`, not `#`, so it does not match ASSIGN#.
+    expect(assignStepSk('a1', 's1').startsWith(ASSIGN_PREFIX)).toBe(false);
   });
 });
 
@@ -68,7 +76,7 @@ describe('ENTITY discriminators', () => {
     expect(ENTITY.TASK).toBe('Task');
     expect(ENTITY.TASK_STEP).toBe('TaskStep');
     expect(ENTITY.ASSIGNMENT).toBe('Assignment');
-    expect(ENTITY.PROGRESS_EVENT).toBe('ProgressEvent');
+    expect(ENTITY.ASSIGNMENT_STEP).toBe('AssignmentStep');
     expect(ENTITY.MEDIA_ASSET).toBe('MediaAsset');
     expect(ENTITY.REPORT).toBe('Report');
   });

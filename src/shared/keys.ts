@@ -13,7 +13,7 @@ export const ENTITY = {
   TASK: 'Task',
   TASK_STEP: 'TaskStep',
   ASSIGNMENT: 'Assignment',
-  PROGRESS_EVENT: 'ProgressEvent',
+  ASSIGNMENT_STEP: 'AssignmentStep',
   MEDIA_ASSET: 'MediaAsset',
   REPORT: 'Report',
 } as const;
@@ -41,7 +41,10 @@ export const META_SK = '#META';
 export const CATEGORY_PREFIX = 'CATEGORY#';
 export const STEP_PREFIX = 'STEP#';
 export const ASSIGN_PREFIX = 'ASSIGN#';
-export const PROGRESS_PREFIX = 'PROGRESS#';
+// AssignmentStep snapshots. Note `ASSIGN_STEP#` does NOT begin with `ASSIGN#`
+// (the 7th char is `_`, not `#`), so a begins_with(SK, 'ASSIGN#') query for a
+// user's assignments never returns these step rows.
+export const ASSIGN_STEP_PREFIX = 'ASSIGN_STEP#';
 export const MEDIA_PREFIX = 'MEDIA#';
 export const USER_LINK_PREFIX = 'USER#';
 
@@ -76,9 +79,12 @@ export const userLinkSk = (primaryUserId: string): string => `USER#${primaryUser
 export const stepSk = (order: number): string => `${STEP_PREFIX}${padOrder(order)}`;
 /** Assignment SK — keyed by the globally-unique assignmentId, never the taskId. */
 export const assignSk = (assignmentId: string): string => `${ASSIGN_PREFIX}${assignmentId}`;
-/** ProgressEvent SK — timestamp first (sortable), eventId for uniqueness. Append-only. */
-export const progressSk = (timestamp: string, eventId: string): string =>
-  `${PROGRESS_PREFIX}${timestamp}#${eventId}`;
+/** AssignmentStep SK — one snapshot row per TaskStep within one assignment. */
+export const assignStepSk = (assignmentId: string, stepId: string): string =>
+  `${ASSIGN_STEP_PREFIX}${assignmentId}#${STEP_PREFIX}${stepId}`;
+/** begins_with prefix to query only one assignment's step snapshots. */
+export const assignStepPrefix = (assignmentId: string): string =>
+  `${ASSIGN_STEP_PREFIX}${assignmentId}#${STEP_PREFIX}`;
 /** MediaAsset SK — keyed by the unique assetId under the owning task. */
 export const mediaSk = (assetId: string): string => `${MEDIA_PREFIX}${assetId}`;
 

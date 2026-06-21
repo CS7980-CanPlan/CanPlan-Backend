@@ -63,7 +63,6 @@ export const handler = async (event: AppSyncEvent<{ input: CreateTaskInput }>): 
       order: index + 1,
       text: step.text.trim(),
       mediaRefs: step.mediaRefs,
-      expectedDuration: step.expectedDuration,
       createdAt: now,
       updatedAt: now,
     };
