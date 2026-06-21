@@ -159,14 +159,15 @@ async function createAssignment(input: CreateAssignmentInput): Promise<Assignmen
     updatedAt: now,
   };
 
-  // One AssignmentStep snapshot per TaskStep, all initialized incomplete.
+  // One AssignmentStep snapshot per TaskStep, all initialized incomplete. Snapshots copy
+  // text/order only — NOT media: a live Task MediaAsset can be deleted with its TaskStep,
+  // so it must never be referenced from an immutable assignment snapshot.
   const steps: AssignmentStep[] = taskSteps.map((step) => ({
     assignmentId,
     taskId,
     stepId: step.stepId,
     order: step.order,
     text: step.text,
-    mediaRefs: step.mediaRefs,
     completed: false,
     createdAt: now,
     updatedAt: now,

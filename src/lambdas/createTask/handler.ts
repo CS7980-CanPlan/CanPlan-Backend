@@ -66,7 +66,7 @@ export const handler = async (event: AppSyncEvent<{ input: CreateTaskInput }>): 
       taskId,
       order: index + 1,
       text: step.text.trim(),
-      mediaRefs: step.mediaRefs,
+      // Steps are created without media; it's attached later via updateTaskStep.
       createdAt: now,
       updatedAt: now,
     };

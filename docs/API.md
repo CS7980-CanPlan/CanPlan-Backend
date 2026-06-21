@@ -245,7 +245,8 @@ user is a separate operation — see `createAssignment`.
 | `schedule` | `TaskScheduleInput` | — | Optional recurring schedule (stored only — see below) |
 | `notificationEnabled` | `Boolean` | — | Defaults to `true` when `schedule` is set; otherwise left unset unless you pass it |
 
-`CreateTaskStepNestedInput`: `text: String!`, `mediaRefs: [ID!]`.
+`CreateTaskStepNestedInput`: `text: String!` (text only — step media is attached
+afterward via the upload flow, since step ids don't exist until `createTask` returns).
 
 **Category behavior.** Every task is filed under a category so it stays queryable by
 `listTasksByCategory`. If you omit `categoryId` (or send a blank string), the task is
@@ -385,9 +386,10 @@ fields are marked `!` and everything else is optional; see
 | `listTasksByOwner` | `ownerId!, limit, nextToken` | `TaskConnection!` |
 | `listTasksByCategory` | `ownerId!, categoryId, limit, nextToken` | `TaskConnection!` — tasks in one category; omit/blank `categoryId` for the `NO_CATEGORY` bucket |
 | `updateTask` | `input: { taskId!, title, categoryId, description, scheduleRule, status, schedule, notificationEnabled }` | `Task` — **partial edit**; see below |
-| `createTaskStep` | `input: { taskId!, order!, text!, mediaRefs }` | `TaskStep` |
-| `updateTaskStep` | `input: { taskId!, stepId!, text, mediaRefs }` | `TaskStep` — **partial edit** of one step; see below |
-| `deleteTask` | `taskId!` | `Task` — the deleted template (minus internal fields); deletes all its `TaskStep`s; see below |
+| `createTaskStep` | `input: { taskId!, order!, text! }` | `TaskStep` (created without media; attach via `updateTaskStep`) |
+| `updateTaskStep` | `input: { taskId!, stepId!, text, mediaAssetId, removeMedia }` | `TaskStep` — **partial edit** of one step; see below |
+| `deleteTaskStep` | `input: { taskId!, stepId! }` | `TaskStep` — the deleted step; also deletes its single media asset; see below |
+| `deleteTask` | `taskId!` | `Task` — the deleted template (minus internal fields); cascades to all its steps + media; see below |
 
 > **`updateTask` is a partial edit.** Only the fields you include change; omitted
 > fields keep their current value. `ownerId` is immutable and **steps are not edited
@@ -410,21 +412,56 @@ fields are marked `!` and everything else is optional; see
 > ```
 
 > **`updateTaskStep` is a partial edit of one step.** Identify the step by `taskId` +
-> `stepId`. **Supply at least one of `text` / `mediaRefs`** — a request with neither is
-> rejected. A supplied `text` is trimmed and may **not** be empty; a supplied `mediaRefs`
-> **replaces** the list and **may be empty** (`[]` clears all media). `stepId`, `taskId`,
-> `order`, and `createdAt` are immutable; `updatedAt` is bumped. A missing step (no step
-> with that `stepId` under the task) returns a not-found error. There is **no API for
-> deleting an individual `TaskStep`** — steps are removed only by deleting their parent
-> `Task`.
+> `stepId`. **Supply at least one of `text`, `mediaAssetId`, or `removeMedia: true`** — a
+> request with none is rejected, and supplying both `mediaAssetId` and `removeMedia: true`
+> is rejected. A supplied `text` is trimmed and may **not** be empty. `stepId`, `taskId`,
+> `order`, and `createdAt` are immutable; `updatedAt` is bumped. A missing step returns a
+> not-found error. To remove the whole step, use `deleteTaskStep` (below).
+>
+> **A step holds at most one media asset** (`TaskStep.mediaAssetId`).
+> - **`mediaAssetId`** attaches one existing, currently-**unattached** media asset to the
+>   step. It must exist under the same `taskId`, not be the Task cover image, have no
+>   `stepId`, and not already be pointed at by another step — otherwise the request is
+>   rejected. The asset's `stepId` and the step's `mediaAssetId` are set together
+>   atomically. If the step already had an asset, the **new one is attached first, then the
+>   old asset's metadata row + S3 binary are deleted**.
+> - **`removeMedia: true`** detaches and **deletes** the step's current media asset (row +
+>   S3 binary).
 >
 > ```graphql
 > mutation UpdateTaskStep($input: UpdateTaskStepInput!) {
->   updateTaskStep(input: $input) { stepId taskId order text mediaRefs updatedAt }
+>   updateTaskStep(input: $input) { stepId taskId order text mediaAssetId updatedAt }
 > }
 > ```
 > ```json
-> { "input": { "taskId": "task-123", "stepId": "step-9", "text": "Scrub for 20 seconds", "mediaRefs": [] } }
+> { "input": { "taskId": "task-123", "stepId": "step-9", "text": "Scrub for 20 seconds", "mediaAssetId": "asset-7" } }
+> ```
+
+> **`deleteTaskStep` removes one step and its single media asset.** Identify the step by
+> `taskId` + `stepId` (located by scanning the task's steps — the storage key is
+> order-based, not `stepId`-based). Returns the deleted `TaskStep` (internal fields
+> stripped); a missing step returns a not-found error.
+>
+> **Media cleanup.** If the step has a `mediaAssetId`, that one asset's metadata row + S3
+> binary are deleted. Each media asset belongs to exactly one step (or the cover), so there
+> is nothing shared to preserve.
+>
+> **Not touched:** the `Task` itself, any other `TaskStep`, and — importantly — **any
+> `Assignment` or `AssignmentStep`**. Historical `AssignmentStep` snapshots are immutable;
+> removing a template step never alters them, and future `createAssignment` calls simply
+> snapshot the task's remaining steps. (There is still **no API to delete an
+> `AssignmentStep`** — see [assignments](#assignments--progress-tracking).)
+>
+> _Consistency note:_ uses the same media-cleanup policy as `deleteMediaAsset` (clear the
+> back-reference → delete row → delete S3 binary, DB-first, structured-logged). It is safe
+> to retry; if an S3 delete fails it does **not** silently claim success — the metadata is
+> already gone (no API-visible dangling reference) and the operation returns a retryable
+> error with the failure logged for cleanup.
+>
+> ```graphql
+> mutation DeleteTaskStep($input: DeleteTaskStepInput!) {
+>   deleteTaskStep(input: $input) { stepId taskId order text }
+> }
 > ```
 
 > **`deleteTask` removes a template and all its steps.** Deletes the `Task` `#META` item
@@ -494,14 +531,15 @@ fields are marked `!` and everything else is optional; see
 |---|---|---|
 | `createMediaUploadUrl` | `input: { taskId!, contentType!, fileName }` | `MediaUploadTarget` — see flow below |
 | `createTaskCoverImageUploadUrl` | `input: { contentType!, fileName }` | `MediaUploadTarget!` — temporary cover-image upload; see [cover images](#task-cover-images) |
-| `createMediaAsset` | `input: { taskId!, s3Key!, type!, mimeType!, ownerId!, size, stepId }` | `MediaAsset` — see flow below |
+| `createMediaAsset` | `input: { taskId!, s3Key!, type!, mimeType!, ownerId!, size }` | `MediaAsset` — initially unattached; see flow below |
 | `deleteMediaAsset` | `input: { taskId!, assetId! }` | `MediaAsset` — deletes the binary + row + dangling refs; see below |
 | `getMediaDownloadUrl` | `taskId!, assetId!` | `MediaDownloadTarget` — see flow below |
 | `listMediaForTask` | `taskId!, limit, nextToken` | `MediaAssetConnection!` |
 
 > **Media is upload-first.** Binaries live in the S3 media bucket; DynamoDB stores
-> only the `s3Key` and metadata (`type`, `mimeType`, `ownerId`, `size`, optional
-> `stepId`). Clients never need AWS credentials — they upload through a presigned URL:
+> only the `s3Key` and metadata (`type`, `mimeType`, `ownerId`, `size`). Newly created
+> media is initially unattached. Clients never need AWS credentials — they upload through
+> a presigned URL:
 >
 > 1. **`createMediaUploadUrl({ taskId, contentType, fileName? })`** → returns
 >    `{ uploadUrl, s3Key, expiresIn }`. `uploadUrl` is a short-lived (default 15 min)
@@ -509,8 +547,9 @@ fields are marked `!` and everything else is optional; see
 > 2. **`PUT` the raw file bytes to `uploadUrl`** with the same `Content-Type` you
 >    passed as `contentType` (direct browser/mobile upload to S3 — the bucket allows
 >    CORS PUT). No GraphQL, no credentials.
-> 3. **`createMediaAsset({ taskId, s3Key, type, mimeType, ownerId, size?, stepId? })`**
->    → registers the now-uploaded object's metadata so it shows up in `listMediaForTask`.
+> 3. **`createMediaAsset({ taskId, s3Key, type, mimeType, ownerId, size? })`**
+>    → registers the now-uploaded object's metadata. Attach it to one step with
+>    `updateTaskStep({ mediaAssetId })`.
 >
 > ```bash
 > # 2) upload the bytes to the presigned URL from step 1
@@ -525,8 +564,8 @@ fields are marked `!` and everything else is optional; see
 > **`deleteMediaAsset({ taskId, assetId })`** permanently removes one media asset: its
 > **S3 binary** and its **DynamoDB row**, after first clearing every API-visible
 > reference to it — if it was the task's cover image, `Task.coverImageAssetId` is
-> cleared; it is removed from `mediaRefs` on every `TaskStep` that listed it. The `Task`
-> and its `TaskSteps` are **not** deleted. Returns the deleted asset (internal storage
+> cleared; if it belongs to a step, that step's `mediaAssetId` is cleared. The `Task` and
+> its `TaskSteps` are **not** deleted. Returns the deleted asset (internal storage
 > fields stripped); a missing asset returns a not-found error.
 >
 > _Consistency & sharing:_ DynamoDB and S3 aren't transactional, so references and the
@@ -698,10 +737,10 @@ Planned but not implemented — don't build against them:
   / `INTERNAL` (see [Error handling](#error-handling)) are the intended contract, but
   resolver errors currently surface as `Lambda:Unhandled` with the cause only in
   `message`. Branch defensively until the codes are wired through.
-- **Delete** for entities other than tasks (`deleteTask`), assignments
-  (`deleteAssignment`), and media assets (`deleteMediaAsset`); there is no standalone
-  delete for a `TaskStep` or `AssignmentStep` (they are removed only with their parent).
-  **Update** exists for tasks (`updateTask`), task steps (`updateTaskStep`), and
+- **Delete** exists for tasks (`deleteTask`), task steps (`deleteTaskStep`), assignments
+  (`deleteAssignment`), and media assets (`deleteMediaAsset`); there is **no standalone
+  delete for an `AssignmentStep`** (it is removed only when its parent `Assignment` is
+  deleted). **Update** exists for tasks (`updateTask`), task steps (`updateTaskStep`), and
   assignment status (`updateAssignmentStatus`); other entities have no update yet.
 - **Report generation** — the `Report` type exists in the schema, but no query or
   mutation is exposed for it yet.
@@ -736,7 +775,7 @@ per-assignment step completion. **This is a breaking API change.**
 
 - `AssignmentStep` is an immutable snapshot of one `TaskStep` captured into one
   `Assignment` at creation (`assignmentId`, `taskId`, `stepId`, `order`, `text`,
-  `mediaRefs`, `completed`, `completedAt`, `createdAt`, `updatedAt`).
+  `completed`, `completedAt`, `createdAt`, `updatedAt`).
   Editing the `Task` template later does **not** change historical assignments.
 - `listAssignmentSteps(userId, assignmentId, …)` and
   `setAssignmentStepCompletion(input)` (see the operations table above).

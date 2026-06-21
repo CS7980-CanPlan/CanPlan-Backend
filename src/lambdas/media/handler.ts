@@ -1,15 +1,14 @@
 import { randomUUID } from 'crypto';
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
-import { DeleteCommand, GetCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { queryAllItems } from '../../shared/batch';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
-import { ENTITY, MEDIA_PREFIX, mediaSk, META_SK, STEP_PREFIX, stepSk, taskPk } from '../../shared/keys';
+import { ENTITY, MEDIA_PREFIX, mediaSk, taskPk } from '../../shared/keys';
 import {
-  deleteS3ObjectBestEffort,
   isAllowedImageMime,
   ALLOWED_IMAGE_MIME_TYPES,
   pendingCoverKey,
+  purgeMediaAsset,
 } from '../../shared/media';
 import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
 import { NotFoundError, ValidationError } from '../../shared/response';
@@ -24,7 +23,6 @@ import type {
   MediaAsset,
   MediaDownloadTarget,
   MediaUploadTarget,
-  TaskStep,
 } from '../../shared/types';
 
 /**
@@ -152,10 +150,11 @@ async function createMediaAsset(input: CreateMediaAssetInput): Promise<MediaAsse
   if (!ownerId) throw new ValidationError('ownerId is required and cannot be empty');
 
   const now = new Date().toISOString();
+  // Newly registered media is UNATTACHED (no stepId) — it is bound to a step only via
+  // updateTaskStep(mediaAssetId), or promoted to a cover image through the cover flow.
   const asset: MediaAsset = {
     assetId: randomUUID(),
     taskId,
-    stepId: input.stepId?.trim(),
     s3Key,
     type: input.type,
     mimeType,
@@ -177,19 +176,19 @@ async function createMediaAsset(input: CreateMediaAssetInput): Promise<MediaAsse
 
 /**
  * deleteMediaAsset — delete one media asset's S3 binary and its metadata row, after
- * removing every API-visible reference to it.
+ * clearing the single back-reference to it.
  *
- * Consistency strategy (S3 + DynamoDB are not transactional): we clear references and
+ * Singular model: an asset is referenced by at most one location — the Task cover
+ * (Task.coverImageAssetId) OR one TaskStep (its mediaAssetId). purgeMediaAsset clears
+ * whichever applies (both are safe no-ops otherwise) — a single back-reference, not a list.
+ *
+ * Consistency strategy (S3 + DynamoDB are not transactional): we clear the reference and
  * delete the DynamoDB row FIRST, then delete the S3 object. This deliberately prefers a
  * (logged, recoverable) orphaned S3 file over a database reference to a missing file —
  * the API never points at a binary that's gone. The operation is idempotent/retryable:
  * a re-run after the row is deleted returns NotFound, and S3 DeleteObject is a no-op for
  * an already-absent key. An S3 delete failure is logged with full context (never
  * silently ignored) for a retry/cleanup job; it does not resurrect the reference.
- *
- * Sharing: each MediaAsset belongs to exactly one Task (PK=TASK#<taskId>) and is owned/
- * deleted with that task — assets are not shared across tasks, so no cross-task
- * reference check is required before deleting the binary.
  */
 async function deleteMediaAsset(input: DeleteMediaAssetInput): Promise<MediaAsset> {
   const taskId = input?.taskId?.trim();
@@ -203,61 +202,20 @@ async function deleteMediaAsset(input: DeleteMediaAssetInput): Promise<MediaAsse
   const asset = result.Item as MediaAsset | undefined;
   if (!asset) throw new NotFoundError('media asset not found');
 
-  // Remove dangling references before deleting the row (each step is idempotent).
-  await clearTaskCoverReference(taskId, assetId);
-  await removeAssetFromTaskSteps(taskId, assetId);
-
-  // Delete the metadata row, then the binary (DB-first — see the function comment).
-  await dynamo.send(
-    new DeleteCommand({ TableName: TABLE_NAME, Key: { PK: taskPk(taskId), SK: mediaSk(assetId) } }),
-  );
-  await deleteS3ObjectBestEffort(asset.s3Key, { event: 'deleteMediaAsset', taskId, assetId });
+  // Shared cleanup path (also used by deleteTaskStep / deleteTask): clear dangling
+  // references, delete the metadata row, then delete the S3 binary. A failed binary
+  // delete remains in the durable cleanup journal and is surfaced to the caller rather
+  // than being reported as a successful deletion.
+  const complete = await purgeMediaAsset(asset, { event: 'deleteMediaAsset' });
+  if (!complete) {
+    throw new Error(`deleteMediaAsset: media object ${assetId} could not be deleted; retry the operation`);
+  }
 
   const out: Record<string, unknown> = { ...asset };
   delete out.PK;
   delete out.SK;
   delete out.entityType;
   return out as unknown as MediaAsset;
-}
-
-/** Clear Task.coverImageAssetId iff it currently points at this asset (no-op otherwise). */
-async function clearTaskCoverReference(taskId: string, assetId: string): Promise<void> {
-  try {
-    await dynamo.send(
-      new UpdateCommand({
-        TableName: TABLE_NAME,
-        Key: { PK: taskPk(taskId), SK: META_SK },
-        UpdateExpression: 'REMOVE coverImageAssetId',
-        // Only touch the task if this asset is actually its cover.
-        ConditionExpression: 'coverImageAssetId = :assetId',
-        ExpressionAttributeValues: { ':assetId': assetId },
-      }),
-    );
-  } catch (err) {
-    // Not the cover (or the task is gone) — nothing to clear.
-    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return;
-    throw err;
-  }
-}
-
-/** Remove assetId from mediaRefs on every TaskStep that references it (paginated). */
-async function removeAssetFromTaskSteps(taskId: string, assetId: string): Promise<void> {
-  const steps = await queryAllItems<TaskStep>(taskPk(taskId), STEP_PREFIX);
-  const now = new Date().toISOString();
-  for (const step of steps) {
-    if (!step.mediaRefs?.includes(assetId)) continue;
-    await dynamo.send(
-      new UpdateCommand({
-        TableName: TABLE_NAME,
-        Key: { PK: taskPk(taskId), SK: stepSk(step.order) },
-        UpdateExpression: 'SET mediaRefs = :refs, updatedAt = :now',
-        ExpressionAttributeValues: {
-          ':refs': step.mediaRefs.filter((ref) => ref !== assetId),
-          ':now': now,
-        },
-      }),
-    );
-  }
 }
 
 async function listMediaForTask(taskId: string, page: PageArgs): Promise<Connection<MediaAsset>> {

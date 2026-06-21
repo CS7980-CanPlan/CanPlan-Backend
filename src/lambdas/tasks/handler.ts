@@ -24,7 +24,12 @@ import {
   taskMediaCleanupSk,
   taskPk,
 } from '../../shared/keys';
-import { deleteS3ObjectBestEffort, prepareCoverImageAsset } from '../../shared/media';
+import {
+  deleteS3ObjectBestEffort,
+  prepareCoverImageAsset,
+  purgeMediaAsset,
+  retryTaskMediaCleanup,
+} from '../../shared/media';
 import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
 import { NotFoundError, ValidationError } from '../../shared/response';
 import { normalizeSchedule } from '../../shared/schedule';
@@ -32,6 +37,7 @@ import type {
   AppSyncEvent,
   Connection,
   CreateTaskStepInput,
+  DeleteTaskStepInput,
   MediaAsset,
   Task,
   TaskStep,
@@ -67,6 +73,8 @@ export const handler = async (
       return createTaskStep(args.input as CreateTaskStepInput);
     case 'updateTaskStep':
       return updateTaskStep(args.input as UpdateTaskStepInput);
+    case 'deleteTaskStep':
+      return deleteTaskStep(args.input as DeleteTaskStepInput);
     case 'deleteTask':
       return deleteTask(args.taskId as string);
     default:
@@ -274,12 +282,12 @@ async function createTaskStep(input: CreateTaskStepInput): Promise<TaskStep> {
   }
 
   const now = new Date().toISOString();
+  // Created without media; attach later via updateTaskStep(mediaAssetId).
   const step: TaskStep = {
     stepId: randomUUID(),
     taskId,
     order: input.order,
     text: input.text.trim(),
-    mediaRefs: input.mediaRefs,
     createdAt: now,
     updatedAt: now,
   };
@@ -295,13 +303,19 @@ async function createTaskStep(input: CreateTaskStepInput): Promise<TaskStep> {
 }
 
 /**
- * updateTaskStep — partial edit of one TaskStep (text and/or mediaRefs).
+ * updateTaskStep — partial edit of one TaskStep: its `text`, and/or its single media
+ * asset (attach via `mediaAssetId`, or remove via `removeMedia: true`).
  *
- * The TaskStep SK is derived from `order` (STEP#<zero-padded-order>), NOT from stepId,
- * so the row can't be addressed directly by stepId. We scan the task's STEP# rows
- * (paginated) to find the one whose stepId matches, then update it by its real key.
- * Only the supplied editable fields change; stepId/taskId/order/createdAt/PK/SK are
- * left intact and updatedAt is bumped.
+ * The TaskStep SK is derived from `order`, NOT stepId, so the row is found by scanning
+ * the task's STEP# rows. Singular media rules:
+ *  - At least one of text / mediaAssetId / removeMedia:true must be supplied.
+ *  - text is trimmed and must be non-empty.
+ *  - mediaAssetId attaches one existing, currently-unattached asset under the same task
+ *    (not the cover, no stepId, not already pointed at by another step). The asset's
+ *    stepId and the step's mediaAssetId are set together in one transaction; any prior
+ *    asset is deleted only AFTER the new one is attached.
+ *  - removeMedia:true removes+deletes the step's current asset.
+ *  - mediaAssetId + removeMedia:true together is rejected.
  */
 async function updateTaskStep(input: UpdateTaskStepInput): Promise<TaskStep> {
   const taskId = input?.taskId?.trim();
@@ -309,55 +323,249 @@ async function updateTaskStep(input: UpdateTaskStepInput): Promise<TaskStep> {
   if (!taskId) throw new ValidationError('taskId is required and cannot be empty');
   if (!stepId) throw new ValidationError('stepId is required and cannot be empty');
 
-  // A field is "supplied" when present and non-null (mirrors updateTask). An empty
-  // mediaRefs list IS supplied — it replaces the value with none.
   const textProvided = input.text != null;
-  const mediaRefsProvided = input.mediaRefs != null;
-  if (!textProvided && !mediaRefsProvided) {
-    throw new ValidationError('at least one of text or mediaRefs must be supplied');
+  const attachProvided = input.mediaAssetId != null;
+  const removeMedia = input.removeMedia === true;
+  if (attachProvided && removeMedia) {
+    throw new ValidationError('cannot provide both mediaAssetId and removeMedia: true');
+  }
+  if (!textProvided && !attachProvided && !removeMedia) {
+    throw new ValidationError('at least one of text, mediaAssetId, or removeMedia: true must be supplied');
   }
   let trimmedText: string | undefined;
   if (textProvided) {
     trimmedText = input.text!.trim();
     if (!trimmedText) throw new ValidationError('text cannot be empty');
   }
+  const newAssetId = attachProvided ? input.mediaAssetId!.trim() : undefined;
+  if (attachProvided && !newAssetId) throw new ValidationError('mediaAssetId cannot be empty');
 
-  const step = await findTaskStep(taskId, stepId);
+  // Drain any prior failed remove/replace cleanup before making another media change.
+  // This makes a client retry of the same update converge rather than accumulating
+  // orphaned binaries.
+  const pendingCleanupCompleted = await retryTaskMediaCleanup(taskId, {
+    event: 'updateTaskStep.retryPendingCleanup',
+    stepId,
+  });
+  if (!pendingCleanupCompleted) {
+    throw new Error('updateTaskStep: pending media cleanup could not be completed; retry the operation');
+  }
+
+  // Locate the step (and all steps, to enforce one-to-one on attach).
+  const allSteps = await queryAllItems<TaskStep>(taskPk(taskId), STEP_PREFIX);
+  const step = allSteps.find((s) => s.stepId === stepId);
   if (!step) throw new NotFoundError(`step ${stepId} not found for task ${taskId}`);
-
+  const oldAssetId = step.mediaAssetId;
   const now = new Date().toISOString();
-  const setParts = ['#updatedAt = :updatedAt'];
-  const names: Record<string, string> = { '#updatedAt': 'updatedAt' };
-  const values: Record<string, unknown> = { ':updatedAt': now };
-  if (textProvided) {
-    setParts.push('#text = :text');
-    names['#text'] = 'text';
-    values[':text'] = trimmedText;
-  }
-  if (mediaRefsProvided) {
-    setParts.push('#mediaRefs = :mediaRefs');
-    names['#mediaRefs'] = 'mediaRefs';
-    values[':mediaRefs'] = input.mediaRefs; // may be an empty list
+  const stepKey = { PK: taskPk(taskId), SK: stepSk(step.order) };
+
+  // A client may retry a replacement after the new asset was attached but before an old
+  // asset's S3 cleanup completed. Treat re-attaching the already-current asset as an
+  // idempotent update (after the retry above has drained the cleanup journal).
+  if (attachProvided && oldAssetId === newAssetId) {
+    if (!textProvided) return stripStep(step);
+    await dynamo.send(
+      new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: stepKey,
+        UpdateExpression: 'SET #text = :text, #updatedAt = :now',
+        ConditionExpression: 'attribute_exists(PK)',
+        ExpressionAttributeNames: { '#text': 'text', '#updatedAt': 'updatedAt' },
+        ExpressionAttributeValues: { ':text': trimmedText, ':now': now },
+      }),
+    );
+    return stripStep({ ...step, text: trimmedText!, updatedAt: now });
   }
 
-  const result = await dynamo.send(
+  // ── Attach (or replace) a media asset ───────────────────────────────────────
+  if (attachProvided) {
+    const asset = await getMediaAsset(taskId, newAssetId!);
+    if (!asset) throw new NotFoundError(`media asset ${newAssetId} not found under task ${taskId}`);
+    const coverAssetId = await getTaskCoverAssetId(taskId);
+    if (coverAssetId === newAssetId) {
+      throw new ValidationError('cannot attach the task cover image to a step');
+    }
+    if (asset.stepId || allSteps.some((s) => s.mediaAssetId === newAssetId)) {
+      throw new ValidationError(`media asset ${newAssetId} is already attached to a step`);
+    }
+
+    // Atomic: mark the asset owned by this step + point the step at the asset (+text).
+    const stepSet = ['#mediaAssetId = :assetId', '#updatedAt = :now'];
+    const stepNames: Record<string, string> = { '#mediaAssetId': 'mediaAssetId', '#updatedAt': 'updatedAt' };
+    const stepValues: Record<string, unknown> = { ':assetId': newAssetId, ':now': now };
+    if (textProvided) {
+      stepSet.push('#text = :text');
+      stepNames['#text'] = 'text';
+      stepValues[':text'] = trimmedText;
+    }
+    await dynamo.send(
+      new TransactWriteCommand({
+        TransactItems: [
+          {
+            Update: {
+              TableName: TABLE_NAME,
+              Key: { PK: taskPk(taskId), SK: mediaSk(newAssetId!) },
+              UpdateExpression: 'SET stepId = :stepId, updatedAt = :now',
+              // Still exists AND still unattached at write time (guards races).
+              ConditionExpression: 'attribute_exists(PK) AND attribute_not_exists(stepId)',
+              ExpressionAttributeValues: { ':stepId': stepId, ':now': now },
+            },
+          },
+          {
+            Update: {
+              TableName: TABLE_NAME,
+              Key: stepKey,
+              UpdateExpression: `SET ${stepSet.join(', ')}`,
+              ConditionExpression: 'attribute_exists(PK)',
+              ExpressionAttributeNames: stepNames,
+              ExpressionAttributeValues: stepValues,
+            },
+          },
+        ],
+      }),
+    );
+
+    // New asset is attached. Now delete the replaced one (best-effort, logged — never
+    // roll back the successful attach). Skip when there was none or it's the same id.
+    if (oldAssetId && oldAssetId !== newAssetId) {
+      const oldAsset = await getMediaAsset(taskId, oldAssetId);
+      if (oldAsset) await purgeMediaAsset(oldAsset, { event: 'updateTaskStep.replaceMedia', taskId, stepId });
+    }
+
+    const updated: TaskStep = { ...step, mediaAssetId: newAssetId, updatedAt: now };
+    if (textProvided) updated.text = trimmedText!;
+    return stripStep(updated);
+  }
+
+  // ── Remove media (and/or edit text) ─────────────────────────────────────────
+  if (removeMedia) {
+    const setParts = ['#updatedAt = :now'];
+    const names: Record<string, string> = { '#updatedAt': 'updatedAt' };
+    const values: Record<string, unknown> = { ':now': now };
+    if (textProvided) {
+      setParts.push('#text = :text');
+      names['#text'] = 'text';
+      values[':text'] = trimmedText;
+    }
+    await dynamo.send(
+      new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: stepKey,
+        UpdateExpression: `SET ${setParts.join(', ')} REMOVE mediaAssetId`,
+        ConditionExpression: 'attribute_exists(PK)',
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+      }),
+    );
+    if (oldAssetId) {
+      const oldAsset = await getMediaAsset(taskId, oldAssetId);
+      if (oldAsset) await purgeMediaAsset(oldAsset, { event: 'updateTaskStep.removeMedia', taskId, stepId });
+    }
+    const updated: TaskStep = { ...step, updatedAt: now };
+    delete updated.mediaAssetId;
+    if (textProvided) updated.text = trimmedText!;
+    return stripStep(updated);
+  }
+
+  // ── Text only ───────────────────────────────────────────────────────────────
+  await dynamo.send(
     new UpdateCommand({
       TableName: TABLE_NAME,
-      // The step's SK is keyed on its (unchanged) order, not its stepId.
-      Key: { PK: taskPk(taskId), SK: stepSk(step.order) },
-      UpdateExpression: `SET ${setParts.join(', ')}`,
-      ExpressionAttributeNames: names,
-      ExpressionAttributeValues: values,
-      // Defensive — the row was just read, but never resurrect a vanished step.
+      Key: stepKey,
+      UpdateExpression: 'SET #text = :text, #updatedAt = :now',
       ConditionExpression: 'attribute_exists(PK)',
-      ReturnValues: 'ALL_NEW',
+      ExpressionAttributeNames: { '#text': 'text', '#updatedAt': 'updatedAt' },
+      ExpressionAttributeValues: { ':text': trimmedText, ':now': now },
     }),
   );
-  const out = { ...(result.Attributes as Record<string, unknown>) };
+  return stripStep({ ...step, text: trimmedText!, updatedAt: now });
+}
+
+/** Strip internal storage attributes from a TaskStep before returning it. */
+function stripStep(step: TaskStep): TaskStep {
+  const out: Record<string, unknown> = { ...step };
   delete out.PK;
   delete out.SK;
   delete out.entityType;
   return out as unknown as TaskStep;
+}
+
+/** Read one MediaAsset row under a task (null if absent). */
+async function getMediaAsset(taskId: string, assetId: string): Promise<MediaAsset | undefined> {
+  const result = await dynamo.send(
+    new GetCommand({ TableName: TABLE_NAME, Key: { PK: taskPk(taskId), SK: mediaSk(assetId) } }),
+  );
+  return result.Item as MediaAsset | undefined;
+}
+
+/** Read a Task's current cover image asset id (undefined if none / task missing). */
+async function getTaskCoverAssetId(taskId: string): Promise<string | undefined> {
+  const result = await dynamo.send(
+    new GetCommand({ TableName: TABLE_NAME, Key: { PK: taskPk(taskId), SK: META_SK } }),
+  );
+  return (result.Item as Task | undefined)?.coverImageAssetId;
+}
+
+/**
+ * deleteTaskStep — delete one TaskStep and its single media asset (if any).
+ *
+ * The TaskStep SK is keyed on `order`, not stepId, so the row is located by scanning the
+ * Task's STEP# rows (paginated). The step owns at most one MediaAsset (its mediaAssetId);
+ * that asset's metadata row + S3 binary are removed via the shared purgeMediaAsset path
+ * (clear back-reference → delete row → best-effort delete S3, structured-logged) — the
+ * same retry-safe policy as deleteMediaAsset. If the S3 delete fails the operation throws
+ * a retryable error rather than silently claiming success (the metadata is already gone —
+ * no API-visible dangling reference — and the orphaned binary is logged for cleanup).
+ *
+ * Never modifies the Task, any other TaskStep, any Assignment, or any AssignmentStep —
+ * historical snapshots are untouched.
+ */
+async function deleteTaskStep(input: DeleteTaskStepInput): Promise<TaskStep> {
+  const taskId = input?.taskId?.trim();
+  const stepId = input?.stepId?.trim();
+  if (!taskId) throw new ValidationError('taskId is required and cannot be empty');
+  if (!stepId) throw new ValidationError('stepId is required and cannot be empty');
+
+  // Finish an earlier failed binary cleanup before looking up the step. A previous
+  // attempt leaves the step in place (but detached) until its durable S3 journal has
+  // been drained, so retrying this same mutation is safe.
+  const pendingCleanupCompleted = await retryTaskMediaCleanup(taskId, {
+    event: 'deleteTaskStep.retryPendingCleanup',
+    stepId,
+  });
+  if (!pendingCleanupCompleted) {
+    throw new Error('deleteTaskStep: pending media cleanup could not be completed; retry the operation');
+  }
+
+  // Locate the step — its SK is order-based, so find it by scanning the STEP# rows.
+  const step = await findTaskStep(taskId, stepId);
+  if (!step) throw new NotFoundError(`step ${stepId} not found for task ${taskId}`);
+
+  // Delete the step's single media asset before removing the step. purgeMediaAsset
+  // records the S3 key durably; if S3 fails, leave the detached step in place so a retry
+  // of this same mutation can drain the journal and then finish the step deletion.
+  if (step.mediaAssetId) {
+    const asset = await getMediaAsset(taskId, step.mediaAssetId);
+    if (asset) {
+      const s3Deleted = await purgeMediaAsset(asset, { event: 'deleteTaskStep', taskId, stepId });
+      if (!s3Deleted) {
+        throw new Error(
+          `deleteTaskStep: media object ${step.mediaAssetId} could not be deleted; retry the operation`,
+        );
+      }
+    }
+  }
+
+  // Only remove the TaskStep once its media deletion has completed.
+  await dynamo.send(
+    new DeleteCommand({
+      TableName: TABLE_NAME,
+      Key: { PK: taskPk(taskId), SK: stepSk(step.order) },
+      ConditionExpression: 'attribute_exists(PK)',
+    }),
+  );
+
+  return stripStep(step);
 }
 
 /**

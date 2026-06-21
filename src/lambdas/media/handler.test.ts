@@ -1,6 +1,6 @@
 import { handler } from './handler';
 import { dynamo } from '../../shared/dynamodb';
-import { deleteS3ObjectBestEffort } from '../../shared/media';
+import { purgeMediaAsset } from '../../shared/media';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { Connection, MediaAsset, MediaDownloadTarget, MediaUploadTarget } from '../../shared/types';
 
@@ -17,11 +17,11 @@ jest.mock('../../shared/s3', () => ({
   DOWNLOAD_URL_TTL_SECONDS: 900,
 }));
 
-// Keep the real cover-image constants/helpers, but stub the S3 object delete so
-// deleteMediaAsset's binary cleanup is observable without a real S3 client.
+// Keep the real cover-image constants/helpers, but stub the shared media-purge service
+// (its internals — ref clearing, row + S3 delete — are unit-tested in shared/media.test.ts).
 jest.mock('../../shared/media', () => ({
   ...jest.requireActual('../../shared/media'),
-  deleteS3ObjectBestEffort: jest.fn().mockResolvedValue(true),
+  purgeMediaAsset: jest.fn().mockResolvedValue(true),
 }));
 
 jest.mock('@aws-sdk/s3-request-presigner', () => ({
@@ -30,7 +30,7 @@ jest.mock('@aws-sdk/s3-request-presigner', () => ({
 
 const mockSend = dynamo.send as jest.Mock;
 const mockGetSignedUrl = getSignedUrl as jest.Mock;
-const mockDeleteS3 = deleteS3ObjectBestEffort as jest.Mock;
+const mockPurge = purgeMediaAsset as jest.Mock;
 
 beforeEach(() => {
   mockSend.mockResolvedValue({});
@@ -49,9 +49,9 @@ function mediaInput(overrides: Record<string, unknown> = {}) {
 }
 
 describe('media handler', () => {
-  it('createMediaAsset writes PK=TASK#<id>, SK=MEDIA#<assetId> with S3 metadata only', async () => {
+  it('createMediaAsset writes PK=TASK#<id>, SK=MEDIA#<assetId>, UNATTACHED (no stepId)', async () => {
     const result = (await handler(
-      event('createMediaAsset', { input: mediaInput({ size: 2048, stepId: 'st1' }) }),
+      event('createMediaAsset', { input: mediaInput({ size: 2048 }) }),
     )) as MediaAsset;
     const { Item } = lastInput();
     expect(Item.PK).toBe('TASK#t1');
@@ -61,8 +61,14 @@ describe('media handler', () => {
     expect(Item.s3Key).toBe('media/t1/a.bin');
     expect(Item.mimeType).toBe('image/png');
     expect(Item.ownerId).toBe('o1');
-    expect(Item.stepId).toBe('st1');
+    // Newly registered media is unattached — bound to a step only via updateTaskStep.
+    expect(Item.stepId).toBeUndefined();
     expect(Item.size).toBe(2048);
+  });
+
+  it('createMediaAsset ignores any client-supplied stepId (assets are created unattached)', async () => {
+    await handler(event('createMediaAsset', { input: mediaInput({ stepId: 'st1' }) }));
+    expect(lastInput().Item.stepId).toBeUndefined();
   });
 
   it.each(['IMAGE', 'AUDIO', 'VIDEO'])('createMediaAsset supports the %s media type', async (type) => {
@@ -197,21 +203,23 @@ describe('media handler — createTaskCoverImageUploadUrl', () => {
 
 describe('media handler — deleteMediaAsset', () => {
   const asset = { PK: 'TASK#t1', SK: 'MEDIA#a1', entityType: 'MediaAsset', assetId: 'a1', taskId: 't1', s3Key: 'media/t1/a1.png', type: 'IMAGE', ownerId: 'o1' };
-  const commands = () => mockSend.mock.calls.map((c) => c[0]);
-  const inputs = () => commands().map((c) => c.input);
-  const updates = () => inputs().filter((i) => i.UpdateExpression);
 
-  it('removes the MediaAsset row and its S3 object, returning it without internal fields', async () => {
-    mockSend.mockResolvedValueOnce({ Item: { ...asset } }); // GET asset; rest default {}
+  // The cleanup mechanics (ref clearing, row + S3 delete, partial-failure logging) are
+  // unit-tested against the shared service in src/shared/media.test.ts. Here we verify the
+  // handler looks the asset up and delegates to that service, then returns it cleanly.
+  it('looks the asset up and delegates to purgeMediaAsset, returning it without internal fields', async () => {
+    mockSend.mockResolvedValueOnce({ Item: { ...asset } }); // GET asset
     const result = (await handler(
       event('deleteMediaAsset', { input: { taskId: 't1', assetId: 'a1' } }),
     )) as MediaAsset;
 
-    // Row deleted by its PK/SK (DeleteCommand, distinct from the initial GetCommand).
-    const del = commands().find((c) => c.constructor.name === 'DeleteCommand')!;
-    expect(del.input.Key).toEqual({ PK: 'TASK#t1', SK: 'MEDIA#a1' });
-    // S3 binary deleted (best-effort helper) with the asset's key.
-    expect(mockDeleteS3).toHaveBeenCalledWith('media/t1/a1.png', expect.objectContaining({ taskId: 't1', assetId: 'a1' }));
+    // Looked up by its PK/SK.
+    expect(mockSend.mock.calls[0][0].input.Key).toEqual({ PK: 'TASK#t1', SK: 'MEDIA#a1' });
+    // Delegated to the shared purge service with the looked-up asset.
+    expect(mockPurge).toHaveBeenCalledWith(
+      expect.objectContaining({ taskId: 't1', assetId: 'a1', s3Key: 'media/t1/a1.png' }),
+      expect.objectContaining({ event: 'deleteMediaAsset' }),
+    );
     // Returned metadata is stripped of storage attributes.
     const out = result as unknown as Record<string, unknown>;
     expect(out.PK).toBeUndefined();
@@ -220,57 +228,21 @@ describe('media handler — deleteMediaAsset', () => {
     expect(result.assetId).toBe('a1');
   });
 
-  it('clears Task.coverImageAssetId when it points at the deleted asset', async () => {
+  it('surfaces a retryable error when the durable S3 cleanup is still pending', async () => {
     mockSend.mockResolvedValueOnce({ Item: { ...asset } });
-    await handler(event('deleteMediaAsset', { input: { taskId: 't1', assetId: 'a1' } }));
+    mockPurge.mockResolvedValueOnce(false);
 
-    const coverUpdate = updates().find((i) => i.UpdateExpression.includes('REMOVE coverImageAssetId'))!;
-    expect(coverUpdate.Key).toEqual({ PK: 'TASK#t1', SK: '#META' });
-    expect(coverUpdate.ConditionExpression).toBe('coverImageAssetId = :assetId');
-    expect(coverUpdate.ExpressionAttributeValues).toEqual({ ':assetId': 'a1' });
+    await expect(
+      handler(event('deleteMediaAsset', { input: { taskId: 't1', assetId: 'a1' } })),
+    ).rejects.toThrow('could not be deleted; retry');
   });
 
-  it('proceeds when the asset is not the cover (ConditionalCheckFailed is swallowed)', async () => {
-    const condFail = Object.assign(new Error('cond'), { name: 'ConditionalCheckFailedException' });
-    mockSend
-      .mockResolvedValueOnce({ Item: { ...asset } }) // GET
-      .mockRejectedValueOnce(condFail) // clear-cover Update → not the cover
-      .mockResolvedValueOnce({ Items: [] }) // step query
-      .mockResolvedValueOnce({}); // delete row
-    const result = (await handler(
-      event('deleteMediaAsset', { input: { taskId: 't1', assetId: 'a1' } }),
-    )) as MediaAsset;
-    expect(result.assetId).toBe('a1');
-    expect(mockDeleteS3).toHaveBeenCalled();
-  });
-
-  it('removes the assetId from every referencing TaskStep.mediaRefs', async () => {
-    mockSend
-      .mockResolvedValueOnce({ Item: { ...asset } }) // GET asset
-      .mockResolvedValueOnce({}) // clear-cover Update
-      .mockResolvedValueOnce({
-        Items: [
-          { stepId: 's1', order: 1, mediaRefs: ['a1', 'keep'] },
-          { stepId: 's2', order: 2, mediaRefs: ['other'] },
-        ],
-      }) // step query
-      .mockResolvedValue({}); // step update + row delete
-
-    await handler(event('deleteMediaAsset', { input: { taskId: 't1', assetId: 'a1' } }));
-
-    const stepUpdates = updates().filter((i) => i.UpdateExpression.includes('mediaRefs = :refs'));
-    // Only the referencing step (order 1) is rewritten, with the assetId filtered out.
-    expect(stepUpdates).toHaveLength(1);
-    expect(stepUpdates[0].Key).toEqual({ PK: 'TASK#t1', SK: 'STEP#001' });
-    expect(stepUpdates[0].ExpressionAttributeValues[':refs']).toEqual(['keep']);
-  });
-
-  it('returns NotFound and deletes nothing when the asset does not exist', async () => {
+  it('returns NotFound and purges nothing when the asset does not exist', async () => {
     mockSend.mockResolvedValueOnce({}); // GET → no Item
     await expect(
       handler(event('deleteMediaAsset', { input: { taskId: 't1', assetId: 'gone' } })),
     ).rejects.toThrow('media asset not found');
-    expect(mockDeleteS3).not.toHaveBeenCalled();
+    expect(mockPurge).not.toHaveBeenCalled();
   });
 
   it('validates taskId and assetId', async () => {

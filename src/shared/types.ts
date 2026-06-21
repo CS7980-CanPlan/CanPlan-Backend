@@ -97,7 +97,8 @@ export interface TaskStep {
   taskId: string;
   order: number;
   text: string;
-  mediaRefs?: string[];
+  /** At most one media asset (singular media model); absent when the step has none. */
+  mediaAssetId?: string;
   createdAt: string;
   updatedAt?: string;
 }
@@ -121,6 +122,10 @@ export interface Assignment {
  * A snapshot of one TaskStep captured into one Assignment at creation time. The
  * snapshot is immutable to template edits — later changes to the Task's steps must
  * not alter historical assignments. PK = USER#<userId>, SK = ASSIGN_STEP#<assignmentId>#STEP#<stepId>.
+ *
+ * Carries text/completion only — NOT media. A live Task MediaAsset can be deleted with
+ * its TaskStep, so it is never copied here. Assignment-visible media, if ever needed,
+ * must be a separate assignment-owned snapshot.
  */
 export interface AssignmentStep {
   assignmentId: string;
@@ -128,7 +133,6 @@ export interface AssignmentStep {
   stepId: string;
   order: number;
   text: string;
-  mediaRefs?: string[];
   completed: boolean;
   completedAt?: string;
   createdAt: string;
@@ -174,7 +178,6 @@ export interface CreateCategoryInput {
 
 export interface CreateTaskStepNestedInput {
   text: string;
-  mediaRefs?: string[];
 }
 
 /** Schedule metadata accepted at task creation. `enabled` defaults to true when stored. */
@@ -228,21 +231,32 @@ export interface CreateTaskStepInput {
   taskId: string;
   order: number;
   text: string;
-  mediaRefs?: string[];
 }
 
 /**
- * Partial edit of one TaskStep. The step is located by (taskId, stepId) — the storage
- * SK is derived from `order`, not stepId, so the row is found by query, not key build.
- * Only the fields that are present (non-null) change; `stepId`, `taskId`, `order`, and
- * `createdAt` are immutable. At least one editable field (`text` or `mediaRefs`) must
- * be supplied. `mediaRefs` may be an empty list (replaces the value with none).
+ * Partial edit of one TaskStep, located by (taskId, stepId). At least one of `text`,
+ * `mediaAssetId`, or `removeMedia: true` must be supplied. `text` is trimmed and must be
+ * non-empty. `mediaAssetId` attaches one existing, currently-unattached media asset
+ * (replacing any current one). `removeMedia: true` removes+deletes the current asset.
+ * Supplying both `mediaAssetId` and `removeMedia: true` is rejected. `stepId`, `taskId`,
+ * `order`, and `createdAt` are immutable.
  */
 export interface UpdateTaskStepInput {
   taskId: string;
   stepId: string;
   text?: string;
-  mediaRefs?: string[];
+  mediaAssetId?: string;
+  removeMedia?: boolean;
+}
+
+/**
+ * Identifies one TaskStep for deletion. The step is located by (taskId, stepId) — the
+ * storage SK is derived from `order`, not stepId, so the row is found by query. Deleting
+ * a step also cleans up media assets that are exclusive to it (see the tasks handler).
+ */
+export interface DeleteTaskStepInput {
+  taskId: string;
+  stepId: string;
 }
 
 export interface CreateAssignmentInput {
@@ -278,9 +292,10 @@ export interface DeleteAssignmentInput {
   assignmentId: string;
 }
 
+// Newly registered media is always created UNATTACHED — there is no stepId here; an asset
+// is bound to a step only via updateTaskStep(mediaAssetId) (or used as a cover image).
 export interface CreateMediaAssetInput {
   taskId: string;
-  stepId?: string;
   s3Key: string;
   type: MediaType;
   mimeType: string;

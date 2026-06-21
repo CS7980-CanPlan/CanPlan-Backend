@@ -1,6 +1,11 @@
 import { handler } from './handler';
 import { dynamo } from '../../shared/dynamodb';
-import { deleteS3ObjectBestEffort, prepareCoverImageAsset } from '../../shared/media';
+import {
+  deleteS3ObjectBestEffort,
+  prepareCoverImageAsset,
+  purgeMediaAsset,
+  retryTaskMediaCleanup,
+} from '../../shared/media';
 import type { Connection, Task, TaskStep } from '../../shared/types';
 
 jest.mock('../../shared/dynamodb', () => ({
@@ -8,16 +13,21 @@ jest.mock('../../shared/dynamodb', () => ({
   TABLE_NAME: 'CanPlan-test',
 }));
 
-// Cover-image S3 work is unit-tested in shared/media.test.ts; stub it here so the
-// tasks handler tests focus on DB orchestration + cleanup ordering.
+// Cover-image S3 work + the shared media-cleanup service are unit-tested in
+// shared/media.test.ts; stub them here so the tasks handler tests focus on DB
+// orchestration, reference decisions, and cleanup ordering.
 jest.mock('../../shared/media', () => ({
   prepareCoverImageAsset: jest.fn(),
   deleteS3ObjectBestEffort: jest.fn().mockResolvedValue(true),
+  purgeMediaAsset: jest.fn().mockResolvedValue(true),
+  retryTaskMediaCleanup: jest.fn().mockResolvedValue(true),
 }));
 
 const mockSend = dynamo.send as jest.Mock;
 const mockPrepare = prepareCoverImageAsset as jest.Mock;
 const mockDeleteS3 = deleteS3ObjectBestEffort as jest.Mock;
+const mockPurge = purgeMediaAsset as jest.Mock;
+const mockRetryMediaCleanup = retryTaskMediaCleanup as jest.Mock;
 
 beforeEach(() => mockSend.mockResolvedValue({}));
 afterEach(() => jest.clearAllMocks());
@@ -326,16 +336,37 @@ describe('tasks handler', () => {
   });
 
   describe('updateTaskStep', () => {
-    // findTaskStep queries STEP# rows; the matching row carries the real `order`.
-    const stubStep = (rows: Array<Record<string, unknown>>, attrs: Record<string, unknown>) =>
-      mockSend.mockResolvedValueOnce({ Items: rows }).mockResolvedValueOnce({ Attributes: attrs });
-    const updateInput = () => mockSend.mock.calls.find((c) => c[0].input.UpdateExpression)![0].input;
+    const commands = () => mockSend.mock.calls.map((c) => c[0]);
+    const updateInput = () => commands().find((c) => c.constructor.name === 'UpdateCommand')?.input;
+    const txItems = () => {
+      const tx = commands().find((c) => c.input.TransactItems);
+      return tx ? tx.input.TransactItems.map((t: { Update?: unknown; Put?: unknown }) => t.Update ?? t.Put) : [];
+    };
+    /**
+     * Leak-free stub: STEP# query → `steps`; GET #META → optional cover; GET MEDIA#<id> →
+     * `assets[SK]` (or not-found); every write (Update/Transact) → {}.
+     */
+    const stub = (
+      steps: Array<Record<string, unknown>>,
+      opts: { cover?: string; assets?: Record<string, Record<string, unknown>> } = {},
+    ) => {
+      mockSend.mockImplementation((cmd: { constructor: { name: string }; input: { Key?: { SK?: string } } }) => {
+        const { name } = cmd.constructor;
+        if (name === 'QueryCommand') return Promise.resolve({ Items: steps });
+        if (name === 'GetCommand') {
+          const sk = cmd.input.Key?.SK ?? '';
+          if (sk === '#META') {
+            return Promise.resolve({ Item: opts.cover ? { coverImageAssetId: opts.cover } : {} });
+          }
+          const item = opts.assets?.[sk];
+          return Promise.resolve(item ? { Item: item } : {});
+        }
+        return Promise.resolve({});
+      });
+    };
 
     it('updates text (trimmed) on the row found by stepId, keyed by its order', async () => {
-      stubStep(
-        [{ stepId: 's1', order: 3, taskId: 't1', text: 'old', createdAt: 'c' }],
-        { PK: 'TASK#t1', SK: 'STEP#003', entityType: 'TaskStep', stepId: 's1', order: 3, text: 'Rinse', updatedAt: 'now' },
-      );
+      stub([{ stepId: 's1', order: 3, taskId: 't1', text: 'old', createdAt: 'c' }]);
       const result = (await handler(
         event('updateTaskStep', { input: { taskId: 't1', stepId: 's1', text: '  Rinse  ' } }),
       )) as TaskStep;
@@ -346,25 +377,11 @@ describe('tasks handler', () => {
       expect(input.UpdateExpression).toContain('#text = :text');
       expect(input.ExpressionAttributeValues[':text']).toBe('Rinse');
       expect(input.ConditionExpression).toBe('attribute_exists(PK)');
-      // Result is stripped of internal storage attributes.
       const out = result as unknown as Record<string, unknown>;
       expect(out.PK).toBeUndefined();
       expect(out.SK).toBeUndefined();
       expect(out.entityType).toBeUndefined();
       expect(result.text).toBe('Rinse');
-    });
-
-    it('replaces mediaRefs, including with an empty list', async () => {
-      stubStep(
-        [{ stepId: 's1', order: 1 }],
-        { stepId: 's1', order: 1, mediaRefs: [], updatedAt: 'now' },
-      );
-      await handler(event('updateTaskStep', { input: { taskId: 't1', stepId: 's1', mediaRefs: [] } }));
-      const input = updateInput();
-      expect(input.UpdateExpression).toContain('#mediaRefs = :mediaRefs');
-      expect(input.ExpressionAttributeValues[':mediaRefs']).toEqual([]);
-      // text was not supplied, so it is not in the update.
-      expect(input.UpdateExpression).not.toContain(':text');
     });
 
     it('rejects an empty (whitespace) text before touching DynamoDB', async () => {
@@ -374,20 +391,26 @@ describe('tasks handler', () => {
       expect(mockSend).not.toHaveBeenCalled();
     });
 
-    it('rejects a request with neither text nor mediaRefs', async () => {
+    it('rejects a request with none of text / mediaAssetId / removeMedia', async () => {
       await expect(
         handler(event('updateTaskStep', { input: { taskId: 't1', stepId: 's1' } })),
-      ).rejects.toThrow('at least one of text or mediaRefs');
+      ).rejects.toThrow('at least one of text, mediaAssetId, or removeMedia: true');
+      expect(mockSend).not.toHaveBeenCalled();
+    });
+
+    it('rejects supplying both mediaAssetId and removeMedia: true', async () => {
+      await expect(
+        handler(event('updateTaskStep', { input: { taskId: 't1', stepId: 's1', mediaAssetId: 'm1', removeMedia: true } })),
+      ).rejects.toThrow('cannot provide both mediaAssetId and removeMedia');
       expect(mockSend).not.toHaveBeenCalled();
     });
 
     it('returns NotFound when no STEP# row has the given stepId', async () => {
-      mockSend.mockResolvedValueOnce({ Items: [{ stepId: 'other', order: 1 }] });
+      stub([{ stepId: 'other', order: 1 }]);
       await expect(
         handler(event('updateTaskStep', { input: { taskId: 't1', stepId: 'missing', text: 'x' } })),
       ).rejects.toThrow('step missing not found for task t1');
-      // Found nothing → never issued an update.
-      expect(mockSend.mock.calls.some((c) => c[0].input.UpdateExpression)).toBe(false);
+      expect(commands().some((c) => c.constructor.name === 'UpdateCommand')).toBe(false);
     });
 
     it('validates taskId and stepId', async () => {
@@ -397,6 +420,112 @@ describe('tasks handler', () => {
       await expect(
         handler(event('updateTaskStep', { input: { taskId: 't1', text: 'x' } })),
       ).rejects.toThrow('stepId is required');
+    });
+
+    describe('attach media (mediaAssetId)', () => {
+      it('attaches an unattached asset: sets the asset stepId + the step mediaAssetId atomically', async () => {
+        stub([{ stepId: 's1', order: 1 }], {
+          assets: { 'MEDIA#m1': { assetId: 'm1', taskId: 't1', s3Key: 'media/t1/m1.png' } },
+        });
+        const result = (await handler(
+          event('updateTaskStep', { input: { taskId: 't1', stepId: 's1', mediaAssetId: 'm1' } }),
+        )) as TaskStep;
+
+        const items = txItems();
+        const assetUpd = items.find((i: { Key: { SK: string } }) => i.Key.SK === 'MEDIA#m1');
+        expect(assetUpd.UpdateExpression).toContain('stepId = :stepId');
+        // Guarded so a concurrent attach can't double-bind the asset.
+        expect(assetUpd.ConditionExpression).toContain('attribute_not_exists(stepId)');
+        expect(assetUpd.ExpressionAttributeValues[':stepId']).toBe('s1');
+        const stepUpd = items.find((i: { Key: { SK: string } }) => i.Key.SK === 'STEP#001');
+        expect(stepUpd.ExpressionAttributeValues[':assetId']).toBe('m1');
+        expect(result.mediaAssetId).toBe('m1');
+        expect(mockPurge).not.toHaveBeenCalled(); // nothing replaced
+      });
+
+      it('rejects attaching an asset that belongs to another Task (absent under this task)', async () => {
+        stub([{ stepId: 's1', order: 1 }], { assets: {} }); // GET MEDIA#other → not found
+        await expect(
+          handler(event('updateTaskStep', { input: { taskId: 't1', stepId: 's1', mediaAssetId: 'other' } })),
+        ).rejects.toThrow('media asset other not found under task t1');
+      });
+
+      it('rejects attaching an asset already attached to a step (has stepId)', async () => {
+        stub([{ stepId: 's1', order: 1 }], {
+          assets: { 'MEDIA#m1': { assetId: 'm1', taskId: 't1', stepId: 's2', s3Key: 'k' } },
+        });
+        await expect(
+          handler(event('updateTaskStep', { input: { taskId: 't1', stepId: 's1', mediaAssetId: 'm1' } })),
+        ).rejects.toThrow('already attached to a step');
+      });
+
+      it('rejects attaching an asset another step already points to', async () => {
+        stub(
+          [
+            { stepId: 's1', order: 1 },
+            { stepId: 's2', order: 2, mediaAssetId: 'm1' },
+          ],
+          { assets: { 'MEDIA#m1': { assetId: 'm1', taskId: 't1', s3Key: 'k' } } },
+        );
+        await expect(
+          handler(event('updateTaskStep', { input: { taskId: 't1', stepId: 's1', mediaAssetId: 'm1' } })),
+        ).rejects.toThrow('already attached to a step');
+      });
+
+      it('rejects attaching the Task cover image to a step', async () => {
+        stub([{ stepId: 's1', order: 1 }], {
+          cover: 'm1',
+          assets: { 'MEDIA#m1': { assetId: 'm1', taskId: 't1', s3Key: 'k' } },
+        });
+        await expect(
+          handler(event('updateTaskStep', { input: { taskId: 't1', stepId: 's1', mediaAssetId: 'm1' } })),
+        ).rejects.toThrow('cannot attach the task cover image');
+      });
+
+      it('replacing step media attaches the new asset first, then deletes the old one', async () => {
+        stub([{ stepId: 's1', order: 1, mediaAssetId: 'old' }], {
+          assets: {
+            'MEDIA#new': { assetId: 'new', taskId: 't1', s3Key: 'media/t1/new.png' },
+            'MEDIA#old': { assetId: 'old', taskId: 't1', stepId: 's1', s3Key: 'media/t1/old.png' },
+          },
+        });
+        const result = (await handler(
+          event('updateTaskStep', { input: { taskId: 't1', stepId: 's1', mediaAssetId: 'new' } }),
+        )) as TaskStep;
+
+        // The atomic attach (transaction) happens; the old asset is purged afterward.
+        expect(commands().some((c) => c.input.TransactItems)).toBe(true);
+        expect(mockPurge).toHaveBeenCalledWith(
+          expect.objectContaining({ assetId: 'old', s3Key: 'media/t1/old.png' }),
+          expect.objectContaining({ event: 'updateTaskStep.replaceMedia' }),
+        );
+        expect(result.mediaAssetId).toBe('new');
+      });
+    });
+
+    describe('removeMedia', () => {
+      it('removes the back-reference and deletes the current media asset', async () => {
+        stub([{ stepId: 's1', order: 1, mediaAssetId: 'm1' }], {
+          assets: { 'MEDIA#m1': { assetId: 'm1', taskId: 't1', s3Key: 'media/t1/m1.png' } },
+        });
+        const result = (await handler(
+          event('updateTaskStep', { input: { taskId: 't1', stepId: 's1', removeMedia: true } }),
+        )) as TaskStep;
+
+        expect(updateInput().UpdateExpression).toContain('REMOVE mediaAssetId');
+        expect(mockPurge).toHaveBeenCalledWith(
+          expect.objectContaining({ assetId: 'm1' }),
+          expect.objectContaining({ event: 'updateTaskStep.removeMedia' }),
+        );
+        expect(result.mediaAssetId).toBeUndefined();
+      });
+
+      it('is a no-op for media when the step has none (still updates the step)', async () => {
+        stub([{ stepId: 's1', order: 1 }]);
+        await handler(event('updateTaskStep', { input: { taskId: 't1', stepId: 's1', removeMedia: true } }));
+        expect(updateInput().UpdateExpression).toContain('REMOVE mediaAssetId');
+        expect(mockPurge).not.toHaveBeenCalled();
+      });
     });
   });
 
@@ -556,9 +685,119 @@ describe('tasks handler', () => {
       expect(deleteInputs()).toHaveLength(0); // #META was not deleted
     });
 
-    it('has no API for deleting an individual TaskStep', async () => {
-      await expect(handler(event('deleteTaskStep', { taskId: 't1', stepId: 's1' }))).rejects.toThrow(
-        'unsupported field',
+  });
+
+  describe('deleteTaskStep', () => {
+    const commands = () => mockSend.mock.calls.map((c) => c[0]);
+    const stepDelete = () => commands().find((c) => c.constructor.name === 'DeleteCommand')?.input;
+
+    /** Leak-free stub: STEP# query → `steps`; GET MEDIA#<id> → `asset` (or not-found). */
+    const stub = (opts: { steps: Array<Record<string, unknown>>; asset?: Record<string, unknown> }) => {
+      mockSend.mockImplementation((cmd: { constructor: { name: string } }) => {
+        const { name } = cmd.constructor;
+        if (name === 'QueryCommand') return Promise.resolve({ Items: opts.steps });
+        if (name === 'GetCommand') return Promise.resolve(opts.asset ? { Item: opts.asset } : {});
+        return Promise.resolve({}); // DeleteCommand
+      });
+    };
+
+    it('deletes a step with no media and returns the deleted step payload', async () => {
+      stub({ steps: [{ PK: 'TASK#t1', SK: 'STEP#001', entityType: 'TaskStep', stepId: 's1', taskId: 't1', order: 1, text: 'a' }] });
+      const result = (await handler(
+        event('deleteTaskStep', { input: { taskId: 't1', stepId: 's1' } }),
+      )) as TaskStep;
+
+      expect(stepDelete().Key).toEqual({ PK: 'TASK#t1', SK: 'STEP#001' });
+      expect(stepDelete().ConditionExpression).toBe('attribute_exists(PK)');
+      expect(mockPurge).not.toHaveBeenCalled();
+      // Returned payload excludes internal fields.
+      expect(result.stepId).toBe('s1');
+      const out = result as unknown as Record<string, unknown>;
+      expect(out.PK).toBeUndefined();
+      expect(out.SK).toBeUndefined();
+      expect(out.entityType).toBeUndefined();
+    });
+
+    it('returns NotFound when no STEP# row has the given stepId', async () => {
+      stub({ steps: [{ stepId: 'other', order: 1 }] });
+      await expect(
+        handler(event('deleteTaskStep', { input: { taskId: 't1', stepId: 'missing' } })),
+      ).rejects.toThrow('step missing not found for task t1');
+      expect(commands().some((c) => c.constructor.name === 'DeleteCommand')).toBe(false);
+      expect(mockPurge).not.toHaveBeenCalled();
+    });
+
+    it('validates blank taskId and stepId before any DynamoDB call', async () => {
+      await expect(handler(event('deleteTaskStep', { input: { stepId: 's1' } }))).rejects.toThrow('taskId is required');
+      await expect(handler(event('deleteTaskStep', { input: { taskId: '  ', stepId: 's1' } }))).rejects.toThrow('taskId is required');
+      await expect(handler(event('deleteTaskStep', { input: { taskId: 't1' } }))).rejects.toThrow('stepId is required');
+      await expect(handler(event('deleteTaskStep', { input: { taskId: 't1', stepId: '  ' } }))).rejects.toThrow('stepId is required');
+      expect(mockSend).not.toHaveBeenCalled();
+    });
+
+    it('deletes the step and its single media asset (metadata row + S3 binary)', async () => {
+      stub({
+        steps: [{ stepId: 's1', order: 1, mediaAssetId: 'm1' }],
+        asset: { assetId: 'm1', taskId: 't1', stepId: 's1', s3Key: 'media/t1/m1.png' },
+      });
+      await handler(event('deleteTaskStep', { input: { taskId: 't1', stepId: 's1' } }));
+
+      // Step row deleted, then the single asset purged (row + S3) via the shared helper.
+      expect(stepDelete().Key).toEqual({ PK: 'TASK#t1', SK: 'STEP#001' });
+      expect(mockPurge).toHaveBeenCalledTimes(1);
+      expect(mockPurge).toHaveBeenCalledWith(
+        expect.objectContaining({ assetId: 'm1', s3Key: 'media/t1/m1.png' }),
+        expect.objectContaining({ event: 'deleteTaskStep', taskId: 't1', stepId: 's1' }),
+      );
+    });
+
+    it('treats an already-gone media asset as cleaned (no purge, still succeeds)', async () => {
+      stub({ steps: [{ stepId: 's1', order: 1, mediaAssetId: 'm1' }] }); // GET asset → {}
+      const result = (await handler(
+        event('deleteTaskStep', { input: { taskId: 't1', stepId: 's1' } }),
+      )) as TaskStep;
+      expect(result.stepId).toBe('s1');
+      expect(mockPurge).not.toHaveBeenCalled();
+    });
+
+    it('does not read, update, or delete any Assignment/AssignmentStep rows', async () => {
+      stub({
+        steps: [{ stepId: 's1', order: 1, mediaAssetId: 'm1' }],
+        asset: { assetId: 'm1', taskId: 't1', stepId: 's1', s3Key: 'media/t1/m1.png' },
+      });
+      await handler(event('deleteTaskStep', { input: { taskId: 't1', stepId: 's1' } }));
+      const serialized = JSON.stringify(commands().map((c) => c.input));
+      expect(serialized).not.toContain('USER#');
+      expect(serialized).not.toContain('ASSIGN');
+    });
+
+    it('finds the step across paginated STEP# pages', async () => {
+      mockSend
+        .mockResolvedValueOnce({ Items: [{ stepId: 'other', order: 1 }], LastEvaluatedKey: { k: 1 } }) // page 1
+        .mockResolvedValueOnce({ Items: [{ stepId: 's1', order: 2 }] }) // page 2 has the target
+        .mockResolvedValue({}); // step delete (no media)
+      const result = (await handler(
+        event('deleteTaskStep', { input: { taskId: 't1', stepId: 's1' } }),
+      )) as TaskStep;
+      expect(result.stepId).toBe('s1');
+      expect(stepDelete().Key).toEqual({ PK: 'TASK#t1', SK: 'STEP#002' });
+    });
+
+    it('surfaces a retryable error when the S3 cleanup fails (no silent success)', async () => {
+      mockPurge.mockResolvedValueOnce(false); // S3 delete failed
+      stub({
+        steps: [{ stepId: 's1', order: 1, mediaAssetId: 'm1' }],
+        asset: { assetId: 'm1', taskId: 't1', stepId: 's1', s3Key: 'media/t1/m1.png' },
+      });
+      await expect(
+        handler(event('deleteTaskStep', { input: { taskId: 't1', stepId: 's1' } })),
+      ).rejects.toThrow('could not be deleted; retry');
+      // The step remains until the durable media cleanup succeeds, so retrying this
+      // same mutation can finish safely rather than returning NotFound.
+      expect(stepDelete()).toBeUndefined();
+      expect(mockRetryMediaCleanup).toHaveBeenCalledWith(
+        't1',
+        expect.objectContaining({ event: 'deleteTaskStep.retryPendingCleanup', stepId: 's1' }),
       );
     });
   });

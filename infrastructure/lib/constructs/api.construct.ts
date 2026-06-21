@@ -100,6 +100,7 @@ export class Api extends Construct {
       { typeName: 'Mutation', fieldName: 'updateTask' },
       { typeName: 'Mutation', fieldName: 'createTaskStep' },
       { typeName: 'Mutation', fieldName: 'updateTaskStep' },
+      { typeName: 'Mutation', fieldName: 'deleteTaskStep' },
       { typeName: 'Mutation', fieldName: 'deleteTask' },
       { typeName: 'Query', fieldName: 'getTask' },
       { typeName: 'Query', fieldName: 'listTaskSteps' },
