@@ -3,9 +3,9 @@
  * its ordered steps.
  *
  * A task template is the only entity that doesn't depend on a real account or file:
- *   - UserProfile / SupportLink / Assignment / ProgressEvent are all tied to Cognito
- *     users (created via sign-up), so seeding them would create orphan rows for users
- *     that don't exist in the User Pool.
+ *   - UserProfile / SupportLink / Assignment are all tied to Cognito users (created
+ *     via sign-up), so seeding them would create orphan rows for users that don't
+ *     exist in the User Pool.
  *   - MediaAsset only stores an `s3Key`; seeding one points at an S3 object that was
  *     never uploaded. Real flow: upload the binary to the media bucket first, THEN
  *     call createMediaAsset.

@@ -16,7 +16,6 @@ export interface ApiProps {
   readonly categoriesFn: lambda.IFunction;
   readonly tasksFn: lambda.IFunction;
   readonly assignmentsFn: lambda.IFunction;
-  readonly progressFn: lambda.IFunction;
   readonly mediaFn: lambda.IFunction;
   readonly adminFn: lambda.IFunction;
 }
@@ -100,29 +99,31 @@ export class Api extends Construct {
     wire('TasksDataSource', props.tasksFn, [
       { typeName: 'Mutation', fieldName: 'updateTask' },
       { typeName: 'Mutation', fieldName: 'createTaskStep' },
+      { typeName: 'Mutation', fieldName: 'updateTaskStep' },
+      { typeName: 'Mutation', fieldName: 'deleteTaskStep' },
+      { typeName: 'Mutation', fieldName: 'deleteTask' },
       { typeName: 'Query', fieldName: 'getTask' },
       { typeName: 'Query', fieldName: 'listTaskSteps' },
       { typeName: 'Query', fieldName: 'listTasksByOwner' },
       { typeName: 'Query', fieldName: 'listTasksByCategory' },
     ]);
 
-    // Assignments.
+    // Assignments + per-assignment step snapshots.
     wire('AssignmentsDataSource', props.assignmentsFn, [
       { typeName: 'Mutation', fieldName: 'createAssignment' },
       { typeName: 'Mutation', fieldName: 'updateAssignmentStatus' },
+      { typeName: 'Mutation', fieldName: 'setAssignmentStepCompletion' },
+      { typeName: 'Mutation', fieldName: 'deleteAssignment' },
       { typeName: 'Query', fieldName: 'listAssignmentsForUser' },
-    ]);
-
-    // Progress events.
-    wire('ProgressDataSource', props.progressFn, [
-      { typeName: 'Mutation', fieldName: 'createProgressEvent' },
-      { typeName: 'Query', fieldName: 'listProgressEventsForUser' },
+      { typeName: 'Query', fieldName: 'listAssignmentSteps' },
     ]);
 
     // Media assets — presigned upload + download URLs, metadata registration, listing.
     wire('MediaDataSource', props.mediaFn, [
       { typeName: 'Mutation', fieldName: 'createMediaUploadUrl' },
+      { typeName: 'Mutation', fieldName: 'createTaskCoverImageUploadUrl' },
       { typeName: 'Mutation', fieldName: 'createMediaAsset' },
+      { typeName: 'Mutation', fieldName: 'deleteMediaAsset' },
       { typeName: 'Query', fieldName: 'getMediaDownloadUrl' },
       { typeName: 'Query', fieldName: 'listMediaForTask' },
     ]);

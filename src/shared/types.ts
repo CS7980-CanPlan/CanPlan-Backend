@@ -7,8 +7,13 @@
 export type UserRole = 'PRIMARY_USER' | 'SUPPORT_PERSON' | 'ORG_ADMIN';
 export type SupportLinkStatus = 'PENDING' | 'ACTIVE' | 'REVOKED';
 export type TaskStatus = 'DRAFT' | 'ACTIVE' | 'ARCHIVED';
-export type AssignmentStatus = 'ACTIVE' | 'COMPLETED' | 'PAUSED' | 'CANCELLED';
-export type ProgressEventType = 'STARTED' | 'PAUSED' | 'RESUMED' | 'SKIPPED' | 'COMPLETED' | 'SYNCED';
+/**
+ * Assignment status as surfaced through the API. `OVERDUE` is derived at read time
+ * (persisted status TO_DO + a dueDate in the past) — it is never written to storage.
+ */
+export type AssignmentStatus = 'TO_DO' | 'OVERDUE' | 'COMPLETED' | 'SKIPPED';
+/** The only statuses ever persisted on an Assignment row. */
+export type PersistedAssignmentStatus = 'TO_DO' | 'COMPLETED' | 'SKIPPED';
 export type MediaType = 'IMAGE' | 'AUDIO' | 'VIDEO';
 export type RepeatUnit = 'MINUTE' | 'HOUR' | 'DAY' | 'WEEK' | 'MONTH';
 
@@ -75,6 +80,12 @@ export interface Task {
   nextOccurrenceAt?: string;
   /** Whether reminders are enabled; defaults to true when a schedule is provided. */
   notificationEnabled?: boolean;
+  /**
+   * Optional single cover image. The id of an IMAGE MediaAsset (PK=TASK#<taskId>,
+   * SK=MEDIA#<assetId>); fetch a viewable URL with getMediaDownloadUrl(taskId, assetId).
+   * Null/absent when the task has no cover image.
+   */
+  coverImageAssetId?: string;
   createdAt: string;
   updatedAt?: string;
   /** Populated by createTask with the steps it just wrote; null on plain getTask. */
@@ -86,8 +97,8 @@ export interface TaskStep {
   taskId: string;
   order: number;
   text: string;
-  mediaRefs?: string[];
-  expectedDuration?: number;
+  /** At most one media asset (singular media model); absent when the step has none. */
+  mediaAssetId?: string;
   createdAt: string;
   updatedAt?: string;
 }
@@ -100,23 +111,32 @@ export interface Assignment {
   dueDate?: string;
   recurrence?: string;
   scheduleRule?: string;
-  active: boolean;
+  /** Persisted as TO_DO/COMPLETED/SKIPPED; surfaced as AssignmentStatus (may be OVERDUE). */
   status: AssignmentStatus;
   assignedAt: string;
   createdAt: string;
   updatedAt?: string;
 }
 
-export interface ProgressEvent {
-  eventId: string;
-  assignmentId?: string;
-  taskId?: string;
-  userId: string;
-  eventType: ProgressEventType;
-  timestamp: string;
-  source?: string;
-  metadata?: Record<string, unknown>;
+/**
+ * A snapshot of one TaskStep captured into one Assignment at creation time. The
+ * snapshot is immutable to template edits — later changes to the Task's steps must
+ * not alter historical assignments. PK = USER#<userId>, SK = ASSIGN_STEP#<assignmentId>#STEP#<stepId>.
+ *
+ * Carries text/completion only — NOT media. A live Task MediaAsset can be deleted with
+ * its TaskStep, so it is never copied here. Assignment-visible media, if ever needed,
+ * must be a separate assignment-owned snapshot.
+ */
+export interface AssignmentStep {
+  assignmentId: string;
+  taskId: string;
+  stepId: string;
+  order: number;
+  text: string;
+  completed: boolean;
+  completedAt?: string;
   createdAt: string;
+  updatedAt: string;
 }
 
 export interface MediaAsset {
@@ -158,8 +178,6 @@ export interface CreateCategoryInput {
 
 export interface CreateTaskStepNestedInput {
   text: string;
-  mediaRefs?: string[];
-  expectedDuration?: number;
 }
 
 /** Schedule metadata accepted at task creation. `enabled` defaults to true when stored. */
@@ -181,6 +199,11 @@ export interface CreateTaskInput {
   steps?: CreateTaskStepNestedInput[];
   schedule?: TaskScheduleInput;
   notificationEnabled?: boolean;
+  /**
+   * Optional cover image: the pending s3Key returned by createTaskCoverImageUploadUrl
+   * (after the client PUT the bytes). Omitted ⇒ no cover image.
+   */
+  coverImageS3Key?: string;
 }
 
 /**
@@ -196,14 +219,44 @@ export interface UpdateTaskInput {
   status?: TaskStatus;
   schedule?: TaskScheduleInput;
   notificationEnabled?: boolean;
+  /**
+   * Optional new cover image: the pending s3Key from createTaskCoverImageUploadUrl.
+   * Supplied ⇒ replace the cover image (old one is cleaned up after the new one is
+   * safely registered); omitted ⇒ leave the current cover image unchanged.
+   */
+  coverImageS3Key?: string;
 }
 
 export interface CreateTaskStepInput {
   taskId: string;
   order: number;
   text: string;
-  mediaRefs?: string[];
-  expectedDuration?: number;
+}
+
+/**
+ * Partial edit of one TaskStep, located by (taskId, stepId). At least one of `text`,
+ * `mediaAssetId`, or `removeMedia: true` must be supplied. `text` is trimmed and must be
+ * non-empty. `mediaAssetId` attaches one existing, currently-unattached media asset
+ * (replacing any current one). `removeMedia: true` removes+deletes the current asset.
+ * Supplying both `mediaAssetId` and `removeMedia: true` is rejected. `stepId`, `taskId`,
+ * `order`, and `createdAt` are immutable.
+ */
+export interface UpdateTaskStepInput {
+  taskId: string;
+  stepId: string;
+  text?: string;
+  mediaAssetId?: string;
+  removeMedia?: boolean;
+}
+
+/**
+ * Identifies one TaskStep for deletion. The step is located by (taskId, stepId) — the
+ * storage SK is derived from `order`, not stepId, so the row is found by query. Deleting
+ * a step also cleans up media assets that are exclusive to it (see the tasks handler).
+ */
+export interface DeleteTaskStepInput {
+  taskId: string;
+  stepId: string;
 }
 
 export interface CreateAssignmentInput {
@@ -213,30 +266,36 @@ export interface CreateAssignmentInput {
   dueDate?: string;
   recurrence?: string;
   scheduleRule?: string;
-  active?: boolean;
-  status?: AssignmentStatus;
 }
 
 export interface UpdateAssignmentStatusInput {
   userId: string;
   assignmentId: string;
+  /** Accepts the AssignmentStatus enum, but OVERDUE is rejected — it is a derived status. */
   status: AssignmentStatus;
-  active?: boolean;
 }
 
-export interface CreateProgressEventInput {
+export interface SetAssignmentStepCompletionInput {
   userId: string;
-  assignmentId?: string;
-  taskId?: string;
-  eventType: ProgressEventType;
-  timestamp?: string;
-  source?: string;
-  metadata?: Record<string, unknown>;
+  assignmentId: string;
+  stepId: string;
+  completed: boolean;
 }
 
+/**
+ * Identifies one Assignment for deletion by its composite key (userId + assignmentId).
+ * Deleting an assignment also removes all of its AssignmentStep snapshots; the source
+ * Task and its TaskSteps are never touched.
+ */
+export interface DeleteAssignmentInput {
+  userId: string;
+  assignmentId: string;
+}
+
+// Newly registered media is always created UNATTACHED — there is no stepId here; an asset
+// is bound to a step only via updateTaskStep(mediaAssetId) (or used as a cover image).
 export interface CreateMediaAssetInput {
   taskId: string;
-  stepId?: string;
   s3Key: string;
   type: MediaType;
   mimeType: string;
@@ -248,6 +307,20 @@ export interface CreateMediaUploadUrlInput {
   taskId: string;
   contentType: string;
   fileName?: string;
+}
+
+// Cover-image upload URL: no taskId (a task may not exist yet at create time). The
+// returned s3Key is a server-owned pending key; the client PUTs bytes to the URL, then
+// passes the key as coverImageS3Key to createTask/updateTask.
+export interface CreateTaskCoverImageUploadUrlInput {
+  contentType: string;
+  fileName?: string;
+}
+
+// Identifies one MediaAsset for deletion (its binary + metadata row + dangling refs).
+export interface DeleteMediaAssetInput {
+  taskId: string;
+  assetId: string;
 }
 
 // Returned by createMediaUploadUrl: a presigned PUT URL the client uploads the

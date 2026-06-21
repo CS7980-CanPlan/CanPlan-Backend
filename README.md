@@ -11,7 +11,7 @@ frontend-facing reference is [docs/API.md](docs/API.md).
 
 CanPlan uses a **single DynamoDB table** (`CanPlanTasks-<env>`, composite `PK`/`SK`)
 for every entity — UserProfile, SupportLink, Category, Task, TaskStep, Assignment,
-ProgressEvent, MediaAsset, Report. The item-key conventions live in
+AssignmentStep, MediaAsset, Report. The item-key conventions live in
 [src/shared/keys.ts](src/shared/keys.ts).
 
 | Operation(s) | Type | Backing service |
@@ -20,10 +20,9 @@ ProgressEvent, MediaAsset, Report. The item-key conventions live in
 | `createTask` | Mutation | `canplan-createTask-<env>` Lambda (writes Task + steps atomically) |
 | `createUserProfile`, `createSupportLink`, `getUserProfile`, `listUsersByOrganization`, `listPrimaryUsersBySupporter` | Query/Mutation | `canplan-users-<env>` Lambda + DynamoDB |
 | `createCategory`, `listCategoriesByOwner` | Query/Mutation | `canplan-categories-<env>` Lambda + DynamoDB |
-| `getTask`, `listTaskSteps`, `listTasksByOwner`, `listTasksByCategory`, `updateTask`, `createTaskStep` | Query/Mutation | `canplan-tasks-<env>` Lambda + DynamoDB |
-| `createAssignment`, `updateAssignmentStatus`, `listAssignmentsForUser` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB |
-| `createProgressEvent`, `listProgressEventsForUser` | Query/Mutation | `canplan-progress-<env>` Lambda + DynamoDB |
-| `createMediaUploadUrl`, `createMediaAsset`, `getMediaDownloadUrl`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB + S3 media bucket (presigned upload/download) |
+| `getTask`, `listTaskSteps`, `listTasksByOwner`, `listTasksByCategory`, `updateTask`, `createTaskStep`, `updateTaskStep`, `deleteTaskStep`, `deleteTask` | Query/Mutation | `canplan-tasks-<env>` Lambda + DynamoDB + S3 (media cleanup) |
+| `createAssignment`, `updateAssignmentStatus`, `setAssignmentStepCompletion`, `deleteAssignment`, `listAssignmentsForUser`, `listAssignmentSteps` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB |
+| `createMediaUploadUrl`, `createTaskCoverImageUploadUrl`, `createMediaAsset`, `deleteMediaAsset`, `getMediaDownloadUrl`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB + S3 media bucket (presigned upload/download, cover images, cascade delete) |
 | `listAllUsers`, `listAllTasks` | Query | `canplan-admin-<env>` Lambda + DynamoDB `entityTypeIndex` (SystemAdmin only, paginated) |
 | `generateTaskSteps` | Mutation | `canplan-generateTaskSteps-<env>` Lambda + Bedrock KB RAG |
 
@@ -74,7 +73,7 @@ The app deploys two CDK stacks with `--all`.
 
 | Region | Stack | Main resources |
 | ------ | ----- | -------------- |
-| `CANPLAN_BACKEND_REGION` default `ca-central-1` | `canplan-backend-<env>` | AppSync, Cognito, single-table DynamoDB `CanPlanTasks-<env>`, media S3 bucket, `createTask` + domain Lambdas (`users`/`categories`/`tasks`/`assignments`/`progress`/`media`/`admin`) + `generateTaskSteps` Lambda, `postConfirmation` Cognito trigger Lambda, CloudWatch logs |
+| `CANPLAN_BACKEND_REGION` default `ca-central-1` | `canplan-backend-<env>` | AppSync, Cognito, single-table DynamoDB `CanPlanTasks-<env>`, media S3 bucket, `createTask` + domain Lambdas (`users`/`categories`/`tasks`/`assignments`/`media`/`admin`) + `generateTaskSteps` Lambda, `postConfirmation` Cognito trigger Lambda, CloudWatch logs |
 | `CANPLAN_KNOWLEDGE_BASE_REGION` default `us-east-1` | `canplan-knowledge-base-<env>` | Bedrock Knowledge Base, S3 corpus bucket, Bedrock S3 data source, OpenSearch Serverless vector collection/index |
 
 `generateTaskSteps` runs in `ca-central-1` by default, but calls Bedrock Agent
@@ -87,7 +86,7 @@ region:
 
 | Region | Lambda functions you should expect |
 | ------ | ---------------------------------- |
-| Backend region | `canplan-createTask-<env>`, `canplan-users-<env>`, `canplan-categories-<env>`, `canplan-tasks-<env>`, `canplan-assignments-<env>`, `canplan-progress-<env>`, `canplan-media-<env>`, `canplan-admin-<env>`, `canplan-generateTaskSteps-<env>`, CDK cross-region reader, sandbox S3 auto-delete helper |
+| Backend region | `canplan-createTask-<env>`, `canplan-users-<env>`, `canplan-categories-<env>`, `canplan-tasks-<env>`, `canplan-assignments-<env>`, `canplan-media-<env>`, `canplan-admin-<env>`, `canplan-generateTaskSteps-<env>`, CDK cross-region reader, sandbox S3 auto-delete helper |
 | Knowledge Base region | OpenSearch index custom-resource provider, bucket deployment helper, CDK cross-region writer, sandbox S3 auto-delete helper |
 
 ## Prerequisites
@@ -260,7 +259,7 @@ infrastructure/lib/knowledge-base-stack.ts     Knowledge Base stack
 infrastructure/lib/constructs/                 CDK constructs
 scripts/build-corpus.ts                        seed.jsonl -> data/corpus/dist
 src/lambdas/createTask/handler.ts              createTask resolver (Task + steps)
-src/lambdas/{users,categories,tasks,assignments,progress,media}/handler.ts   Domain resolvers (routed by fieldName)
+src/lambdas/{users,categories,tasks,assignments,media}/handler.ts   Domain resolvers (routed by fieldName)
 src/lambdas/admin/handler.ts                   SystemAdmin list-all-by-entityType resolvers
 src/lambdas/generateTaskSteps/handler.ts       KB Retrieve -> Converse resolver
 src/shared/keys.ts                             Single-table PK/SK + entityType conventions

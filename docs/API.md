@@ -1,6 +1,21 @@
 # CanPlan 2.0 — Frontend API Reference
 
-_Last updated: 2026-06-19. Version: phase 1 (pre-authorization)._
+_Last updated: 2026-06-20. Version: phase 1 (pre-authorization)._
+
+> ## 🚨 Breaking change — progress model replaced
+>
+> The `ProgressEvent` model has been **removed** and the assignment model reworked.
+> See [Breaking changes](#breaking-changes-progress--assignment-rework) below for the
+> full migration notes. In short:
+>
+> - `ProgressEvent` is gone — `createProgressEvent` and `listProgressEventsForUser`,
+>   the `ProgressEvent`/`ProgressEventType` types, and the `progress` Lambda no longer
+>   exist. (Existing `ProgressEvent` rows are left in DynamoDB but are no longer served.)
+> - `AssignmentStatus` is now `TO_DO` / `OVERDUE` / `COMPLETED` / `SKIPPED`. `OVERDUE`
+>   is **derived**, never persisted. The old `ACTIVE`/`PAUSED`/`CANCELLED` values and
+>   the `active` field are gone.
+> - Progress is now tracked as per-assignment **`AssignmentStep`** snapshots, toggled
+>   with `setAssignmentStepCompletion` and read with `listAssignmentSteps`.
 
 The backend exposes a single **AWS AppSync GraphQL** endpoint backed by a single
 DynamoDB table. This document covers how to connect, the available operations, and
@@ -15,7 +30,7 @@ human-readable companion.
 > Outside the `SystemAdmin` admin queries and the self-scoped `createUserProfile`,
 > **no domain operation verifies the caller.** Any authenticated caller can act on
 > **any `id`** — read another user's profile, create a task under any `ownerId`,
-> append a progress event for any `userId`, link any supporter to any primary user.
+> assign a task to any `userId`, link any supporter to any primary user.
 > The schema and single-table keys are structured to support per-role/owner rules,
 > but they are **not implemented in this phase**.
 >
@@ -41,8 +56,8 @@ of how data is keyed and read back:
   client-supplied id and uses your `sub` from the session (see below). So your
   profile always lands at `USER#<sub>`.
 - But the **read** and every other self-scoped write (`getUserProfile`,
-  `createAssignment`, `createProgressEvent`, `listAssignmentsForUser`,
-  `listProgressEventsForUser`, …) take a `userId`/`ownerId` **argument**. If you pass
+  `createAssignment`, `setAssignmentStepCompletion`, `listAssignmentsForUser`,
+  `listAssignmentSteps`, …) take a `userId`/`ownerId` **argument**. If you pass
   anything other than your own `sub` there, you will write rows you can never read
   back through your own profile, or read an empty result — silently, with no error.
 
@@ -125,7 +140,7 @@ GraphQL types below. The key layout (for reference):
 | Task (template) | `TASK#<taskId>` | `#META` |
 | TaskStep | `TASK#<taskId>` | `STEP#<order>` (zero-padded, e.g. `STEP#001`) |
 | Assignment | `USER#<userId>` | `ASSIGN#<assignmentId>` |
-| ProgressEvent | `USER#<userId>` | `PROGRESS#<timestamp>#<eventId>` |
+| AssignmentStep | `USER#<userId>` | `ASSIGN_STEP#<assignmentId>#STEP#<stepId>` |
 | MediaAsset | `TASK#<taskId>` | `MEDIA#<assetId>` |
 
 Five GSIs serve the cross-cutting lists: `supporterIndex` (users managed by a
@@ -135,6 +150,12 @@ denormalized `<ownerId>#<categoryId>`, newest-first), and `entityTypeIndex` (eve
 item of one `entityType`, newest-first — backs the SystemAdmin list-all APIs without
 a Scan).
 
+`Assignment` and its `AssignmentStep` snapshots share the `USER#<userId>` partition.
+`ASSIGN_STEP#…` deliberately does **not** begin with `ASSIGN#` (its 7th character is
+`_`, not `#`), so `listAssignmentsForUser`'s `begins_with(SK, 'ASSIGN#')` query never
+returns step rows; `listAssignmentSteps` scopes to one assignment's steps and sorts
+them by `order`.
+
 ---
 
 ## Enums
@@ -143,8 +164,7 @@ a Scan).
 |---|---|
 | `UserRole` | `PRIMARY_USER`, `SUPPORT_PERSON`, `ORG_ADMIN` — a server-derived projection of Cognito group membership (`PrimaryUser`/`SupportPerson`/`OrganizationAdmin`); **Cognito groups are the authorization source of truth**. `SystemAdmin` is an elevated group, not a `UserRole`. |
 | `TaskStatus` | `DRAFT`, `ACTIVE`, `ARCHIVED` |
-| `AssignmentStatus` | `ACTIVE`, `COMPLETED`, `PAUSED`, `CANCELLED` |
-| `ProgressEventType` | `STARTED`, `PAUSED`, `RESUMED`, `SKIPPED`, `COMPLETED`, `SYNCED` |
+| `AssignmentStatus` | `TO_DO`, `OVERDUE`, `COMPLETED`, `SKIPPED` — only `TO_DO`/`COMPLETED`/`SKIPPED` are persisted; `OVERDUE` is **derived** at read time (a `TO_DO` assignment whose `dueDate` is in the past) and cannot be set by a mutation |
 | `MediaType` | `IMAGE`, `AUDIO`, `VIDEO` |
 | `SupportLinkStatus` | `PENDING`, `ACTIVE`, `REVOKED` |
 | `RepeatUnit` | `MINUTE`, `HOUR`, `DAY`, `WEEK`, `MONTH` |
@@ -176,7 +196,7 @@ object instead is the most common mistake here and is rejected at the AppSync ed
 ```
 
 In practice: `accessibilitySettings: JSON.stringify(settings)` on the way in. The same
-applies to `permissions` (`createSupportLink`) and `metadata` (`createProgressEvent`).
+applies to `permissions` (`createSupportLink`).
 **Responses are symmetric** — these fields come back as JSON strings, so
 `JSON.parse(profile.accessibilitySettings)` on the way out.
 
@@ -221,11 +241,12 @@ user is a separate operation — see `createAssignment`.
 | `description` | `String` | — | Optional |
 | `scheduleRule` | `String` | — | Optional (e.g. an RRULE) |
 | `status` | `TaskStatus` | — | Defaults to `DRAFT` |
-| `steps` | `[CreateTaskStepNestedInput!]` | — | Ordered; each becomes a `STEP#NNN` item |
+| `steps` | `[CreateTaskStepNestedInput!]` | — | Ordered; each becomes a `STEP#NNN` item; max 99, or max 98 when `coverImageS3Key` is supplied |
 | `schedule` | `TaskScheduleInput` | — | Optional recurring schedule (stored only — see below) |
 | `notificationEnabled` | `Boolean` | — | Defaults to `true` when `schedule` is set; otherwise left unset unless you pass it |
 
-`CreateTaskStepNestedInput`: `text: String!`, `mediaRefs: [ID!]`, `expectedDuration: Int`.
+`CreateTaskStepNestedInput`: `text: String!` (text only — step media is attached
+afterward via the upload flow, since step ids don't exist until `createTask` returns).
 
 **Category behavior.** Every task is filed under a category so it stays queryable by
 `listTasksByCategory`. If you omit `categoryId` (or send a blank string), the task is
@@ -365,7 +386,10 @@ fields are marked `!` and everything else is optional; see
 | `listTasksByOwner` | `ownerId!, limit, nextToken` | `TaskConnection!` |
 | `listTasksByCategory` | `ownerId!, categoryId, limit, nextToken` | `TaskConnection!` — tasks in one category; omit/blank `categoryId` for the `NO_CATEGORY` bucket |
 | `updateTask` | `input: { taskId!, title, categoryId, description, scheduleRule, status, schedule, notificationEnabled }` | `Task` — **partial edit**; see below |
-| `createTaskStep` | `input: { taskId!, order!, text!, mediaRefs, expectedDuration }` | `TaskStep` |
+| `createTaskStep` | `input: { taskId!, order!, text! }` | `TaskStep` (created without media; attach via `updateTaskStep`) |
+| `updateTaskStep` | `input: { taskId!, stepId!, text, mediaAssetId, removeMedia }` | `TaskStep` — **partial edit** of one step; see below |
+| `deleteTaskStep` | `input: { taskId!, stepId! }` | `TaskStep` — the deleted step; also deletes its single media asset; see below |
+| `deleteTask` | `taskId!` | `Task` — the deleted template (minus internal fields); cascades to all its steps + media; see below |
 
 > **`updateTask` is a partial edit.** Only the fields you include change; omitted
 > fields keep their current value. `ownerId` is immutable and **steps are not edited
@@ -387,28 +411,135 @@ fields are marked `!` and everything else is optional; see
 > { "input": { "taskId": "task-123", "title": "Wash hands well", "status": "ACTIVE", "categoryId": "cat-hygiene" } }
 > ```
 
-**Assignments**
+> **`updateTaskStep` is a partial edit of one step.** Identify the step by `taskId` +
+> `stepId`. **Supply at least one of `text`, `mediaAssetId`, or `removeMedia: true`** — a
+> request with none is rejected, and supplying both `mediaAssetId` and `removeMedia: true`
+> is rejected. A supplied `text` is trimmed and may **not** be empty. `stepId`, `taskId`,
+> `order`, and `createdAt` are immutable; `updatedAt` is bumped. A missing step returns a
+> not-found error. To remove the whole step, use `deleteTaskStep` (below).
+>
+> **A step holds at most one media asset** (`TaskStep.mediaAssetId`).
+> - **`mediaAssetId`** attaches one existing, currently-**unattached** media asset to the
+>   step. It must exist under the same `taskId`, not be the Task cover image, have no
+>   `stepId`, and not already be pointed at by another step — otherwise the request is
+>   rejected. The asset's `stepId` and the step's `mediaAssetId` are set together
+>   atomically. If the step already had an asset, the **new one is attached first, then the
+>   old asset's metadata row + S3 binary are deleted**.
+> - **`removeMedia: true`** detaches and **deletes** the step's current media asset (row +
+>   S3 binary).
+>
+> ```graphql
+> mutation UpdateTaskStep($input: UpdateTaskStepInput!) {
+>   updateTaskStep(input: $input) { stepId taskId order text mediaAssetId updatedAt }
+> }
+> ```
+> ```json
+> { "input": { "taskId": "task-123", "stepId": "step-9", "text": "Scrub for 20 seconds", "mediaAssetId": "asset-7" } }
+> ```
+
+> **`deleteTaskStep` removes one step and its single media asset.** Identify the step by
+> `taskId` + `stepId` (located by scanning the task's steps — the storage key is
+> order-based, not `stepId`-based). Returns the deleted `TaskStep` (internal fields
+> stripped); a missing step returns a not-found error.
+>
+> **Media cleanup.** If the step has a `mediaAssetId`, that one asset's metadata row + S3
+> binary are deleted. Each media asset belongs to exactly one step (or the cover), so there
+> is nothing shared to preserve.
+>
+> **Not touched:** the `Task` itself, any other `TaskStep`, and — importantly — **any
+> `Assignment` or `AssignmentStep`**. Historical `AssignmentStep` snapshots are immutable;
+> removing a template step never alters them, and future `createAssignment` calls simply
+> snapshot the task's remaining steps. (There is still **no API to delete an
+> `AssignmentStep`** — see [assignments](#assignments--progress-tracking).)
+>
+> _Consistency note:_ uses the same media-cleanup policy as `deleteMediaAsset` (clear the
+> back-reference → delete row → delete S3 binary, DB-first, structured-logged). It is safe
+> to retry; if an S3 delete fails it does **not** silently claim success — the metadata is
+> already gone (no API-visible dangling reference) and the operation returns a retryable
+> error with the failure logged for cleanup.
+>
+> ```graphql
+> mutation DeleteTaskStep($input: DeleteTaskStepInput!) {
+>   deleteTaskStep(input: $input) { stepId taskId order text }
+> }
+> ```
+
+> **`deleteTask` removes a template and all its steps.** Deletes the `Task` `#META` item
+> **and every `TaskStep`** under it, then returns the deleted `Task` (with internal
+> storage fields such as `PK`/`SK`/`entityType` stripped). A missing `taskId` returns a
+> not-found error.
+>
+> **`deleteTask` cascades to all task-owned media.** It deletes the `Task` `#META` item,
+> **every `TaskStep`**, **every `MediaAsset` row** under the task (cover image, step media,
+> and any task-level media without a `stepId`), and **each of those `MediaAsset`s' S3
+> binaries**. Nothing task-owned — DynamoDB rows, S3 objects, or cover/step references —
+> is left behind.
+>
+> **Historical `Assignment`s and `AssignmentStep`s are preserved.** They are immutable
+> snapshots and **remain readable after the template is deleted** — deleting a template
+> never rewrites history. (To remove an assignment, use `deleteAssignment`; to remove a
+> single media asset, use `deleteMediaAsset`.)
+>
+> _Consistency note:_ a task with **>99 children** exceeds DynamoDB's 100-item transaction
+> limit, so deletion is **not** a single atomic transaction. Before any `MediaAsset` row
+> is removed, the backend writes durable cleanup-journal rows containing its S3 key.
+> `TaskStep` and `MediaAsset` rows are then bulk-deleted in batches (children first). The
+> journal drives S3 deletion and is removed only after every binary is deleted; only then
+> is `#META` removed. If a batch or S3 delete fails, the Task and journal remain so a retry
+> can finish cleanup without losing an S3 key.
+>
+> ```graphql
+> mutation DeleteTask($taskId: ID!) {
+>   deleteTask(taskId: $taskId) { taskId title status }
+> }
+> ```
+
+**Assignments & progress tracking**
 
 | Operation | Input | Returns |
 |---|---|---|
-| `createAssignment` | `input: { taskId!, userId!, assignedBy, dueDate, recurrence, scheduleRule, active, status }` | `Assignment` · `active` defaults `true`, `status` defaults `ACTIVE` |
-| `updateAssignmentStatus` | `input: { userId!, assignmentId!, status!, active }` | `Assignment` · **needs both `userId` and `assignmentId`** (they form the item key); errors if the assignment doesn't exist |
-| `listAssignmentsForUser` | `userId!, limit, nextToken` | `AssignmentConnection!` |
+| `createAssignment` | `input: { taskId!, userId!, assignedBy, dueDate, recurrence, scheduleRule }` | `Assignment` · always created with persisted status `TO_DO`. Validates the `Task` exists, then snapshots its `TaskStep`s into one `AssignmentStep` per step (all `completed: false`), atomically. Errors if the task is missing or has > 99 steps (DynamoDB's 100-item transaction limit). |
+| `updateAssignmentStatus` | `input: { userId!, assignmentId!, status! }` | `Assignment` · `status` accepts only `TO_DO`/`COMPLETED`/`SKIPPED` (`OVERDUE` is rejected). **Needs both `userId` and `assignmentId`** (they form the item key); errors if the assignment doesn't exist. Setting `COMPLETED` is rejected while any `AssignmentStep` is still incomplete (a zero-step assignment may be completed). Marking all steps complete does **not** auto-complete the assignment — the client sets `COMPLETED` explicitly. |
+| `setAssignmentStepCompletion` | `input: { userId!, assignmentId!, stepId!, completed! }` | `AssignmentStep` · toggles one step. Sets `completedAt` to now when `completed: true`, clears it when `false`. Rejected if the assignment is `COMPLETED` or `SKIPPED`; 404s if the assignment or step doesn't exist for the user. |
+| `deleteAssignment` | `input: { userId!, assignmentId! }` | `Assignment` · the deleted assignment (internal fields stripped); deletes all its `AssignmentStep`s. See below. |
+| `listAssignmentsForUser` | `userId!, limit, nextToken` | `AssignmentConnection!` · `status` is returned with `OVERDUE` derived and legacy values mapped (see [breaking changes](#breaking-changes-progress--assignment-rework)). |
+| `listAssignmentSteps` | `userId!, assignmentId!, limit, nextToken` | `AssignmentStepConnection!` · one assignment's step snapshots, sorted by `order`. |
 
-**Progress (append-only) & media**
+> **`deleteAssignment` removes an assignment and all its steps.** Identify it by `userId`
+> + `assignmentId` (its composite key). Deletes the `Assignment` row **and every
+> `AssignmentStep` snapshot** under it, then returns the deleted `Assignment` (internal
+> storage fields stripped; `status` is derived/legacy-mapped as on reads). A missing
+> assignment for that user returns a not-found error. The **source `Task` and its
+> `TaskSteps` are never touched**. There is **no API for deleting an `AssignmentStep`
+> independently** — a step snapshot is removed only when its parent assignment is deleted
+> (its completion can be toggled with `setAssignmentStepCompletion`, nothing more).
+>
+> _Consistency note:_ identical to `deleteTask` — an assignment with **>99 step
+> snapshots** can't be deleted in one atomic transaction (DynamoDB's 100-item limit), so
+> steps are batch-deleted first and the assignment row last, making the call idempotent/
+> retryable and never leaving an orphaned `AssignmentStep`.
+>
+> ```graphql
+> mutation DeleteAssignment($input: DeleteAssignmentInput!) {
+>   deleteAssignment(input: $input) { assignmentId userId taskId status }
+> }
+> ```
+
+**Media**
 
 | Operation | Input | Returns |
 |---|---|---|
-| `createProgressEvent` | `input: { userId!, eventType!, assignmentId, taskId, timestamp, source, metadata }` | `ProgressEvent` · append-only; `timestamp` defaults to now |
-| `listProgressEventsForUser` | `userId!, assignmentId, limit, nextToken` | `ProgressEventConnection!` — optional `assignmentId` filter |
 | `createMediaUploadUrl` | `input: { taskId!, contentType!, fileName }` | `MediaUploadTarget` — see flow below |
-| `createMediaAsset` | `input: { taskId!, s3Key!, type!, mimeType!, ownerId!, size, stepId }` | `MediaAsset` — see flow below |
+| `createTaskCoverImageUploadUrl` | `input: { contentType!, fileName }` | `MediaUploadTarget!` — temporary cover-image upload; see [cover images](#task-cover-images) |
+| `createMediaAsset` | `input: { taskId!, s3Key!, type!, mimeType!, ownerId!, size }` | `MediaAsset` — initially unattached; see flow below |
+| `deleteMediaAsset` | `input: { taskId!, assetId! }` | `MediaAsset` — deletes the binary + row + dangling refs; see below |
 | `getMediaDownloadUrl` | `taskId!, assetId!` | `MediaDownloadTarget` — see flow below |
 | `listMediaForTask` | `taskId!, limit, nextToken` | `MediaAssetConnection!` |
 
 > **Media is upload-first.** Binaries live in the S3 media bucket; DynamoDB stores
-> only the `s3Key` and metadata (`type`, `mimeType`, `ownerId`, `size`, optional
-> `stepId`). Clients never need AWS credentials — they upload through a presigned URL:
+> only the `s3Key` and metadata (`type`, `mimeType`, `ownerId`, `size`). Newly created
+> media is initially unattached. Clients never need AWS credentials — they upload through
+> a presigned URL:
 >
 > 1. **`createMediaUploadUrl({ taskId, contentType, fileName? })`** → returns
 >    `{ uploadUrl, s3Key, expiresIn }`. `uploadUrl` is a short-lived (default 15 min)
@@ -416,8 +547,9 @@ fields are marked `!` and everything else is optional; see
 > 2. **`PUT` the raw file bytes to `uploadUrl`** with the same `Content-Type` you
 >    passed as `contentType` (direct browser/mobile upload to S3 — the bucket allows
 >    CORS PUT). No GraphQL, no credentials.
-> 3. **`createMediaAsset({ taskId, s3Key, type, mimeType, ownerId, size?, stepId? })`**
->    → registers the now-uploaded object's metadata so it shows up in `listMediaForTask`.
+> 3. **`createMediaAsset({ taskId, s3Key, type, mimeType, ownerId, size? })`**
+>    → registers the now-uploaded object's metadata. Attach it to one step with
+>    `updateTaskStep({ mediaAssetId })`.
 >
 > ```bash
 > # 2) upload the bytes to the presigned URL from step 1
@@ -428,6 +560,67 @@ fields are marked `!` and everything else is optional; see
 > call **`getMediaDownloadUrl(taskId, assetId)`** → `{ downloadUrl, s3Key, expiresIn }`
 > and `GET` the (short-lived) `downloadUrl`. It only signs assets that are actually
 > registered — unknown ids return a not-found error rather than signing an arbitrary key.
+
+> **`deleteMediaAsset({ taskId, assetId })`** permanently removes one media asset: its
+> **S3 binary** and its **DynamoDB row**, after first clearing every API-visible
+> reference to it — if it was the task's cover image, `Task.coverImageAssetId` is
+> cleared; if it belongs to a step, that step's `mediaAssetId` is cleared. The `Task` and
+> its `TaskSteps` are **not** deleted. Returns the deleted asset (internal storage
+> fields stripped); a missing asset returns a not-found error.
+>
+> _Consistency & sharing:_ DynamoDB and S3 aren't transactional, so references and the
+> metadata row are deleted **first**, then the S3 object — the API never points at a
+> file that's gone. The call is **idempotent/retryable** (a re-run returns not-found;
+> S3 delete is a no-op for an already-absent object). If the S3 delete fails after the
+> row is gone, the failure is **logged with `taskId`/`assetId`/`s3Key`** for a
+> retry/cleanup job (never silently ignored) and leaves only an orphaned binary, not a
+> dangling reference. **Each media asset belongs to exactly one `Task`** (it lives under
+> `TASK#<taskId>`) and is deleted with it — assets are not shared across tasks.
+
+---
+
+### Task cover images
+
+A `Task` may have **one optional cover image** (`Task.coverImageAssetId`, nullable). The
+file is an ordinary private-S3 object recorded as a `MediaAsset` (`type: IMAGE`, no
+`stepId`). Binary bytes never travel through GraphQL — the existing presigned-PUT flow is
+used, with a temporary key so it also works at **create** time (before a `taskId` exists).
+
+**Sequence (create or update):**
+
+1. **`createTaskCoverImageUploadUrl({ contentType, fileName? })`** → `{ uploadUrl, s3Key,
+   expiresIn }`. `contentType` must be `image/jpeg`, `image/png`, or `image/webp` (others
+   are rejected). `s3Key` is a server-owned **pending** key
+   (`media/pending/task-cover/<uuid>.<ext>`).
+2. **`PUT` the image bytes to `uploadUrl`** with that same `Content-Type` (direct to S3).
+3. Pass the pending `s3Key` as **`coverImageS3Key`** to **`createTask`** or
+   **`updateTask`**. The server then, server-side:
+   - rejects any key not under the pending prefix (no arbitrary keys);
+   - **`HeadObject`** verifies the *real* object — it must exist, be an allowed image
+     type, and be `0 < size ≤ 10 MB` (client-declared MIME/size are never trusted);
+   - copies it to a task-owned key (`media/<taskId>/<assetId>.<ext>`), deletes the temp
+     object, registers the `MediaAsset`, and sets `Task.coverImageAssetId`.
+4. **To display it:** call **`getMediaDownloadUrl(taskId, coverImageAssetId)`** — there is
+   no cover URL exposed directly on `Task`.
+
+```graphql
+mutation CoverUrl($input: CreateTaskCoverImageUploadUrlInput!) {
+  createTaskCoverImageUploadUrl(input: $input) { uploadUrl s3Key expiresIn }
+}
+# then: PUT bytes to uploadUrl, then createTask/updateTask with coverImageS3Key: <s3Key>
+```
+
+- **On `createTask`:** the cover `MediaAsset` row is written **in the same transaction**
+  as the `Task` + `TaskStep`s. If that write fails after the S3 copy, the copied object is
+  best-effort deleted and the original error is preserved.
+- **On `updateTask`:** supplying `coverImageS3Key` **replaces** the cover. The new asset
+  is verified, copied, and persisted (Task + new `MediaAsset`) atomically **first**; only
+  then is the **old** cover's row + S3 object removed (best-effort). Omitting
+  `coverImageS3Key` leaves the current cover unchanged. A new cover is never rolled back if
+  old-cover cleanup fails — that failure is logged (`taskId`, old `assetId`, `s3Key`) for
+  retry.
+- Abandoned pending uploads (`media/pending/task-cover/`) are expired by an **S3 lifecycle
+  rule after 24h**.
 
 ---
 
@@ -544,9 +737,57 @@ Planned but not implemented — don't build against them:
   / `INTERNAL` (see [Error handling](#error-handling)) are the intended contract, but
   resolver errors currently surface as `Lambda:Unhandled` with the cause only in
   `message`. Branch defensively until the codes are wired through.
-- **Delete** for any entity, and **update** for entities other than tasks
-  (`updateTask`) and assignment status (`updateAssignmentStatus`) — including
-  per-step editing (steps can only be created, via `createTaskStep`).
+- **Delete** exists for tasks (`deleteTask`), task steps (`deleteTaskStep`), assignments
+  (`deleteAssignment`), and media assets (`deleteMediaAsset`); there is **no standalone
+  delete for an `AssignmentStep`** (it is removed only when its parent `Assignment` is
+  deleted). **Update** exists for tasks (`updateTask`), task steps (`updateTaskStep`), and
+  assignment status (`updateAssignmentStatus`); other entities have no update yet.
 - **Report generation** — the `Report` type exists in the schema, but no query or
   mutation is exposed for it yet.
 - **Streaming AI responses** — `generateTaskSteps` is request/response only.
+
+---
+
+## Breaking changes: progress & assignment rework
+
+The `ProgressEvent`-based progress model was replaced by assignment-level status plus
+per-assignment step completion. **This is a breaking API change.**
+
+**Removed**
+
+- `ProgressEvent` type, `ProgressEventType` enum, `ProgressEventConnection`,
+  `CreateProgressEventInput`, the `createProgressEvent` mutation, and the
+  `listProgressEventsForUser` query. The `canplan-progress-<env>` Lambda and its
+  resolver wiring are gone.
+- `Assignment.active` and the `active` input on `createAssignment` /
+  `updateAssignmentStatus`.
+- The `status` input on `createAssignment` — assignments are always created `TO_DO`.
+
+**Changed — `AssignmentStatus`**
+
+- New values: `TO_DO`, `OVERDUE`, `COMPLETED`, `SKIPPED`.
+- Only `TO_DO`, `COMPLETED`, and `SKIPPED` are ever persisted. `OVERDUE` is **derived**
+  at read time — an assignment is `OVERDUE` when its persisted status is `TO_DO`, it has
+  a `dueDate`, and that `dueDate` is in the past. An assignment without a `dueDate` is
+  never `OVERDUE`. Mutations reject an attempt to set `OVERDUE`.
+
+**Added — per-assignment steps**
+
+- `AssignmentStep` is an immutable snapshot of one `TaskStep` captured into one
+  `Assignment` at creation (`assignmentId`, `taskId`, `stepId`, `order`, `text`,
+  `completed`, `completedAt`, `createdAt`, `updatedAt`).
+  Editing the `Task` template later does **not** change historical assignments.
+- `listAssignmentSteps(userId, assignmentId, …)` and
+  `setAssignmentStepCompletion(input)` (see the operations table above).
+
+**Data compatibility**
+
+- Existing `Assignment` rows with legacy statuses are mapped on read so the new enum
+  never surfaces an invalid value: `ACTIVE` → `TO_DO`, `PAUSED` → `TO_DO`,
+  `CANCELLED` → `SKIPPED`, `COMPLETED` → `COMPLETED`. A legacy `active` attribute is
+  dropped from responses.
+- Legacy assignments created before this change have **no** `AssignmentStep` rows, so
+  `listAssignmentSteps` returns empty for them. Only assignments created via the new
+  `createAssignment` carry step snapshots.
+- This is an API/code refactor only: existing `ProgressEvent` rows are **left in
+  DynamoDB** (not deleted) — they are simply no longer served by any API.

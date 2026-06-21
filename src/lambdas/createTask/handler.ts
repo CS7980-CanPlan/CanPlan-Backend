@@ -1,10 +1,14 @@
 import { randomUUID } from 'crypto';
 import { TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
-import { ENTITY, META_SK, NO_CATEGORY, stepSk, taskCategoryKey, taskPk } from '../../shared/keys';
+import { ENTITY, META_SK, mediaSk, NO_CATEGORY, stepSk, taskCategoryKey, taskPk } from '../../shared/keys';
+import { deleteS3ObjectBestEffort, prepareCoverImageAsset } from '../../shared/media';
 import { ValidationError } from '../../shared/response';
 import { normalizeSchedule } from '../../shared/schedule';
-import type { AppSyncEvent, CreateTaskInput, Task, TaskStep } from '../../shared/types';
+import type { AppSyncEvent, CreateTaskInput, MediaAsset, Task, TaskStep } from '../../shared/types';
+
+/** DynamoDB permits at most 100 writes in a transaction. */
+const MAX_TRANSACTION_ITEMS = 100;
 
 /**
  * createTask — create a reusable task template owned by a SupportPerson or
@@ -62,36 +66,77 @@ export const handler = async (event: AppSyncEvent<{ input: CreateTaskInput }>): 
       taskId,
       order: index + 1,
       text: step.text.trim(),
-      mediaRefs: step.mediaRefs,
-      expectedDuration: step.expectedDuration,
+      // Steps are created without media; it's attached later via updateTaskStep.
       createdAt: now,
       updatedAt: now,
     };
   });
 
-  await dynamo.send(
-    new TransactWriteCommand({
-      TransactItems: [
-        {
-          Put: {
-            TableName: TABLE_NAME,
-            Item: { PK: taskPk(taskId), SK: META_SK, entityType: ENTITY.TASK, ...task },
-          },
+  // A create writes one Task row, one row per step, and one more row when a cover
+  // image is supplied. Fail clearly before touching S3 or DynamoDB rather than letting
+  // DynamoDB surface its generic transaction-size error.
+  const transactionItemCount = 1 + steps.length + (input.coverImageS3Key != null ? 1 : 0);
+  if (transactionItemCount > MAX_TRANSACTION_ITEMS) {
+    const maxSteps = MAX_TRANSACTION_ITEMS - 1 - (input.coverImageS3Key != null ? 1 : 0);
+    throw new ValidationError(
+      `a task${input.coverImageS3Key != null ? ' with a cover image' : ''} may have at most ` +
+        `${maxSteps} steps (DynamoDB's ${MAX_TRANSACTION_ITEMS}-item transaction limit)`,
+    );
+  }
+
+  // Optional cover image: verify + promote the pending upload BEFORE the DB write, so
+  // an invalid image fails before any Task row is created. The MediaAsset row rides in
+  // the SAME transaction as the Task + steps (so a task never lands referencing a cover
+  // row that wasn't written).
+  let coverAsset: MediaAsset | undefined;
+  if (input.coverImageS3Key != null) {
+    coverAsset = await prepareCoverImageAsset({
+      taskId,
+      ownerId,
+      coverImageS3Key: input.coverImageS3Key,
+    });
+    task.coverImageAssetId = coverAsset.assetId;
+  }
+
+  const transactItems: Array<{ Put: { TableName: string; Item: Record<string, unknown> } }> = [
+    {
+      Put: {
+        TableName: TABLE_NAME,
+        Item: { PK: taskPk(taskId), SK: META_SK, entityType: ENTITY.TASK, ...task },
+      },
+    },
+    ...steps.map((step) => ({
+      Put: {
+        TableName: TABLE_NAME,
+        Item: { PK: taskPk(taskId), SK: stepSk(step.order), entityType: ENTITY.TASK_STEP, ...step },
+      },
+    })),
+  ];
+  if (coverAsset) {
+    transactItems.push({
+      Put: {
+        TableName: TABLE_NAME,
+        Item: {
+          PK: taskPk(taskId),
+          SK: mediaSk(coverAsset.assetId),
+          entityType: ENTITY.MEDIA_ASSET,
+          ...coverAsset,
         },
-        ...steps.map((step) => ({
-          Put: {
-            TableName: TABLE_NAME,
-            Item: {
-              PK: taskPk(taskId),
-              SK: stepSk(step.order),
-              entityType: ENTITY.TASK_STEP,
-              ...step,
-            },
-          },
-        })),
-      ],
-    }),
-  );
+      },
+    });
+  }
+
+  try {
+    await dynamo.send(new TransactWriteCommand({ TransactItems: transactItems }));
+  } catch (err) {
+    // S3 and DynamoDB can't be atomic: the cover object was already copied to its final
+    // key. Best-effort remove it so the failed create leaves nothing behind, then
+    // re-throw the ORIGINAL error.
+    if (coverAsset) {
+      await deleteS3ObjectBestEffort(coverAsset.s3Key, { event: 'createTask.coverRollback', taskId });
+    }
+    throw err;
+  }
 
   // Return the created task with the steps it just wrote (clients can also fetch
   // them later via the listTaskSteps query).

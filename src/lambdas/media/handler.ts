@@ -4,6 +4,12 @@ import { GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import { ENTITY, MEDIA_PREFIX, mediaSk, taskPk } from '../../shared/keys';
+import {
+  isAllowedImageMime,
+  ALLOWED_IMAGE_MIME_TYPES,
+  pendingCoverKey,
+  purgeMediaAsset,
+} from '../../shared/media';
 import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
 import { NotFoundError, ValidationError } from '../../shared/response';
 import { DOWNLOAD_URL_TTL_SECONDS, MEDIA_BUCKET, s3, UPLOAD_URL_TTL_SECONDS } from '../../shared/s3';
@@ -12,6 +18,8 @@ import type {
   Connection,
   CreateMediaAssetInput,
   CreateMediaUploadUrlInput,
+  CreateTaskCoverImageUploadUrlInput,
+  DeleteMediaAssetInput,
   MediaAsset,
   MediaDownloadTarget,
   MediaUploadTarget,
@@ -33,8 +41,12 @@ export const handler = async (
   switch (event.info?.fieldName) {
     case 'createMediaUploadUrl':
       return createMediaUploadUrl(args.input as CreateMediaUploadUrlInput);
+    case 'createTaskCoverImageUploadUrl':
+      return createTaskCoverImageUploadUrl(args.input as CreateTaskCoverImageUploadUrlInput);
     case 'createMediaAsset':
       return createMediaAsset(args.input as CreateMediaAssetInput);
+    case 'deleteMediaAsset':
+      return deleteMediaAsset(args.input as DeleteMediaAssetInput);
     case 'getMediaDownloadUrl':
       return getMediaDownloadUrl(args.taskId as string, args.assetId as string);
     case 'listMediaForTask':
@@ -89,6 +101,33 @@ async function createMediaUploadUrl(input: CreateMediaUploadUrlInput): Promise<M
   return { uploadUrl, s3Key, expiresIn: UPLOAD_URL_TTL_SECONDS };
 }
 
+/**
+ * Mint a presigned PUT URL for a task cover image, under the server-owned *pending*
+ * prefix. There's no taskId yet (the task may not exist), so the object lands in
+ * `media/pending/task-cover/` and createTask/updateTask promotes it to a task-owned key
+ * after verifying it. Only image content types are accepted (the upload is re-verified
+ * server-side too — this is a fast-fail, not the security boundary).
+ */
+async function createTaskCoverImageUploadUrl(
+  input: CreateTaskCoverImageUploadUrlInput,
+): Promise<MediaUploadTarget> {
+  const contentType = input?.contentType?.trim().toLowerCase();
+  if (!contentType) {
+    throw new ValidationError('contentType is required (image/jpeg, image/png, or image/webp)');
+  }
+  if (!isAllowedImageMime(contentType)) {
+    throw new ValidationError(`contentType must be one of ${ALLOWED_IMAGE_MIME_TYPES.join(', ')}`);
+  }
+
+  const s3Key = pendingCoverKey(contentType);
+  const uploadUrl = await getSignedUrl(
+    s3,
+    new PutObjectCommand({ Bucket: MEDIA_BUCKET, Key: s3Key, ContentType: contentType }),
+    { expiresIn: UPLOAD_URL_TTL_SECONDS },
+  );
+  return { uploadUrl, s3Key, expiresIn: UPLOAD_URL_TTL_SECONDS };
+}
+
 /** Best-effort file extension: prefer the fileName's, fall back to the content subtype. */
 function fileExtension(fileName: string | undefined, contentType: string): string | undefined {
   if (fileName && fileName.includes('.')) {
@@ -111,10 +150,11 @@ async function createMediaAsset(input: CreateMediaAssetInput): Promise<MediaAsse
   if (!ownerId) throw new ValidationError('ownerId is required and cannot be empty');
 
   const now = new Date().toISOString();
+  // Newly registered media is UNATTACHED (no stepId) — it is bound to a step only via
+  // updateTaskStep(mediaAssetId), or promoted to a cover image through the cover flow.
   const asset: MediaAsset = {
     assetId: randomUUID(),
     taskId,
-    stepId: input.stepId?.trim(),
     s3Key,
     type: input.type,
     mimeType,
@@ -132,6 +172,50 @@ async function createMediaAsset(input: CreateMediaAssetInput): Promise<MediaAsse
   );
 
   return asset;
+}
+
+/**
+ * deleteMediaAsset — delete one media asset's S3 binary and its metadata row, after
+ * clearing the single back-reference to it.
+ *
+ * Singular model: an asset is referenced by at most one location — the Task cover
+ * (Task.coverImageAssetId) OR one TaskStep (its mediaAssetId). purgeMediaAsset clears
+ * whichever applies (both are safe no-ops otherwise) — a single back-reference, not a list.
+ *
+ * Consistency strategy (S3 + DynamoDB are not transactional): we clear the reference and
+ * delete the DynamoDB row FIRST, then delete the S3 object. This deliberately prefers a
+ * (logged, recoverable) orphaned S3 file over a database reference to a missing file —
+ * the API never points at a binary that's gone. The operation is idempotent/retryable:
+ * a re-run after the row is deleted returns NotFound, and S3 DeleteObject is a no-op for
+ * an already-absent key. An S3 delete failure is logged with full context (never
+ * silently ignored) for a retry/cleanup job; it does not resurrect the reference.
+ */
+async function deleteMediaAsset(input: DeleteMediaAssetInput): Promise<MediaAsset> {
+  const taskId = input?.taskId?.trim();
+  const assetId = input?.assetId?.trim();
+  if (!taskId) throw new ValidationError('taskId is required and cannot be empty');
+  if (!assetId) throw new ValidationError('assetId is required and cannot be empty');
+
+  const result = await dynamo.send(
+    new GetCommand({ TableName: TABLE_NAME, Key: { PK: taskPk(taskId), SK: mediaSk(assetId) } }),
+  );
+  const asset = result.Item as MediaAsset | undefined;
+  if (!asset) throw new NotFoundError('media asset not found');
+
+  // Shared cleanup path (also used by deleteTaskStep / deleteTask): clear dangling
+  // references, delete the metadata row, then delete the S3 binary. A failed binary
+  // delete remains in the durable cleanup journal and is surfaced to the caller rather
+  // than being reported as a successful deletion.
+  const complete = await purgeMediaAsset(asset, { event: 'deleteMediaAsset' });
+  if (!complete) {
+    throw new Error(`deleteMediaAsset: media object ${assetId} could not be deleted; retry the operation`);
+  }
+
+  const out: Record<string, unknown> = { ...asset };
+  delete out.PK;
+  delete out.SK;
+  delete out.entityType;
+  return out as unknown as MediaAsset;
 }
 
 async function listMediaForTask(taskId: string, page: PageArgs): Promise<Connection<MediaAsset>> {

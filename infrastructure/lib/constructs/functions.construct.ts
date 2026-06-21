@@ -31,7 +31,6 @@ export class Functions extends Construct {
   public readonly categoriesFn: NodejsFunction;
   public readonly tasksFn: NodejsFunction;
   public readonly assignmentsFn: NodejsFunction;
-  public readonly progressFn: NodejsFunction;
   public readonly mediaFn: NodejsFunction;
   /** SystemAdmin-only list-all-by-entityType APIs (read-only). */
   public readonly adminFn: NodejsFunction;
@@ -57,17 +56,29 @@ export class Functions extends Construct {
         timeout: cdk.Duration.seconds(10),
       });
 
+    // Cover-image S3 access for the Lambdas that verify + promote a pending upload
+    // (HeadObject = s3:GetObject, CopyObject = GetObject on the source + PutObject on the
+    // destination) and clean up temp/old objects (DeleteObject). Least-privilege: only
+    // the functions that touch cover images get these, scoped to the media bucket.
+    const grantCoverImageS3 = (fn: NodejsFunction): void => {
+      fn.addEnvironment('MEDIA_BUCKET_NAME', mediaBucket.bucketName);
+      mediaBucket.grantRead(fn); // HeadObject + CopyObject source
+      mediaBucket.grantPut(fn); // CopyObject destination
+      mediaBucket.grantDelete(fn); // temp + replaced/cascaded object cleanup
+    };
+
     // ── createTask ──────────────────────────────────────────────────────────────
-    // Writes a Task #META item plus its TaskStep items in one transaction.
+    // Writes a Task #META item plus its TaskStep items (and an optional cover-image
+    // MediaAsset) in one transaction.
     this.createTaskFn = dataFn('CreateTaskFunction', 'createTask', 'createTask');
     table.grantWriteData(this.createTaskFn);
+    grantCoverImageS3(this.createTaskFn);
 
     // ── Domain Lambdas (read + write the single table, incl. its GSIs) ──────────
     this.usersFn = dataFn('UsersFunction', 'users', 'users');
     this.categoriesFn = dataFn('CategoriesFunction', 'categories', 'categories');
     this.tasksFn = dataFn('TasksFunction', 'tasks', 'tasks');
     this.assignmentsFn = dataFn('AssignmentsFunction', 'assignments', 'assignments');
-    this.progressFn = dataFn('ProgressFunction', 'progress', 'progress');
     this.mediaFn = dataFn('MediaFunction', 'media', 'media');
 
     for (const fn of [
@@ -75,7 +86,6 @@ export class Functions extends Construct {
       this.categoriesFn,
       this.tasksFn,
       this.assignmentsFn,
-      this.progressFn,
       this.mediaFn,
     ]) {
       // grantReadWriteData also covers the table's GSIs (table-arn/index/*).
@@ -86,11 +96,18 @@ export class Functions extends Construct {
     this.adminFn = dataFn('AdminFunction', 'admin', 'admin');
     table.grantReadData(this.adminFn);
 
-    // The media Lambda mints presigned S3 URLs (createMediaUploadUrl / getMediaDownloadUrl);
-    // each signed URL inherits the Lambda's s3:PutObject / s3:GetObject permission here.
+    // The media Lambda mints presigned S3 URLs (createMediaUploadUrl /
+    // createTaskCoverImageUploadUrl / getMediaDownloadUrl); each signed URL inherits the
+    // Lambda's s3:PutObject / s3:GetObject permission here. deleteMediaAsset also removes
+    // the underlying object directly, so it needs s3:DeleteObject.
     this.mediaFn.addEnvironment('MEDIA_BUCKET_NAME', mediaBucket.bucketName);
     mediaBucket.grantPut(this.mediaFn);
     mediaBucket.grantRead(this.mediaFn);
+    mediaBucket.grantDelete(this.mediaFn);
+
+    // updateTask replaces cover images (verify + promote pending upload, then clean up
+    // the old one) and deleteTask cascades to all task-owned media binaries.
+    grantCoverImageS3(this.tasksFn);
 
     // ── generateTaskSteps (Bedrock KB + RAG) ────────────────────────────────────
     this.generateTaskStepsFn = new NodejsFunction(this, 'GenerateTaskStepsFunction', {
