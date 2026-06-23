@@ -455,9 +455,9 @@ client-supplied id)
 | `listTasksByOwner` | `ownerId!, limit, nextToken` | `TaskConnection!` — `ownerId` must be the caller |
 | `listTasksByCategory` | `ownerId!, categoryId!, limit, nextToken` | `TaskConnection!` — tasks in one real category; **`categoryId` is required** and is validated (owned + exists + not deleting → `NOT_FOUND`/`VALIDATION`, never a silent empty result); `ownerId` must be the caller |
 | `updateTask` | `input: { taskId!, title, categoryId, description, scheduleRule, schedule, notificationEnabled }` | `Task` — **partial edit**; owner-only; see below |
-| `createTaskStep` | `input: { taskId!, order!, text!, description }` | `TaskStep` — **appends** one step at the end (owner-only); see below |
-| `updateTaskStep` | `input: { taskId!, stepId!, text, description, mediaAssetId, removeMedia }` | `TaskStep` — **partial edit** of one step; see below |
-| `deleteTaskStep` | `input: { taskId!, stepId! }` | `TaskStep` — the deleted step; also deletes its single media asset; see below |
+| `createTaskStep` | `input: { taskId!, order!, text!, description, media }` | `TaskStep` — **appends** one step at the end, optionally with initial type-specific media (owner-only); see below |
+| `updateTaskStep` | `input: { taskId!, stepId!, text, description, media }` | `TaskStep` — **partial edit** of one step and its type-specific media slots; see below |
+| `deleteTaskStep` | `input: { taskId!, stepId! }` | `TaskStep` — the deleted step; also deletes all its media assets; see below |
 | `reorderTaskSteps` | `input: { taskId!, steps: [{ stepId!, order! }] }` | `[TaskStep!]!` — atomically renumbers all steps; see below |
 | `deleteTask` | `taskId!` | `Task` — the deleted template (minus internal fields); cascades to all its steps + media; see below |
 
@@ -486,12 +486,11 @@ client-supplied id)
 > ```
 
 > **`updateTaskStep` is a partial edit of one step.** Identify the step by `taskId` +
-> `stepId`. **Supply at least one of `text`, `description`, `mediaAssetId`, or
-> `removeMedia: true`** — a request with none is rejected, and supplying both `mediaAssetId`
-> and `removeMedia: true` is rejected. A supplied `text` is trimmed and may **not** be
-> empty. **`description` semantics:** omitted ⇒ unchanged; explicit `null` ⇒ clears the
-> stored description; a whitespace-only string is rejected; otherwise it's trimmed and
-> stored. `stepId`, `taskId`, and `createdAt` are immutable, and `order` changes only via
+> `stepId`. **Supply at least one of `text`, `description`, or a non-empty `media` list** —
+> a request with none is rejected. A supplied `text` is trimmed and may **not** be empty.
+> **`description` semantics:** omitted ⇒ unchanged; explicit `null` ⇒ clears the stored
+> description; a whitespace-only string is rejected; otherwise it's trimmed and stored.
+> `stepId`, `taskId`, and `createdAt` are immutable, and `order` changes only via
 > `reorderTaskSteps`; `updatedAt` is bumped. A missing step returns a not-found error. To
 > remove the whole step, use `deleteTaskStep` (below).
 
@@ -524,6 +523,12 @@ client-supplied id)
 > **`reorderTaskSteps`**. A missing/foreign task returns `NOT_FOUND`/`NOT_AUTHORIZED` (no
 > orphan steps are ever created).
 >
+> A standalone create may include `media: [{ type, assetId }]` to attach existing uploaded
+> assets in the same transaction as the new step. Each type is allowed once and every entry
+> requires a non-null `assetId` of that exact type. The nested `createTask.steps` input does
+> not accept media because its task/step IDs do not exist until the create completes; upload
+> and attach those assets afterward with `updateTaskStep`.
+>
 > _Concurrency note:_ appends are optimistic-concurrency controlled by internal Task step
 > metadata. From the same prior state, exactly one simultaneous `createTaskStep` succeeds;
 > every loser receives a retryable validation/conflict error and must reload then retry. No
@@ -537,31 +542,44 @@ client-supplied id)
 > `order` is therefore preserved across pages (unlike a raw key-order scan). The same numeric
 > ordering is returned by `reorderTaskSteps`.
 
-> **A step holds at most one media asset** (`TaskStep.mediaAssetId`).
-> - **`mediaAssetId`** attaches one existing, currently-**unattached** media asset to the
->   step. It must exist under the same `taskId`, not be the Task cover image, have no
->   `stepId`, and not already be pointed at by another step — otherwise the request is
->   rejected. The asset's `stepId` and the step's `mediaAssetId` are set together
->   atomically. If the step already had an asset, the **new one is attached first, then the
->   old asset's metadata row + S3 binary are deleted**.
-> - **`removeMedia: true`** detaches and **deletes** the step's current media asset (row +
->   S3 binary).
+> **A step holds up to three media assets:** at most one `IMAGE`, one `AUDIO`, and one
+> `VIDEO`. `TaskStep.mediaAssets` returns the attached `MediaAsset` objects in that order;
+> use each `assetId` with `getMediaDownloadUrl` to obtain a viewable URL.
+>
+> Set media through `media: [{ type, assetId }]`. Each type may appear **once** in a
+> request; omitted types are unchanged.
+>
+> - A non-null `assetId` attaches a currently-unattached asset of exactly that `type`. It
+>   must belong to the same task and cannot be the Task cover. If the step already has an
+>   asset of that type, the new one is committed first and the old metadata row + S3 binary
+>   are then deleted. Assets of the other two types are preserved.
+> - `assetId: null` removes and deletes only the current asset of that type.
+> - Concurrent media edits are versioned: conflicting callers receive a retryable validation
+>   error and must reload the step. This prevents two assets of the same type on one step.
 >
 > ```graphql
 > mutation UpdateTaskStep($input: UpdateTaskStepInput!) {
->   updateTaskStep(input: $input) { stepId taskId order text description mediaAssetId updatedAt }
+>   updateTaskStep(input: $input) {
+>     stepId taskId order text description
+>     mediaAssets { assetId type mimeType stepId }
+>     updatedAt
+>   }
 > }
 > ```
 > ```json
-> { "input": { "taskId": "task-123", "stepId": "step-9", "text": "Scrub for 20 seconds", "description": "Count to 20", "mediaAssetId": "asset-7" } }
+> { "input": { "taskId": "task-123", "stepId": "step-9", "media": [
+>   { "type": "IMAGE", "assetId": "image-asset-7" },
+>   { "type": "AUDIO", "assetId": "audio-asset-3" },
+>   { "type": "VIDEO", "assetId": "video-asset-5" }
+> ] } }
 > ```
 
-> **`deleteTaskStep` removes one step and its single media asset.** Identify the step by
+> **`deleteTaskStep` removes one step and every attached media asset.** Identify the step by
 > `taskId` + `stepId` (located directly by its stable `STEP#<stepId>` key). Returns the
 > deleted `TaskStep` (internal fields stripped); a missing step returns a not-found error.
 >
-> **Media cleanup.** If the step has a `mediaAssetId`, that one asset's metadata row + S3
-> binary are deleted. Each media asset belongs to exactly one step (or the cover), so there
+> **Media cleanup.** Every asset whose `stepId` is the deleted step has its metadata row +
+> S3 binary deleted. Each media asset belongs to exactly one step (or the cover), so there
 > is nothing shared to preserve.
 >
 > **Not touched:** the `Task` itself, any other `TaskStep`, and — importantly — **any
@@ -570,11 +588,11 @@ client-supplied id)
 > snapshot the task's remaining steps. (There is still **no API to delete an
 > `AssignmentStep`** — see [assignments](#assignments--progress-tracking).)
 >
-> _Consistency note:_ uses the same media-cleanup policy as `deleteMediaAsset` (clear the
-> back-reference → delete row → delete S3 binary, DB-first, structured-logged). It is safe
-> to retry; if an S3 delete fails it does **not** silently claim success — the metadata is
-> already gone (no API-visible dangling reference) and the operation returns a retryable
-> error with the failure logged for cleanup.
+> _Consistency note:_ uses the same media-cleanup policy as `deleteMediaAsset` (delete row →
+> delete S3 binary, DB-first, structured-logged; cover references are cleared when relevant).
+> It is safe to retry; if an S3 delete fails it does **not** silently claim success — the
+> metadata is already gone and the operation returns a retryable error with the failure
+> logged for cleanup.
 >
 > ```graphql
 > mutation DeleteTaskStep($input: DeleteTaskStepInput!) {
@@ -595,8 +613,8 @@ client-supplied id)
 >
 > **Historical `Assignment`s and `AssignmentStep`s are preserved.** They are immutable
 > snapshots and **remain readable after the template is deleted** — deleting a template
-> never rewrites history. (To remove an assignment, use `deleteAssignment`; to remove a
-> single media asset, use `deleteMediaAsset`.)
+> never rewrites history. (To remove an assignment, use `deleteAssignment`; to remove one
+> individual media asset, use `deleteMediaAsset`.)
 >
 > _Consistency note:_ a task with **>99 children** exceeds DynamoDB's 100-item transaction
 > limit, so deletion is **not** a single atomic transaction. Before any `MediaAsset` row
@@ -666,8 +684,9 @@ client-supplied id)
 >    passed as `contentType` (direct browser/mobile upload to S3 — the bucket allows
 >    CORS PUT). No GraphQL, no credentials.
 > 3. **`createMediaAsset({ taskId, s3Key, type, mimeType, ownerId, size? })`**
->    → registers the now-uploaded object's metadata. Attach it to one step with
->    `updateTaskStep({ mediaAssetId })`.
+>    → registers the now-uploaded object's metadata. Attach it in a standalone
+>    `createTaskStep({ media: [{ type, assetId }] })` or later with
+>    `updateTaskStep({ media: [{ type, assetId }] })`.
 >
 > ```bash
 > # 2) upload the bytes to the presigned URL from step 1
@@ -682,8 +701,8 @@ client-supplied id)
 > **`deleteMediaAsset({ taskId, assetId })`** permanently removes one media asset: its
 > **S3 binary** and its **DynamoDB row**, after first clearing every API-visible
 > reference to it — if it was the task's cover image, `Task.coverImageAssetId` is
-> cleared; if it belongs to a step, that step's `mediaAssetId` is cleared. The `Task` and
-> its `TaskSteps` are **not** deleted. Returns the deleted asset (internal storage
+> cleared; if it belongs to a step, it no longer appears in that step's derived
+> `mediaAssets` list. The `Task` and its `TaskSteps` are **not** deleted. Returns the deleted asset (internal storage
 > fields stripped); a missing asset returns a not-found error.
 >
 > _Consistency & sharing:_ DynamoDB and S3 aren't transactional, so references and the

@@ -133,9 +133,9 @@ type TaskStep {
   text: String!
   # Optional longer description, separate from `text` and from Task.description.
   description: String
-  # At most one media asset (the singular media model). Null when the step has none.
-  # Attach/replace/remove via updateTaskStep; fetch a URL with getMediaDownloadUrl.
-  mediaAssetId: ID
+  # At most one asset of each MediaType (IMAGE, AUDIO, VIDEO). Set/replace/remove an
+  # individual type via updateTaskStep(media); fetch each binary with getMediaDownloadUrl.
+  mediaAssets: [MediaAsset!]!
   createdAt: String!
   updatedAt: String
 }
@@ -175,9 +175,8 @@ type AssignmentStep {
 type MediaAsset {
   assetId: ID!
   taskId: ID!
-  # Ownership marker for step media: set to the owning TaskStep's id when (and only when)
-  # this asset is that step's mediaAssetId. Null when the asset is a Task cover image or is
-  # temporarily unattached (uploaded but not yet assigned). Never set for cover images.
+  # Ownership marker for step media. A step may own one asset per MediaType. Null when this
+  # asset is a Task cover image or temporarily unattached. Never set for cover images.
   stepId: ID
   s3Key: String!
   type: MediaType!
@@ -337,23 +336,30 @@ input CreateTaskStepInput {
   text: String!
   # Optional longer description, separate from `text`. Trimmed when stored.
   description: String
+  # Optional initial media slots. Each entry requires a non-null assetId; types must be unique.
+  media: [SetTaskStepMediaInput!]
 }
 
-# Partial edit of one TaskStep, located by (taskId, stepId). Supply at least one of
-# `text`, `description`, `mediaAssetId`, or `removeMedia: true`. `text` is trimmed and may
-# not be empty. `description` semantics: omitted ⇒ unchanged; explicit null ⇒ clear the
-# stored description; a whitespace-only string is rejected; otherwise trimmed and stored.
-# `mediaAssetId` attaches one existing, currently-unattached media asset (replacing any
-# current one, which is then deleted). `removeMedia: true` removes and deletes the step's
-# current media asset. Supplying both `mediaAssetId` and `removeMedia: true` is rejected.
-# `stepId`, `taskId`, and `createdAt` are immutable (use reorderTaskSteps to change order).
+# Set one media-type slot on a TaskStep. An assetId attaches a currently-unattached asset of
+# exactly this type, replacing and deleting the existing asset of the same type. Explicit
+# null (or omitted) assetId removes the current asset of this type. Types may appear only
+# once per update; omitted types are unchanged.
+input SetTaskStepMediaInput {
+  type: MediaType!
+  assetId: ID
+}
+
+# Partial edit of one TaskStep, located by (taskId, stepId). Supply at least one of `text`,
+# `description`, or `media`. `text` is trimmed and may not be empty. `description` semantics:
+# omitted ⇒ unchanged; explicit null ⇒ clear; whitespace-only ⇒ rejected; otherwise trimmed
+# and stored. `media` sets/replaces/removes one or more type-specific media slots. `stepId`,
+# `taskId`, and `createdAt` are immutable (use reorderTaskSteps to change order).
 input UpdateTaskStepInput {
   taskId: ID!
   stepId: ID!
   text: String
   description: String
-  mediaAssetId: ID
-  removeMedia: Boolean
+  media: [SetTaskStepMediaInput!]
 }
 
 # One step's target position in a whole-task reorder.
@@ -371,10 +377,9 @@ input ReorderTaskStepsInput {
   steps: [ReorderTaskStepInput!]!
 }
 
-# Identifies one TaskStep for deletion. Deleting it also deletes the step's single media
-# asset (metadata row + S3 object), if any. Shared media does not exist in this model —
-# each asset belongs to exactly one step or the cover. Assignments/AssignmentSteps are
-# never touched.
+# Identifies one TaskStep for deletion. Deleting it also deletes every media asset attached
+# to the step (metadata rows + S3 objects), if any. Assets are never shared between steps or
+# the cover. Assignments/AssignmentSteps are never touched.
 input DeleteTaskStepInput {
   taskId: ID!
   stepId: ID!
@@ -412,7 +417,7 @@ input DeleteAssignmentInput {
 }
 
 # Register an uploaded object's metadata. The asset is created UNATTACHED — it is bound
-# to a step only via updateTaskStep(mediaAssetId), or used as a cover via the cover flow.
+# to a step only via updateTaskStep(media), or used as a cover via the cover flow.
 input CreateMediaAssetInput {
   taskId: ID!
   s3Key: String!
@@ -436,8 +441,8 @@ input CreateTaskCoverImageUploadUrlInput {
   fileName: String
 }
 
-# Identifies one MediaAsset to delete (its S3 binary + metadata row). Also clears the one
-# back-reference to it (Task.coverImageAssetId, or the owning TaskStep's mediaAssetId).
+# Identifies one MediaAsset to delete (its S3 binary + metadata row). It also clears a Task
+# cover reference when applicable; Step media is discovered from MediaAsset.stepId at read time.
 input DeleteMediaAssetInput {
   taskId: ID!
   assetId: ID!
@@ -558,10 +563,10 @@ type Mutation {
   # Edit an existing task template's fields (partial update). Errors if not found.
   updateTask(input: UpdateTaskInput!): Task
   createTaskStep(input: CreateTaskStepInput!): TaskStep
-  # Partial edit of one TaskStep: text, and/or attach (mediaAssetId) / remove (removeMedia)
-  # its single media asset. Errors if not found.
+  # Partial edit of one TaskStep: text, description, and/or type-specific media slots.
+  # A step may have one IMAGE, one AUDIO, and one VIDEO asset. Errors if not found.
   updateTaskStep(input: UpdateTaskStepInput!): TaskStep
-  # Delete one TaskStep and its single media asset (metadata row + S3 object), if any.
+  # Delete one TaskStep and every attached media asset (metadata rows + S3 objects), if any.
   # Historical AssignmentSteps are unaffected. Returns the deleted TaskStep.
   deleteTaskStep(input: DeleteTaskStepInput!): TaskStep
   # Atomically reorder ALL of a task's steps (must supply the complete current set).
@@ -588,8 +593,8 @@ type Mutation {
   # non-image content types. Pass the returned s3Key as coverImageS3Key to createTask/
   # updateTask, which verifies and promotes the upload to a task-owned MediaAsset.
   createTaskCoverImageUploadUrl(input: CreateTaskCoverImageUploadUrlInput!): MediaUploadTarget!
-  # Delete one MediaAsset: its S3 binary and metadata row, plus the single back-reference
-  # to it (clears Task.coverImageAssetId, or the owning TaskStep's mediaAssetId). Returns
+  # Delete one MediaAsset: its S3 binary and metadata row, plus a Task cover back-reference
+  # when applicable. Step media is resolved through MediaAsset.stepId. Returns
   # the deleted asset; NotFound if it doesn't exist. Does not delete the Task or its steps.
   deleteMediaAsset(input: DeleteMediaAssetInput!): MediaAsset
 

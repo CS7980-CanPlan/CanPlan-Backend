@@ -118,8 +118,13 @@ describe('createTask handler', () => {
       expect(step.PK).toBe(`TASK#${result.taskId}`);
       expect(step.SK).toBe(`STEP#${step.stepId}`);
       expect(step.taskId).toBe(result.taskId);
+      expect(step.mediaVersion).toBe(0);
     }
     expect(result.steps).toHaveLength(3);
+    expect(result.steps?.every((step) => Array.isArray(step.mediaAssets) && step.mediaAssets.length === 0)).toBe(
+      true,
+    );
+    expect(steps.every((step) => step.mediaAssets === undefined)).toBe(true);
     // Step metadata initialized for concurrency-safe appends: 3 steps ⇒ next append at 4.
     const meta = writtenItems().find((i) => i.SK === '#META')!;
     expect(meta.stepCount).toBe(3);

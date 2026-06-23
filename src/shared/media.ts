@@ -16,15 +16,13 @@ import {
   ENTITY,
   mediaSk,
   META_SK,
-  STEP_PREFIX,
-  stepSk,
   taskMediaCleanupSk,
   taskPk,
   TASK_MEDIA_CLEANUP_PREFIX,
 } from './keys';
 import { NotFoundError, ValidationError } from './response';
 import { MEDIA_BUCKET, s3 } from './s3';
-import type { MediaAsset, TaskStep } from './types';
+import type { MediaAsset } from './types';
 
 /** Cover images accept only these MIME types (verified via HeadObject, not the client). */
 export const ALLOWED_IMAGE_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp'] as const;
@@ -258,33 +256,13 @@ export async function clearTaskCoverReference(taskId: string, assetId: string): 
 }
 
 /**
- * Clear the single `mediaAssetId` back-reference on whichever TaskStep points at this
- * asset (one-to-one: at most one). Scans the task's steps to find the holder; each step's
- * row is keyed by its stable STEP#<stepId> sort key.
- */
-export async function clearTaskStepMediaReference(taskId: string, assetId: string): Promise<void> {
-  const steps = await queryAllItems<TaskStep>(taskPk(taskId), STEP_PREFIX);
-  const now = new Date().toISOString();
-  for (const step of steps) {
-    if (step.mediaAssetId !== assetId) continue;
-    await dynamo.send(
-      new UpdateCommand({
-        TableName: TABLE_NAME,
-        Key: { PK: taskPk(taskId), SK: stepSk(step.stepId) },
-        UpdateExpression: 'SET updatedAt = :now REMOVE mediaAssetId',
-        ExpressionAttributeValues: { ':now': now },
-      }),
-    );
-  }
-}
-
 /**
- * Fully remove one MediaAsset: clear its single back-reference (Task cover OR the owning
- * TaskStep's mediaAssetId — whichever applies; both are safe no-ops when not), delete the
- * metadata row, then best-effort delete the S3 binary. DB-first (references + row before
- * the object) so the API never points at a missing file; the S3 delete is logged for
- * retry on failure. This is the shared cleanup path for deleteMediaAsset, deleteTaskStep,
- * and step-media replacement/removal.
+ * Fully remove one MediaAsset: clear a Task-cover back-reference when applicable, delete
+ * the metadata row, then best-effort delete the S3 binary. Step media needs no reference
+ * rewrite: `TaskStep.mediaAssets` is derived from MediaAsset rows whose `stepId` matches the
+ * step. DB-first (reference + row before the object) means the API never points at a missing
+ * binary. This shared cleanup path is used for deleteMediaAsset, deleteTaskStep, and
+ * type-specific step-media replacement/removal.
  *
  * Returns whether the S3 binary was deleted — a caller that must not "silently claim all
  * cleanup succeeded" can surface a `false` (the metadata is gone, but a logged, orphaned
@@ -299,7 +277,6 @@ export async function purgeMediaAsset(
   // subsequent operation can retry from this durable key rather than losing the binary.
   await journalMediaCleanup(asset);
   await clearTaskCoverReference(taskId, assetId);
-  await clearTaskStepMediaReference(taskId, assetId);
   await dynamo.send(
     new DeleteCommand({ TableName: TABLE_NAME, Key: { PK: taskPk(taskId), SK: mediaSk(assetId) } }),
   );

@@ -61,7 +61,8 @@ export const handler = async (event: AppSyncEvent<{ input: CreateTaskInput }>): 
       text: step.text.trim(),
       // Empty/whitespace descriptions are dropped (undefined), not stored as "".
       description: description || undefined,
-      // Steps are created without media; it's attached later via updateTaskStep.
+      // Steps are created without media; type-specific assets attach later via updateTaskStep(media).
+      mediaVersion: 0,
       createdAt: now,
       updatedAt: now,
     };
@@ -169,7 +170,15 @@ export const handler = async (event: AppSyncEvent<{ input: CreateTaskInput }>): 
 
   // Return the created task with the steps it just wrote (clients can also fetch
   // them later via the listTaskSteps query).
-  return { ...task, steps };
+  // TaskStep.mediaAssets is a non-null GraphQL field; newly-created nested steps are empty.
+  return {
+    ...task,
+    steps: steps.map((step) => {
+      const out = { ...step, mediaAssets: [] };
+      delete out.mediaVersion;
+      return out;
+    }),
+  };
 };
 
 /**

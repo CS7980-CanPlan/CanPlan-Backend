@@ -151,7 +151,7 @@ async function createMediaAsset(input: CreateMediaAssetInput): Promise<MediaAsse
 
   const now = new Date().toISOString();
   // Newly registered media is UNATTACHED (no stepId) — it is bound to a step only via
-  // updateTaskStep(mediaAssetId), or promoted to a cover image through the cover flow.
+  // updateTaskStep(media), or promoted to a cover image through the cover flow.
   const asset: MediaAsset = {
     assetId: randomUUID(),
     taskId,
@@ -178,9 +178,9 @@ async function createMediaAsset(input: CreateMediaAssetInput): Promise<MediaAsse
  * deleteMediaAsset — delete one media asset's S3 binary and its metadata row, after
  * clearing the single back-reference to it.
  *
- * Singular model: an asset is referenced by at most one location — the Task cover
- * (Task.coverImageAssetId) OR one TaskStep (its mediaAssetId). purgeMediaAsset clears
- * whichever applies (both are safe no-ops otherwise) — a single back-reference, not a list.
+ * An asset is referenced by at most one location — the Task cover (Task.coverImageAssetId)
+ * OR one TaskStep (MediaAsset.stepId). Step responses derive their media lists from these
+ * asset rows, so purgeMediaAsset only clears a cover back-reference when applicable.
  *
  * Consistency strategy (S3 + DynamoDB are not transactional): we clear the reference and
  * delete the DynamoDB row FIRST, then delete the S3 object. This deliberately prefers a

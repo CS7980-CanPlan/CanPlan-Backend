@@ -139,8 +139,10 @@ export interface TaskStep {
   text: string;
   /** Optional longer description, separate from `text` and from `Task.description`. */
   description?: string;
-  /** At most one media asset (singular media model); absent when the step has none. */
-  mediaAssetId?: string;
+  /** API-only hydrated assets: one per MediaType, sorted IMAGE → AUDIO → VIDEO. */
+  mediaAssets?: MediaAsset[];
+  /** Internal optimistic-concurrency counter for type-specific media updates. */
+  mediaVersion?: number;
   createdAt: string;
   updatedAt?: string;
 }
@@ -304,17 +306,18 @@ export interface CreateTaskStepInput {
   text: string;
   /** Optional longer description, separate from `text`. Trimmed when stored. */
   description?: string;
+  /** Optional initial type-specific media; every entry must supply a non-null asset id. */
+  media?: StepMediaUpdateInput[];
 }
 
 /**
  * Partial edit of one TaskStep, located by (taskId, stepId). At least one of `text`,
- * `description`, `mediaAssetId`, or `removeMedia: true` must be supplied. `text` is
- * trimmed and must be non-empty. `description` semantics: omitted ⇒ unchanged; explicit
- * `null` ⇒ clear the stored description; a whitespace-only string is rejected; otherwise
- * trimmed and stored. `mediaAssetId` attaches one existing, currently-unattached media
- * asset (replacing any current one). `removeMedia: true` removes+deletes the current
- * asset. Supplying both `mediaAssetId` and `removeMedia: true` is rejected. `stepId`,
- * `taskId`, and `createdAt` are immutable (use reorderTaskSteps to change `order`).
+ * `description`, or `media` must be supplied. `text` is trimmed and must be non-empty.
+ * `description` semantics: omitted ⇒ unchanged; explicit `null` ⇒ clear; whitespace-only
+ * ⇒ rejected; otherwise trimmed and stored. Each `media` entry sets one media type: a
+ * non-null asset id attaches a currently-unattached matching asset (replacing that type's
+ * prior asset), while null removes the current asset of that type. `stepId`, `taskId`, and
+ * `createdAt` are immutable (use reorderTaskSteps to change `order`).
  */
 export interface UpdateTaskStepInput {
   taskId: string;
@@ -322,14 +325,19 @@ export interface UpdateTaskStepInput {
   text?: string;
   /** Omitted ⇒ unchanged; `null` ⇒ clear; whitespace-only ⇒ rejected; else trimmed + stored. */
   description?: string | null;
-  mediaAssetId?: string;
-  removeMedia?: boolean;
+  media?: StepMediaUpdateInput[];
+}
+
+/** One type-specific TaskStep media change; types must be unique within one request. */
+export interface StepMediaUpdateInput {
+  type: MediaType;
+  assetId?: string | null;
 }
 
 /**
  * Identifies one TaskStep for deletion, located by (taskId, stepId) — the storage SK is
- * STEP#<stepId>. Deleting a step also cleans up the single media asset exclusive to it
- * (see the tasks handler).
+ * STEP#<stepId>. Deleting a step also cleans up every media asset attached to it (see the
+ * tasks handler).
  */
 export interface DeleteTaskStepInput {
   taskId: string;
@@ -386,7 +394,7 @@ export interface DeleteAssignmentInput {
 }
 
 // Newly registered media is always created UNATTACHED — there is no stepId here; an asset
-// is bound to a step only via updateTaskStep(mediaAssetId) (or used as a cover image).
+// is bound to a step only via updateTaskStep(media) (or used as a cover image).
 export interface CreateMediaAssetInput {
   taskId: string;
   s3Key: string;
