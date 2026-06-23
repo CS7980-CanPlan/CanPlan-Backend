@@ -245,6 +245,17 @@ input CreateMyUserProfileInput {
   accessibilitySettings: AWSJSON
 }
 
+# Partial update of the signed-in caller's OWN profile. The owner is derived from the
+# Cognito identity — there is no userId. Only displayName and accessibilitySettings may be
+# changed here; userId, email, role, organizationId, defaultCategoryId, and timestamps are
+# not editable. Supply at least one field. displayName: omitted ⇒ unchanged; otherwise
+# trimmed and may not be empty/whitespace. accessibilitySettings: omitted ⇒ unchanged;
+# explicit null ⇒ cleared; a value ⇒ FULL replacement of the stored settings (never merged).
+input UpdateMyUserProfileInput {
+  displayName: String
+  accessibilitySettings: AWSJSON
+}
+
 input CreateSupportLinkInput {
   supporterId: ID!
   primaryUserId: ID!
@@ -545,6 +556,11 @@ type Mutation {
   # Create the signed-in caller's own profile. userId, email, and role are taken
   # from the Cognito session (role derived from group membership), not the input.
   createUserProfile(input: CreateMyUserProfileInput!): UserProfile
+  # Partial update of the caller's OWN profile (owner derived from the Cognito identity).
+  # Only displayName and accessibilitySettings are editable; accessibilitySettings is a full
+  # replacement, not a merge. Errors (NotFound) if the profile doesn't exist — it never
+  # creates one. organizationId, role, email, etc. cannot be changed here.
+  updateMyUserProfile(input: UpdateMyUserProfileInput!): UserProfile!
   createSupportLink(input: CreateSupportLinkInput!): SupportLink
 
   # Create one of the caller's own task categories (owner derived from identity).

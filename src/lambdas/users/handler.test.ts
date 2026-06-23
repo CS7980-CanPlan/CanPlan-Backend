@@ -256,6 +256,175 @@ describe('users handler — UserProfile', () => {
   });
 });
 
+describe('users handler — updateMyUserProfile', () => {
+  // The stored row a conditional UpdateCommand returns via ReturnValues: ALL_NEW.
+  const storedProfile = (overrides: Record<string, unknown> = {}) => ({
+    PK: 'USER#sub-1',
+    SK: '#PROFILE',
+    entityType: 'UserProfile',
+    userId: 'sub-1',
+    role: 'PRIMARY_USER',
+    email: 'me@example.com',
+    organizationId: 'org-1',
+    defaultCategoryId: 'def-1',
+    displayName: 'Old name',
+    createdAt: 'orig-created',
+    updatedAt: 'orig-updated',
+    ...overrides,
+  });
+
+  it('updates only displayName (trimmed), leaving accessibilitySettings untouched', async () => {
+    mockSend.mockResolvedValueOnce({
+      Attributes: storedProfile({ displayName: 'New name' }),
+    });
+    const result = (await handler(
+      event('updateMyUserProfile', { input: { displayName: '  New name  ' } }, caller(['PrimaryUser'], 'sub-1')),
+    )) as unknown as Record<string, unknown>;
+
+    const cmd = lastInput();
+    expect(cmd.Key).toEqual({ PK: 'USER#sub-1', SK: '#PROFILE' });
+    expect(cmd.ConditionExpression).toBe('attribute_exists(PK)');
+    // displayName set (trimmed), settings not referenced at all.
+    expect(cmd.UpdateExpression).toContain('displayName = :displayName');
+    expect(cmd.UpdateExpression).not.toContain('accessibilitySettings');
+    expect(cmd.ExpressionAttributeValues[':displayName']).toBe('New name');
+    // Returned row is stripped of internal storage attributes.
+    expect(result.PK).toBeUndefined();
+    expect(result.SK).toBeUndefined();
+    expect(result.entityType).toBeUndefined();
+    expect(result.displayName).toBe('New name');
+  });
+
+  it('updates only accessibilitySettings, fully replacing the stored value (no merge)', async () => {
+    const settings = { fontScale: 1.5, highContrast: true };
+    mockSend.mockResolvedValueOnce({ Attributes: storedProfile({ accessibilitySettings: settings }) });
+    await handler(
+      event('updateMyUserProfile', { input: { accessibilitySettings: settings } }, caller(['PrimaryUser'], 'sub-1')),
+    );
+
+    const cmd = lastInput();
+    expect(cmd.UpdateExpression).toContain('accessibilitySettings = :settings');
+    expect(cmd.UpdateExpression).not.toContain('displayName');
+    // The entire value is written as-is — no deep-merge expression.
+    expect(cmd.ExpressionAttributeValues[':settings']).toEqual(settings);
+  });
+
+  it('clears accessibilitySettings with an explicit null (REMOVE)', async () => {
+    mockSend.mockResolvedValueOnce({ Attributes: storedProfile() });
+    await handler(
+      event('updateMyUserProfile', { input: { accessibilitySettings: null } }, caller(['PrimaryUser'], 'sub-1')),
+    );
+
+    const cmd = lastInput();
+    expect(cmd.UpdateExpression).toContain('REMOVE accessibilitySettings');
+    expect(cmd.ExpressionAttributeValues[':settings']).toBeUndefined();
+  });
+
+  it('leaves omitted fields unchanged — only updatedAt + the supplied field are written', async () => {
+    mockSend.mockResolvedValueOnce({ Attributes: storedProfile({ displayName: 'Just name' }) });
+    await handler(
+      event('updateMyUserProfile', { input: { displayName: 'Just name' } }, caller(['PrimaryUser'], 'sub-1')),
+    );
+
+    const cmd = lastInput();
+    // SET updatedAt + displayName; nothing else, no REMOVE clause.
+    expect(cmd.UpdateExpression).toBe('SET updatedAt = :now, displayName = :displayName');
+    expect(Object.keys(cmd.ExpressionAttributeValues).sort()).toEqual([':displayName', ':now']);
+  });
+
+  it('rejects an empty input (no editable field supplied)', async () => {
+    await expect(
+      handler(event('updateMyUserProfile', { input: {} }, caller(['PrimaryUser'], 'sub-1'))),
+    ).rejects.toThrow('at least one of displayName or accessibilitySettings');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('rejects a whitespace-only displayName', async () => {
+    await expect(
+      handler(
+        event('updateMyUserProfile', { input: { displayName: '   ' } }, caller(['PrimaryUser'], 'sub-1')),
+      ),
+    ).rejects.toThrow('displayName cannot be empty');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('rejects an explicit null displayName (empty)', async () => {
+    await expect(
+      handler(
+        event(
+          'updateMyUserProfile',
+          { input: { displayName: null } as Record<string, unknown> },
+          caller(['PrimaryUser'], 'sub-1'),
+        ),
+      ),
+    ).rejects.toThrow('displayName cannot be empty');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('returns NotFound when the profile does not exist (conditional check fails, never creates)', async () => {
+    const condFail = Object.assign(new Error('conditional'), {
+      name: 'ConditionalCheckFailedException',
+    });
+    mockSend.mockRejectedValueOnce(condFail);
+    await expect(
+      handler(
+        event('updateMyUserProfile', { input: { displayName: 'New' } }, caller(['PrimaryUser'], 'sub-1')),
+      ),
+    ).rejects.toThrow(/not found/);
+    // It is an UpdateCommand guarded so it can never create a row.
+    expect(lastInput().ConditionExpression).toBe('attribute_exists(PK)');
+  });
+
+  it('rejects an unauthenticated caller (no sub)', async () => {
+    await expect(
+      handler(event('updateMyUserProfile', { input: { displayName: 'New' } }, undefined)),
+    ).rejects.toThrow('authenticated user is required');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('derives the caller from the Cognito sub — never a client-supplied userId', async () => {
+    mockSend.mockResolvedValueOnce({ Attributes: storedProfile() });
+    await handler(
+      event(
+        'updateMyUserProfile',
+        { input: { displayName: 'New', userId: 'victim' } as Record<string, unknown> },
+        caller(['PrimaryUser'], 'sub-me'),
+      ),
+    );
+    expect(lastInput().Key).toEqual({ PK: 'USER#sub-me', SK: '#PROFILE' });
+  });
+
+  it('never changes organizationId, role, email, defaultCategoryId, or createdAt', async () => {
+    mockSend.mockResolvedValueOnce({ Attributes: storedProfile({ displayName: 'New name' }) });
+    await handler(
+      event(
+        'updateMyUserProfile',
+        {
+          // An attacker tries to slip protected fields into the input — they are not part
+          // of the input type and must never appear in the write expression.
+          input: {
+            displayName: 'New name',
+            organizationId: 'evil-org',
+            role: 'ORG_ADMIN',
+            email: 'evil@example.com',
+            defaultCategoryId: 'evil-cat',
+            createdAt: 'evil-time',
+          } as Record<string, unknown>,
+        },
+        caller(['PrimaryUser'], 'sub-1'),
+      ),
+    );
+
+    const cmd = lastInput();
+    // Only updatedAt + displayName are written; no protected field appears.
+    expect(cmd.UpdateExpression).toBe('SET updatedAt = :now, displayName = :displayName');
+    for (const field of ['organizationId', 'role', 'email', 'defaultCategoryId', 'createdAt']) {
+      expect(cmd.UpdateExpression).not.toContain(field);
+      expect(cmd.ExpressionAttributeValues[`:${field}`]).toBeUndefined();
+    }
+  });
+});
+
 describe('users handler — SupportLink', () => {
   it('createSupportLink writes SUPPORTER#<id>/USER#<id> carrying the supporterIndex fields (supporterId, userId)', async () => {
     await handler(

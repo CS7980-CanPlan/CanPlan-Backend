@@ -364,6 +364,7 @@ fields are marked `!` and everything else is optional; see
 | Operation | Input | Returns |
 |---|---|---|
 | `createUserProfile` | `input: { displayName!, organizationId, accessibilitySettings }` (`CreateMyUserProfileInput`) | `UserProfile` — creates the **caller's own** profile **and its default category** atomically; `displayName` is required, while `userId` (Cognito `sub`), `email`, `role`, and `defaultCategoryId` are derived server-side and cannot be supplied by the client |
+| `updateMyUserProfile` | `input: { displayName, accessibilitySettings }` (`UpdateMyUserProfileInput`) | `UserProfile!` — **partial** update of the **caller's own** profile; see below |
 | `getUserProfile` | `userId!` | `UserProfile` · `null` if not found |
 | `listUsersByOrganization` | `organizationId!, limit, nextToken` | `UserProfileConnection!` — **roster only**: just `userId`, `displayName`, `role` are populated (orgIndex projection); other fields are `null` |
 | `createSupportLink` | `input: { supporterId!, primaryUserId!, status, permissions }` | `SupportLink` · `status` defaults to `PENDING` |
@@ -390,6 +391,26 @@ fields are marked `!` and everything else is optional; see
 > re-call **preserves** the existing `defaultCategoryId` and never creates a second default
 > category. So guard it behind the `getUserProfile` null-check above, or treat a second
 > call as a deliberate full replace of the editable fields.
+>
+> **`updateMyUserProfile` semantics.** A **partial update** of the **caller's own** profile
+> only — the owner is the Cognito `sub`, never a client-supplied `userId`, so a caller can
+> only edit their own row. Unlike `createUserProfile`, it **never creates** a profile or a
+> default category: if no profile exists it returns **NotFound** (the write is conditioned on
+> the row existing). Only **`displayName`** and **`accessibilitySettings`** are editable — every
+> other field (`userId`, `email`, `role`, **`organizationId`**, `defaultCategoryId`,
+> `createdAt`) is left untouched and **cannot be changed through this mutation**. Supply at
+> least one of the two editable fields (an empty input is rejected). Per-field rules:
+>
+> - **`displayName`** — omitted ⇒ unchanged; otherwise it is **trimmed**, and `null`, empty,
+>   or whitespace-only values are rejected.
+> - **`accessibilitySettings`** — omitted ⇒ unchanged; explicit **`null`** ⇒ the field is
+>   **cleared**; a non-null value ⇒ a **full replacement** of the stored settings — it is
+>   **not** deep-merged with the previous value. As elsewhere, this is an `AWSJSON` field:
+>   send `JSON.stringify(settings)` and `JSON.parse` it back off the returned profile (see
+>   [AWSJSON fields](#awsjson-fields--encoding-foot-gun)).
+>
+> The server also stamps a fresh `updatedAt`. Use this for ordinary profile edits; use
+> `createUserProfile` only for first-run creation (or a deliberate full replace).
 >
 > **`createSupportLink` semantics.** Same shape: an unconditional put keyed on
 > `(supporterId, primaryUserId)`. Re-creating the same pair **overwrites** the prior

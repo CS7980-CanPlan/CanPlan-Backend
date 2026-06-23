@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { GetCommand, PutCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
+import { GetCommand, PutCommand, TransactWriteCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { requireCaller } from '../../shared/authz';
 import { getOwnedCategory } from '../../shared/category';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
@@ -16,7 +16,7 @@ import {
   userPk,
 } from '../../shared/keys';
 import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
-import { ValidationError } from '../../shared/response';
+import { NotFoundError, ValidationError } from '../../shared/response';
 import { roleFromIdentity } from '../../shared/roles';
 import type {
   AppSyncEvent,
@@ -26,6 +26,7 @@ import type {
   CreateMyUserProfileInput,
   CreateSupportLinkInput,
   SupportLink,
+  UpdateMyUserProfileInput,
   UserProfile,
 } from '../../shared/types';
 
@@ -43,6 +44,8 @@ export const handler = async (
   switch (event.info?.fieldName) {
     case 'createUserProfile':
       return createMyUserProfile(event.identity, args.input as CreateMyUserProfileInput);
+    case 'updateMyUserProfile':
+      return updateMyUserProfile(event.identity, args.input as UpdateMyUserProfileInput);
     case 'getUserProfile':
       return getUserProfile(args.userId as string);
     case 'listUsersByOrganization':
@@ -236,6 +239,93 @@ async function assertValidDefaultCategory(userId: string, defaultCategoryId: str
       `profile's defaultCategoryId (${defaultCategoryId}) does not point at a valid default ` +
         'category; run the category migration to repair it',
     );
+  }
+}
+
+/** Strip internal storage attributes (PK/SK/entityType) before returning a profile. */
+function stripProfile(item: Record<string, unknown>): UserProfile {
+  const out = { ...item };
+  delete out.PK;
+  delete out.SK;
+  delete out.entityType;
+  return out as unknown as UserProfile;
+}
+
+/**
+ * Partial update of the SIGNED-IN caller's OWN profile. The caller is derived from the
+ * Cognito `sub` (never a client-supplied userId), so a caller can only edit their own row.
+ *
+ * Distinct from createUserProfile: this NEVER creates a profile or a default category, NEVER
+ * touches role/email/organizationId/defaultCategoryId/createdAt/keys/entityType, and is a
+ * targeted UpdateCommand (not a full-item Put) so every untouched field is preserved. Only
+ * `displayName` and `accessibilitySettings` are editable:
+ *  - `displayName`: omitted ⇒ unchanged; otherwise trimmed (null/empty/whitespace rejected).
+ *  - `accessibilitySettings`: omitted ⇒ unchanged; explicit `null` ⇒ cleared (REMOVE); a
+ *    non-null value ⇒ FULL replacement of the stored value (never deep-merged). It arrives
+ *    already parsed from the AWSJSON argument and is stored as-is; AppSync re-serializes it
+ *    to an AWSJSON string on the way out.
+ *
+ * At least one editable field must be supplied. The write is conditioned on the profile
+ * existing (`attribute_exists(PK)`), so it can never create a new row; a missing profile
+ * (or one removed concurrently) surfaces as NotFoundError.
+ */
+async function updateMyUserProfile(
+  identity: AppSyncIdentity | undefined,
+  input: UpdateMyUserProfileInput,
+): Promise<UserProfile> {
+  const userId = requireCaller(identity);
+
+  const displayNameKeyPresent = input?.displayName !== undefined;
+  const settingsKeyPresent = input?.accessibilitySettings !== undefined;
+  if (!displayNameKeyPresent && !settingsKeyPresent) {
+    throw new ValidationError(
+      'at least one of displayName or accessibilitySettings must be supplied',
+    );
+  }
+
+  const now = new Date().toISOString();
+  const setParts = ['updatedAt = :now'];
+  const removeParts: string[] = [];
+  const values: Record<string, unknown> = { ':now': now };
+
+  if (displayNameKeyPresent) {
+    const displayName = input.displayName?.trim();
+    if (!displayName) throw new ValidationError('displayName cannot be empty');
+    setParts.push('displayName = :displayName');
+    values[':displayName'] = displayName;
+  }
+
+  if (settingsKeyPresent) {
+    // Explicit null clears the field; any other value fully replaces the stored settings.
+    if (input.accessibilitySettings === null) {
+      removeParts.push('accessibilitySettings');
+    } else {
+      setParts.push('accessibilitySettings = :settings');
+      values[':settings'] = input.accessibilitySettings;
+    }
+  }
+
+  let updateExpression = `SET ${setParts.join(', ')}`;
+  if (removeParts.length) updateExpression += ` REMOVE ${removeParts.join(', ')}`;
+
+  try {
+    const result = await dynamo.send(
+      new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: { PK: userPk(userId), SK: PROFILE_SK },
+        UpdateExpression: updateExpression,
+        // Never create a profile row — the update only applies to an existing one.
+        ConditionExpression: 'attribute_exists(PK)',
+        ExpressionAttributeValues: values,
+        ReturnValues: 'ALL_NEW',
+      }),
+    );
+    return stripProfile(result.Attributes as Record<string, unknown>);
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
+      throw new NotFoundError(`profile for user ${userId} not found`);
+    }
+    throw err;
   }
 }
 

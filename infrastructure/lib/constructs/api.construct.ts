@@ -85,6 +85,7 @@ export class Api extends Construct {
     // UserProfile + SupportLink.
     wire('UsersDataSource', props.usersFn, [
       { typeName: 'Mutation', fieldName: 'createUserProfile' },
+      { typeName: 'Mutation', fieldName: 'updateMyUserProfile' },
       { typeName: 'Mutation', fieldName: 'createSupportLink' },
       { typeName: 'Query', fieldName: 'getUserProfile' },
       { typeName: 'Query', fieldName: 'listUsersByOrganization' },

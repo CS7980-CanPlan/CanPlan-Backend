@@ -206,6 +206,20 @@ export interface CreateMyUserProfileInput {
   accessibilitySettings?: Record<string, unknown>;
 }
 
+/**
+ * Partial update of the caller's OWN profile. The owner is derived from the Cognito
+ * identity (never client-supplied), so there is no userId — and userId, email, role,
+ * organizationId, defaultCategoryId, and timestamps are intentionally absent: they cannot
+ * be changed here. At least one of `displayName`/`accessibilitySettings` must be supplied.
+ * `displayName`: omitted ⇒ unchanged; otherwise trimmed and may not be empty/whitespace.
+ * `accessibilitySettings`: omitted ⇒ unchanged; explicit `null` ⇒ cleared; a non-null value
+ * ⇒ FULL replacement of the stored settings (never deep-merged).
+ */
+export interface UpdateMyUserProfileInput {
+  displayName?: string | null;
+  accessibilitySettings?: Record<string, unknown> | null;
+}
+
 export interface CreateSupportLinkInput {
   supporterId: string;
   primaryUserId: string;
