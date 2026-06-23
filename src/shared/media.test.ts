@@ -109,11 +109,17 @@ describe('prepareCoverImageAsset', () => {
     expect(asset.s3Key).toBe(`media/t1/${asset.assetId}.png`);
 
     // Verify → copy to final → delete temp.
-    expect(sentCommands()).toEqual(['HeadObjectCommand', 'CopyObjectCommand', 'DeleteObjectCommand']);
+    expect(sentCommands()).toEqual([
+      'HeadObjectCommand',
+      'CopyObjectCommand',
+      'DeleteObjectCommand',
+    ]);
     const copy = mockSend.mock.calls.find((c) => c[0].constructor.name === 'CopyObjectCommand')![0];
     expect(copy.input.Key).toBe(asset.s3Key);
     expect(copy.input.CopySource).toBe(`canplan-media-test/${PENDING}`);
-    const del = mockSend.mock.calls.find((c) => c[0].constructor.name === 'DeleteObjectCommand')![0];
+    const del = mockSend.mock.calls.find(
+      (c) => c[0].constructor.name === 'DeleteObjectCommand',
+    )![0];
     expect(del.input.Key).toBe(PENDING); // temp object cleaned up
   });
 
@@ -122,7 +128,8 @@ describe('prepareCoverImageAsset', () => {
       if (cmd.constructor.name === 'HeadObjectCommand') {
         return Promise.resolve({ ContentType: 'image/jpeg', ContentLength: 10 });
       }
-      if (cmd.constructor.name === 'DeleteObjectCommand') return Promise.reject(new Error('s3 down'));
+      if (cmd.constructor.name === 'DeleteObjectCommand')
+        return Promise.reject(new Error('s3 down'));
       return Promise.resolve({});
     });
     const errSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
@@ -168,7 +175,9 @@ describe('clearTaskCoverReference', () => {
   });
 
   it('swallows ConditionalCheckFailed (asset is not the cover)', async () => {
-    mockDynamo.mockRejectedValueOnce(Object.assign(new Error('x'), { name: 'ConditionalCheckFailedException' }));
+    mockDynamo.mockRejectedValueOnce(
+      Object.assign(new Error('x'), { name: 'ConditionalCheckFailedException' }),
+    );
     await expect(clearTaskCoverReference('t1', 'a1')).resolves.toBeUndefined();
   });
 
@@ -192,7 +201,7 @@ describe('clearTaskStepMediaReference', () => {
 
     const updates = mockDynamo.mock.calls.map((c) => c[0].input).filter((i) => i.UpdateExpression);
     expect(updates).toHaveLength(1);
-    expect(updates[0].Key).toEqual({ PK: 'TASK#t1', SK: 'STEP#001' });
+    expect(updates[0].Key).toEqual({ PK: 'TASK#t1', SK: 'STEP#s1' });
     expect(updates[0].UpdateExpression).toBe('SET updatedAt = :now REMOVE mediaAssetId');
   });
 
@@ -224,7 +233,9 @@ describe('purgeMediaAsset', () => {
     const inputs = mockDynamo.mock.calls.map((c) => c[0].input);
     expect(inputs.some((i) => i.Item?.SK === 'CLEANUP_MEDIA#a1')).toBe(true);
     expect(inputs.some((i) => i.Key?.SK === 'CLEANUP_MEDIA#a1')).toBe(true);
-    const s3Del = mockSend.mock.calls.find((c) => c[0].constructor.name === 'DeleteObjectCommand')![0];
+    const s3Del = mockSend.mock.calls.find(
+      (c) => c[0].constructor.name === 'DeleteObjectCommand',
+    )![0];
     expect(s3Del.input.Key).toBe('media/t1/a1.png');
   });
 
@@ -235,7 +246,9 @@ describe('purgeMediaAsset', () => {
     const ok = await purgeMediaAsset(asset, { event: 'deleteTaskStep' });
     expect(ok).toBe(false);
     // Row still deleted (DB-first); failure logged with context for retry.
-    expect(mockDynamo.mock.calls.map((c) => c[0]).some((c) => c.constructor.name === 'DeleteCommand')).toBe(true);
+    expect(
+      mockDynamo.mock.calls.map((c) => c[0]).some((c) => c.constructor.name === 'DeleteCommand'),
+    ).toBe(true);
     expect(errSpy.mock.calls[0][0]).toContain('media/t1/a1.png');
     // The journal survives, preserving the S3 key for a later retry.
     const inputs = mockDynamo.mock.calls.map((c) => c[0].input);
@@ -254,7 +267,10 @@ describe('retryTaskMediaCleanup', () => {
     await expect(retryTaskMediaCleanup('t1', { event: 'retry-test' })).resolves.toBe(true);
 
     const inputs = mockDynamo.mock.calls.map((c) => c[0].input);
-    expect(inputs[0].ExpressionAttributeValues).toEqual({ ':pk': 'TASK#t1', ':prefix': 'CLEANUP_MEDIA#' });
+    expect(inputs[0].ExpressionAttributeValues).toEqual({
+      ':pk': 'TASK#t1',
+      ':prefix': 'CLEANUP_MEDIA#',
+    });
     expect(inputs.some((i) => i.Key?.SK === 'CLEANUP_MEDIA#a1')).toBe(true);
   });
 

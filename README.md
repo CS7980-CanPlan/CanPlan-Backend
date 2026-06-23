@@ -18,9 +18,9 @@ AssignmentStep, MediaAsset, Report. The item-key conventions live in
 | --------- | ---- | --------------- |
 | `healthCheck` | Query | AppSync none data source |
 | `createTask` | Mutation | `canplan-createTask-<env>` Lambda (writes Task + steps atomically) |
-| `createUserProfile`, `createSupportLink`, `getUserProfile`, `listUsersByOrganization`, `listPrimaryUsersBySupporter` | Query/Mutation | `canplan-users-<env>` Lambda + DynamoDB |
-| `createCategory`, `listCategoriesByOwner` | Query/Mutation | `canplan-categories-<env>` Lambda + DynamoDB |
-| `getTask`, `listTaskSteps`, `listTasksByOwner`, `listTasksByCategory`, `updateTask`, `createTaskStep`, `updateTaskStep`, `deleteTaskStep`, `deleteTask` | Query/Mutation | `canplan-tasks-<env>` Lambda + DynamoDB + S3 (media cleanup) |
+| `createUserProfile`, `createSupportLink`, `getUserProfile`, `listUsersByOrganization`, `listPrimaryUsersBySupporter` | Query/Mutation | `canplan-users-<env>` Lambda + DynamoDB (createUserProfile also creates the user's default category atomically) |
+| `createCategory`, `updateCategory`, `deleteCategory`, `listMyCategories` | Query/Mutation | `canplan-categories-<env>` Lambda + DynamoDB (owner derived from the Cognito identity; deleteCategory reparents tasks to the default category) |
+| `getTask`, `listTaskSteps`, `listTasksByOwner`, `listTasksByCategory`, `updateTask`, `createTaskStep`, `updateTaskStep`, `deleteTaskStep`, `reorderTaskSteps`, `deleteTask` | Query/Mutation | `canplan-tasks-<env>` Lambda + DynamoDB + S3 (media cleanup) |
 | `createAssignment`, `updateAssignmentStatus`, `setAssignmentStepCompletion`, `deleteAssignment`, `listAssignmentsForUser`, `listAssignmentSteps` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB |
 | `createMediaUploadUrl`, `createTaskCoverImageUploadUrl`, `createMediaAsset`, `deleteMediaAsset`, `getMediaDownloadUrl`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB + S3 media bucket (presigned upload/download, cover images, cascade delete) |
 | `listAllUsers`, `listAllTasks` | Query | `canplan-admin-<env>` Lambda + DynamoDB `entityTypeIndex` (SystemAdmin only, paginated) |
@@ -49,8 +49,13 @@ The only fields with auth directives:
 | everything else | default Cognito User Pool (any signed-in user) |
 
 The frontend needs the `UserPoolId` and `UserPoolClientId` deploy outputs to run the
-Cognito sign-in flow. Per-role/owner authorization on the domain operations (e.g.
-"only the task owner may edit it") is not enforced yet.
+Cognito sign-in flow. **Task and Category operations are owner-scoped** — every
+`getTask`/`list*`/`updateTask`/`deleteTask`/`*TaskStep`/`reorderTaskSteps` and all category
+operations require the caller's Cognito `sub` to equal the resource's `ownerId` (strict
+self-ownership via [src/shared/authz.ts](src/shared/authz.ts); a foreign owner is rejected).
+Per-role/delegated authorization (e.g. a support person acting for a primary user) and
+owner checks on the remaining profile/assignment/support-link operations are **not enforced
+yet**.
 
 Self-registered users who verify their email and confirm sign-up are automatically
 added to the `PrimaryUser` group — a Cognito Post Confirmation trigger
@@ -66,6 +71,24 @@ creates only the **caller's own** profile: `userId` (Cognito `sub`), `email`, an
 are taken from the authenticated session — clients send only `displayName`,
 `organizationId`, and `accessibilitySettings` (`CreateMyUserProfileInput`); `displayName`
 is required.
+
+`createUserProfile` also creates the user's **default category** (`name: "No Category"`,
+`isDefault: true`) — a real Category row with its own UUID — in the same transaction, and
+stores its id on the profile (`defaultCategoryId`). Every Task belongs to a real Category;
+one created without an explicit `categoryId` is filed under this default. The default
+cannot be renamed or deleted. **Categories are private to their owner:** `createCategory`,
+`updateCategory`, `deleteCategory`, and `listMyCategories` all derive the owner from the
+Cognito identity and never accept a client-supplied owner id. Likewise `createTask` derives
+the task owner from the identity. Before using a profile's default category, runtime code
+strongly reads and verifies the profile pointer, owner, exact `No Category` name,
+`isDefault: true`, and that it is not being deleted; an invalid legacy row fails clearly
+until the migration is applied.
+
+Standalone `createTaskStep` is append-only and concurrency-safe. Task metadata
+(`stepCount`, `stepVersion`, `nextStepOrder`) serializes appends: at most 99 steps are
+allowed, concurrent calls from the same state yield exactly one success, and the other
+callers receive a retryable validation error after reloading the task steps. Deleting a step
+does not reclaim its order; `reorderTaskSteps` normalizes orders atomically.
 
 ## Region Layout
 
@@ -214,6 +237,37 @@ aws bedrock-agent start-ingestion-job \
 
 There is intentionally no `cdk:destroy:prod` script.
 
+## Data Migration (default categories + taskCount + stable TaskStep keys)
+
+[scripts/migrate-default-categories.ts](scripts/migrate-default-categories.ts) brings legacy
+data onto the current model. It is **idempotent**, defaults to **dry-run**, and requires
+`--apply` to write. It:
+
+1. ensures **exactly one valid default category** per profile — creates the real
+   `No Category` row + `defaultCategoryId` when missing, **repairs** a missing/invalid
+   `defaultCategoryId` pointer to the surviving default, and deterministically repairs
+   duplicate/legacy default flags by retaining the lowest canonical category id and
+   demoting every other flagged row to `Recovered Category <short-id>`;
+2. reparents legacy `categoryId: "NO_CATEGORY"` (and dangling) tasks to the owner's default;
+3. strips the removed Task `status` attribute;
+4. **backfills `Category.taskCount`** to the true number of tasks in each category (the
+   durable count `deleteCategory` relies on); and
+5. backfills TaskStep append metadata (`stepCount`, `stepVersion`, `nextStepOrder`); and
+6. rewrites order-based `TaskStep` sort keys (`STEP#001`) to stable `STEP#<stepId>` keys.
+
+Run it **before relying on `deleteCategory`** against legacy data. Runbook (maintenance
+migration — the new code reads legacy rows by the unchanged `STEP#` prefix and sorts by
+`order`, so old rows stay readable throughout):
+
+```bash
+# 1) deploy the new code, then dry-run to review counts/failures
+DYNAMODB_TABLE_NAME=CanPlanTasks-dev npx ts-node scripts/migrate-default-categories.ts
+# 2) apply
+DYNAMODB_TABLE_NAME=CanPlanTasks-dev npx ts-node scripts/migrate-default-categories.ts --apply
+# 3) re-run dry-run to confirm zero pending changes (idempotency check)
+DYNAMODB_TABLE_NAME=CanPlanTasks-dev npx ts-node scripts/migrate-default-categories.ts
+```
+
 ## Environment Behavior
 
 The CDK app reads `--context env=...`; only `env=sandbox` is treated as sandbox.
@@ -258,11 +312,14 @@ infrastructure/lib/canplan-backend-stack.ts    Backend stack
 infrastructure/lib/knowledge-base-stack.ts     Knowledge Base stack
 infrastructure/lib/constructs/                 CDK constructs
 scripts/build-corpus.ts                        seed.jsonl -> data/corpus/dist
+scripts/migrate-default-categories.ts          idempotent default-category + TaskStep-key migration
 src/lambdas/createTask/handler.ts              createTask resolver (Task + steps)
 src/lambdas/{users,categories,tasks,assignments,media}/handler.ts   Domain resolvers (routed by fieldName)
 src/lambdas/admin/handler.ts                   SystemAdmin list-all-by-entityType resolvers
 src/lambdas/generateTaskSteps/handler.ts       KB Retrieve -> Converse resolver
 src/shared/keys.ts                             Single-table PK/SK + entityType conventions
+src/shared/category.ts                         Task↔Category lookup/validation + taskCount deltas
+src/shared/authz.ts                            Owner-scoped authorization helpers
 src/shared/{auth,pagination}.ts                Cognito group checks + nextToken cursors
 src/shared/{dynamodb,s3,bedrock,kb}.ts         Shared AWS clients (s3 = media presign)
 src/shared/                                    Shared types/helpers

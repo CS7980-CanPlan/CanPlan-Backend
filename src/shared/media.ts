@@ -8,11 +8,7 @@
 // copies it to a task-owned final key, and registers a normal MediaAsset row.
 
 import { randomUUID } from 'crypto';
-import {
-  CopyObjectCommand,
-  DeleteObjectCommand,
-  HeadObjectCommand,
-} from '@aws-sdk/client-s3';
+import { CopyObjectCommand, DeleteObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { DeleteCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { queryAllItems } from './batch';
 import { dynamo, TABLE_NAME } from './dynamodb';
@@ -118,7 +114,9 @@ export async function prepareCoverImageAsset(params: {
   }
   if (size <= 0) throw new ValidationError('cover image is empty (zero bytes)');
   if (size > MAX_COVER_IMAGE_BYTES) {
-    throw new ValidationError(`cover image exceeds the ${MAX_COVER_IMAGE_BYTES}-byte (10 MB) limit`);
+    throw new ValidationError(
+      `cover image exceeds the ${MAX_COVER_IMAGE_BYTES}-byte (10 MB) limit`,
+    );
   }
 
   const assetId = randomUUID();
@@ -186,7 +184,9 @@ interface MediaCleanupJournal {
  * Persist an S3 cleanup obligation before the MediaAsset row disappears. This makes a
  * failed S3 delete recoverable even after the caller has removed all live references.
  */
-async function journalMediaCleanup(asset: Pick<MediaAsset, 'taskId' | 'assetId' | 's3Key'>): Promise<void> {
+async function journalMediaCleanup(
+  asset: Pick<MediaAsset, 'taskId' | 'assetId' | 's3Key'>,
+): Promise<void> {
   await dynamo.send(
     new PutCommand({
       TableName: TABLE_NAME,
@@ -210,7 +210,10 @@ export async function retryTaskMediaCleanup(
   taskId: string,
   context: Record<string, unknown> = {},
 ): Promise<boolean> {
-  const journals = await queryAllItems<MediaCleanupJournal>(taskPk(taskId), TASK_MEDIA_CLEANUP_PREFIX);
+  const journals = await queryAllItems<MediaCleanupJournal>(
+    taskPk(taskId),
+    TASK_MEDIA_CLEANUP_PREFIX,
+  );
   let allDeleted = true;
   for (const journal of journals) {
     const deleted = await deleteS3ObjectBestEffort(journal.s3Key, {
@@ -256,7 +259,8 @@ export async function clearTaskCoverReference(taskId: string, assetId: string): 
 
 /**
  * Clear the single `mediaAssetId` back-reference on whichever TaskStep points at this
- * asset (one-to-one: at most one). Paginated scan because the step SK is order-based.
+ * asset (one-to-one: at most one). Scans the task's steps to find the holder; each step's
+ * row is keyed by its stable STEP#<stepId> sort key.
  */
 export async function clearTaskStepMediaReference(taskId: string, assetId: string): Promise<void> {
   const steps = await queryAllItems<TaskStep>(taskPk(taskId), STEP_PREFIX);
@@ -266,7 +270,7 @@ export async function clearTaskStepMediaReference(taskId: string, assetId: strin
     await dynamo.send(
       new UpdateCommand({
         TableName: TABLE_NAME,
-        Key: { PK: taskPk(taskId), SK: stepSk(step.order) },
+        Key: { PK: taskPk(taskId), SK: stepSk(step.stepId) },
         UpdateExpression: 'SET updatedAt = :now REMOVE mediaAssetId',
         ExpressionAttributeValues: { ':now': now },
       }),

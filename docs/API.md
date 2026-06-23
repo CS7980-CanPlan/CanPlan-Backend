@@ -1,21 +1,26 @@
 # CanPlan 2.0 — Frontend API Reference
 
-_Last updated: 2026-06-20. Version: phase 1 (pre-authorization)._
+_Last updated: 2026-06-22. Version: phase 1 (pre-authorization)._
 
-> ## 🚨 Breaking change — progress model replaced
+> ## 🚨 Breaking change — categories, default category, Task status, TaskStep keys
 >
-> The `ProgressEvent` model has been **removed** and the assignment model reworked.
-> See [Breaking changes](#breaking-changes-progress--assignment-rework) below for the
-> full migration notes. In short:
+> See [Breaking changes — categories & tasks rework](#breaking-changes-categories--tasks-rework)
+> for full notes. In short:
 >
-> - `ProgressEvent` is gone — `createProgressEvent` and `listProgressEventsForUser`,
->   the `ProgressEvent`/`ProgressEventType` types, and the `progress` Lambda no longer
->   exist. (Existing `ProgressEvent` rows are left in DynamoDB but are no longer served.)
-> - `AssignmentStatus` is now `TO_DO` / `OVERDUE` / `COMPLETED` / `SKIPPED`. `OVERDUE`
->   is **derived**, never persisted. The old `ACTIVE`/`PAUSED`/`CANCELLED` values and
->   the `active` field are gone.
-> - Progress is now tracked as per-assignment **`AssignmentStep`** snapshots, toggled
->   with `setAssignmentStepCompletion` and read with `listAssignmentSteps`.
+> - **`Task.status` and the `TaskStatus` enum are removed** (output field + `createTask`/
+>   `updateTask` inputs). Tasks no longer have a status.
+> - **Real default category.** Every profile now owns one real Category named
+>   `No Category` (`isDefault: true`), created with the profile; `Task.categoryId` is now
+>   non-null and always a real Category.
+> - **Categories are private to their owner.** `createCategory` no longer takes `ownerId`;
+>   `listCategoriesByOwner` is replaced by **`listMyCategories`**. New: **`updateCategory`**,
+>   **`deleteCategory`**. The owner is always the caller's Cognito identity.
+> - **`createTask` no longer takes `ownerId`** (derived from the identity), and a supplied
+>   `categoryId` must be a real, owned category.
+> - **`TaskStep.description`** added; **`reorderTaskSteps`** mutation added.
+>
+> An earlier breaking change also replaced the progress model — see
+> [Breaking changes — progress & assignment rework](#breaking-changes-progress--assignment-rework).
 
 The backend exposes a single **AWS AppSync GraphQL** endpoint backed by a single
 DynamoDB table. This document covers how to connect, the available operations, and
@@ -25,14 +30,21 @@ The schema lives at [graphql/schema.graphql](../graphql/schema.graphql) — it i
 canonical source of truth for exact types and nullability; this doc is its
 human-readable companion.
 
-> ## ⚠️ No authorization is enforced yet (read this first)
+> ## ⚠️ Authorization: Task & Category operations are owner-scoped; the rest are not yet
 >
-> Outside the `SystemAdmin` admin queries and the self-scoped `createUserProfile`,
-> **no domain operation verifies the caller.** Any authenticated caller can act on
-> **any `id`** — read another user's profile, create a task under any `ownerId`,
-> assign a task to any `userId`, link any supporter to any primary user.
-> The schema and single-table keys are structured to support per-role/owner rules,
-> but they are **not implemented in this phase**.
+> **Enforced today:** the `SystemAdmin` admin queries; the **identity-scoped** creators
+> (`createUserProfile`, `createTask`) and **all category** operations, which derive the
+> owner from the caller's Cognito `sub` and ignore any client-supplied owner id; and
+> **every Task / TaskStep operation** — `getTask`, `listTaskSteps`, `listTasksByOwner`,
+> `listTasksByCategory`, `updateTask`, `deleteTask`, `createTaskStep`, `updateTaskStep`,
+> `deleteTaskStep`, `reorderTaskSteps` — which require the caller's `sub` to equal the
+> task's (or requested) `ownerId`, returning `NOT_AUTHORIZED` otherwise. There is no
+> delegated-role model yet, so this is strict self-ownership.
+>
+> **Not enforced yet:** profile reads and the assignment / support-link operations still
+> let any authenticated caller act on any `id` (read another user's profile, assign a task
+> to any `userId`, link any supporter to any primary user). The schema and keys are
+> structured to support per-role rules there, but they are **not implemented in this phase**.
 >
 > **Do not bake "the server lets me, so it's allowed" into the client.** When
 > enforcement ships, calls that succeed today will start returning a `NOT_AUTHORIZED`
@@ -138,7 +150,7 @@ GraphQL types below. The key layout (for reference):
 | SupportLink | `SUPPORTER#<supporterId>` | `USER#<primaryUserId>` |
 | Category | `USER#<ownerId>` | `CATEGORY#<categoryId>` |
 | Task (template) | `TASK#<taskId>` | `#META` |
-| TaskStep | `TASK#<taskId>` | `STEP#<order>` (zero-padded, e.g. `STEP#001`) |
+| TaskStep | `TASK#<taskId>` | `STEP#<stepId>` (stable id key; `order` is a plain attribute) |
 | Assignment | `USER#<userId>` | `ASSIGN#<assignmentId>` |
 | AssignmentStep | `USER#<userId>` | `ASSIGN_STEP#<assignmentId>#STEP#<stepId>` |
 | MediaAsset | `TASK#<taskId>` | `MEDIA#<assetId>` |
@@ -156,6 +168,15 @@ a Scan).
 returns step rows; `listAssignmentSteps` scopes to one assignment's steps and sorts
 them by `order`.
 
+`TaskStep`s are keyed by their stable `stepId` (`STEP#<stepId>`), with `order` stored as
+a plain attribute — so a step keeps its key when reordered and a whole-task reorder is one
+atomic transaction (`reorderTaskSteps`). The `STEP#` rows are not key-sorted by position,
+so `listTaskSteps` (and the steps returned by `reorderTaskSteps`) sort by the numeric
+`order`. Every `Category` carries `isDefault`; each user has exactly one `isDefault: true`
+row (`No Category`) created with their profile, and every `Task.categoryId` references a
+real Category row. Categories also keep an internal, transactionally-maintained `taskCount`
+(not exposed in GraphQL) that the backend uses to delete a category safely.
+
 ---
 
 ## Enums
@@ -163,7 +184,6 @@ them by `order`.
 | Enum | Values |
 |---|---|
 | `UserRole` | `PRIMARY_USER`, `SUPPORT_PERSON`, `ORG_ADMIN` — a server-derived projection of Cognito group membership (`PrimaryUser`/`SupportPerson`/`OrganizationAdmin`); **Cognito groups are the authorization source of truth**. `SystemAdmin` is an elevated group, not a `UserRole`. |
-| `TaskStatus` | `DRAFT`, `ACTIVE`, `ARCHIVED` |
 | `AssignmentStatus` | `TO_DO`, `OVERDUE`, `COMPLETED`, `SKIPPED` — only `TO_DO`/`COMPLETED`/`SKIPPED` are persisted; `OVERDUE` is **derived** at read time (a `TO_DO` assignment whose `dueDate` is in the past) and cannot be set by a mutation |
 | `MediaType` | `IMAGE`, `AUDIO`, `VIDEO` |
 | `SupportLinkStatus` | `PENDING`, `ACTIVE`, `REVOKED` |
@@ -227,7 +247,7 @@ curl -s "$GRAPHQL_URL" \
 
 ### `createTask` — mutation
 
-Creates a **reusable task template** owned by a SupportPerson or OrgAdmin, plus one
+Creates a **reusable task template** owned by the authenticated caller, plus one
 `TaskStep` item per nested step (each stored as its own row). Assigning a task to a
 user is a separate operation — see `createAssignment`.
 
@@ -235,25 +255,36 @@ user is a separate operation — see `createAssignment`.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `ownerId` | `ID!` | ✅ | The support person / org admin who owns the template |
 | `title` | `String!` | ✅ | Non-empty after trimming |
-| `categoryId` | `ID` | — | Optional; blank/omitted falls back to the reserved `NO_CATEGORY` bucket (see below) |
+| `categoryId` | `ID` | — | Optional; omitted/null ⇒ the owner's default category. A **blank string is rejected**. A supplied id must be a real, owned, non-deleting Category (see below) |
 | `description` | `String` | — | Optional |
 | `scheduleRule` | `String` | — | Optional (e.g. an RRULE) |
-| `status` | `TaskStatus` | — | Defaults to `DRAFT` |
-| `steps` | `[CreateTaskStepNestedInput!]` | — | Ordered; each becomes a `STEP#NNN` item; max 99, or max 98 when `coverImageS3Key` is supplied |
+| `steps` | `[CreateTaskStepNestedInput!]` | — | Ordered; each becomes a `STEP#<stepId>` item; max **98**, or max **97** when `coverImageS3Key` is supplied |
 | `schedule` | `TaskScheduleInput` | — | Optional recurring schedule (stored only — see below) |
 | `notificationEnabled` | `Boolean` | — | Defaults to `true` when `schedule` is set; otherwise left unset unless you pass it |
 
-`CreateTaskStepNestedInput`: `text: String!` (text only — step media is attached
-afterward via the upload flow, since step ids don't exist until `createTask` returns).
+> **No `ownerId`.** The owner is the caller's Cognito `sub`; a client-supplied `ownerId`
+> is ignored. The owner must already have a profile (and therefore a default category) —
+> call `createUserProfile` first, or `createTask` fails clearly.
 
-**Category behavior.** Every task is filed under a category so it stays queryable by
-`listTasksByCategory`. If you omit `categoryId` (or send a blank string), the task is
-stored under the reserved id **`NO_CATEGORY`** — the implicit "uncategorized" bucket.
-`NO_CATEGORY` is never a real `Category` row; it's just the default key. The returned
-`Task.categoryId` reflects the stored value (so it's `"NO_CATEGORY"`, not `null`, when
-you didn't supply one).
+`CreateTaskStepNestedInput`: `text: String!` plus optional `description: String` (trimmed;
+empty/whitespace dropped). Step media is attached afterward via the upload flow, since step
+ids don't exist until `createTask` returns.
+
+**Category behavior.** Every task belongs to a **real** Category. If you omit `categoryId`
+(or send `null`), the task is filed under the owner's **default category** (`No Category`,
+`isDefault: true`). A **blank string** is rejected — omit the field instead. A supplied id
+is validated: it must exist, belong to you, and not be mid-deletion (otherwise `NOT_FOUND`
+/ `VALIDATION`). The write atomically increments the category's task count (conditioned on
+the category existing and not deleting), so a concurrent `deleteCategory` can't slip a task
+onto a category being removed. The returned `Task.categoryId` is always a real category id
+(never `null`). Before using the default, the server strongly reads and verifies the profile
+pointer and referenced Category: correct owner, exact `No Category` name, `isDefault: true`,
+and no deletion in progress. A bad legacy row fails with a migration-required validation error.
+
+**Step limit & the 100-item transaction.** A create is one DynamoDB transaction carrying
+the Task, one row per step, a category condition-check, and (optionally) the cover-image
+row — capped at 100 items. So a task may have at most **98** steps (97 with a cover image).
 
 **Schedule behavior.** Pass `schedule` to attach recurring-reminder metadata. It is
 **stored only** in this phase — no reminders are delivered yet (see _Not available
@@ -281,9 +312,9 @@ mutation CreateTask($input: CreateTaskInput!) {
     taskId
     ownerId
     title
-    status
+    categoryId
     createdAt
-    steps { stepId order text }
+    steps { stepId order text description }
   }
 }
 ```
@@ -291,12 +322,11 @@ mutation CreateTask($input: CreateTaskInput!) {
 ```json
 {
   "input": {
-    "ownerId": "support-123",
     "title": "Wash your hands",
-    "status": "ACTIVE",
+    "categoryId": "cat-hygiene",
     "steps": [
       { "text": "Wet your hands with warm water" },
-      { "text": "Add soap and scrub for 20 seconds" },
+      { "text": "Add soap and scrub for 20 seconds", "description": "Sing happy birthday twice" },
       { "text": "Rinse and dry" }
     ]
   }
@@ -304,7 +334,7 @@ mutation CreateTask($input: CreateTaskInput!) {
 ```
 
 The created steps are returned in `order` (`1`, `2`, `3`, …) — clients work with the
-`order` field, not the internal `STEP#NNN` sort key.
+`order` field, not the internal `STEP#<stepId>` sort key.
 
 ---
 
@@ -333,7 +363,7 @@ fields are marked `!` and everything else is optional; see
 
 | Operation | Input | Returns |
 |---|---|---|
-| `createUserProfile` | `input: { displayName!, organizationId, accessibilitySettings }` (`CreateMyUserProfileInput`) | `UserProfile` — creates the **caller's own** profile; `displayName` is required, while `userId` (Cognito `sub`), `email`, and `role` are derived server-side and cannot be supplied by the client |
+| `createUserProfile` | `input: { displayName!, organizationId, accessibilitySettings }` (`CreateMyUserProfileInput`) | `UserProfile` — creates the **caller's own** profile **and its default category** atomically; `displayName` is required, while `userId` (Cognito `sub`), `email`, `role`, and `defaultCategoryId` are derived server-side and cannot be supplied by the client |
 | `getUserProfile` | `userId!` | `UserProfile` · `null` if not found |
 | `listUsersByOrganization` | `organizationId!, limit, nextToken` | `UserProfileConnection!` — **roster only**: just `userId`, `displayName`, `role` are populated (orgIndex projection); other fields are `null` |
 | `createSupportLink` | `input: { supporterId!, primaryUserId!, status, permissions }` | `SupportLink` · `status` defaults to `PENDING` |
@@ -349,15 +379,17 @@ fields are marked `!` and everything else is optional; see
 > 1. Sign in → obtain the ID token; decode its `sub`.
 > 2. `getUserProfile(sub)` → if `null`, the profile doesn't exist yet.
 > 3. `createUserProfile({ displayName, … })` → creates it at `USER#<sub>` using the
->    session identity (no id is passed; see [Identity](#identity--the-userid-field)).
+>    session identity (no id is passed; see [Identity](#identity--the-userid-field)),
+>    together with the user's default `No Category` (see [Categories](#categories)).
 >
-> **`createUserProfile` semantics.** The write is an unconditional put keyed on your
-> `sub` — it is **last-write-wins, not create-only**. Calling it again **overwrites**
-> the existing profile (and resets `createdAt`/`updatedAt` to "now"); it does **not**
-> error on a pre-existing profile and does **not** merge. So guard it behind the
-> `getUserProfile` null-check above, or treat a second call as a deliberate full
-> replace. It is **not** idempotent in the value sense (timestamps change), though
-> repeating it is harmless to the keying.
+> **`createUserProfile` semantics.** On the **first** call it writes the profile and its
+> default category in one transaction; the profile records the generated
+> `defaultCategoryId`. The profile write is **last-write-wins, not create-only** — calling
+> it again **overwrites** the editable profile fields (and resets `createdAt`/`updatedAt`
+> to "now"); it does **not** error on a pre-existing profile and does **not** merge. A
+> re-call **preserves** the existing `defaultCategoryId` and never creates a second default
+> category. So guard it behind the `getUserProfile` null-check above, or treat a second
+> call as a deliberate full replace of the editable fields.
 >
 > **`createSupportLink` semantics.** Same shape: an unconditional put keyed on
 > `(supporterId, primaryUserId)`. Re-creating the same pair **overwrites** the prior
@@ -365,59 +397,146 @@ fields are marked `!` and everything else is optional; see
 > `status` — rather than erroring on a duplicate. Pass `status` explicitly if you
 > re-issue a link you don't want demoted.
 
-**Categories**
+**Categories** (all **private to the caller** — the owner is the Cognito identity, never a
+client-supplied id)
 
 | Operation | Input | Returns |
 |---|---|---|
-| `createCategory` | `input: { ownerId!, name!, color, sortOrder }` | `Category` · `ownerId`/`name`/`color` are trimmed; `categoryId` is server-generated |
-| `listCategoriesByOwner` | `ownerId!, limit, nextToken` | `CategoryConnection!` — the owner's categories (`USER#<ownerId>` partition, `CATEGORY#` prefix) |
+| `createCategory` | `input: { name!, color, sortOrder }` | `Category` · `name`/`color` trimmed; `categoryId` server-generated; `isDefault: false`. The reserved name `No Category` is rejected |
+| `listMyCategories` | `limit, nextToken` | `CategoryConnection!` — the caller's categories (incl. their `isDefault` default) |
+| `updateCategory` | `input: { categoryId!, name, color, sortOrder }` | `Category!` — partial edit; see below |
+| `deleteCategory` | `input: { categoryId! }` | `Category!` — the deleted (non-default) category; reparents its tasks first; see below |
 
-> Categories are folder-like groupings owned by one user. A task's `categoryId`
-> points at one of these; tasks created without one fall into the reserved
-> `NO_CATEGORY` bucket (which is **not** returned by `listCategoriesByOwner` — it has
-> no `Category` row).
+> **The default category.** Every user has exactly one default Category named
+> `No Category` with `isDefault: true`, created atomically with their profile
+> (`createUserProfile`). Use `Category.isDefault` to identify it. A task created without an
+> explicit `categoryId` is filed under it. It **cannot be renamed or deleted**; its `color`
+> and `sortOrder` **can** be changed. You also cannot create or rename another category to
+> `No Category`. The runtime strongly validates the profile pointer and exact canonical
+> default row before using it; malformed legacy data must be repaired by the migration.
+>
+> **`updateCategory` is a partial edit** — supply at least one of `name`, `color`,
+> `sortOrder` (a request with none is rejected). Located by `categoryId` under your own
+> partition (`NOT_FOUND` if it isn't yours / doesn't exist). For a normal category, `name`
+> is trimmed, must be non-empty, and may not be the reserved `No Category`. For the
+> **default** category, supplying `name` at all is rejected (even if unchanged) — only
+> `color`/`sortOrder` are allowed. `color`/`sortOrder` may be **cleared** with an explicit
+> `null` (a `null` `name` is rejected). It is a **targeted update** that preserves internal
+> state, and it **cannot** run on a category that is mid-deletion (returns a clear error).
+>
+> **`deleteCategory` reparents, then deletes.** The **default category cannot be deleted**.
+> For a normal category, the server (1) flags it `deleting` so new tasks can't attach to (or
+> move into) it, (2) moves **every** task in it to your default category — each move adjusts
+> both categories' internal task counts in the same transaction — then (3) removes the
+> category row **only once a strongly-consistent read proves its task count is zero**.
+> Returns the deleted category.
+>
+> _Consistency note:_ a category may hold arbitrarily many tasks (more than one DynamoDB
+> transaction can carry), so deletion runs **across multiple batches** internally and is
+> **safe to retry**. Because the category index is eventually consistent, the backend does
+> **not** trust an empty index query as proof there are no tasks — it tracks a durable,
+> transactionally-maintained task count and deletes only when that count reaches zero. A
+> failed/interrupted run (or a task the index hasn't surfaced yet) leaves the category in
+> the `deleting` state and returns a **retryable** error; re-running converges and never
+> leaves a task pointing at a deleted category.
+>
+> ```graphql
+> mutation DeleteCategory($input: DeleteCategoryInput!) {
+>   deleteCategory(input: $input) { categoryId name isDefault }
+> }
+> ```
 
 **Tasks & steps**
 
 | Operation | Input | Returns |
 |---|---|---|
-| `getTask` | `taskId!` | `Task` · `null` if not found · `steps` is `null` here (use `listTaskSteps`) |
-| `listTaskSteps` | `taskId!, limit, nextToken` | `TaskStepConnection!` — steps in ascending `order` |
-| `listTasksByOwner` | `ownerId!, limit, nextToken` | `TaskConnection!` |
-| `listTasksByCategory` | `ownerId!, categoryId, limit, nextToken` | `TaskConnection!` — tasks in one category; omit/blank `categoryId` for the `NO_CATEGORY` bucket |
-| `updateTask` | `input: { taskId!, title, categoryId, description, scheduleRule, status, schedule, notificationEnabled }` | `Task` — **partial edit**; see below |
-| `createTaskStep` | `input: { taskId!, order!, text! }` | `TaskStep` (created without media; attach via `updateTaskStep`) |
-| `updateTaskStep` | `input: { taskId!, stepId!, text, mediaAssetId, removeMedia }` | `TaskStep` — **partial edit** of one step; see below |
+| `getTask` | `taskId!` | `Task` · `null` if not found · `steps` is `null` here (use `listTaskSteps`) · owner-only |
+| `listTaskSteps` | `taskId!, limit, nextToken` | `TaskStepConnection!` — steps sorted by ascending `order`, order preserved across pages; owner-only; see below |
+| `listTasksByOwner` | `ownerId!, limit, nextToken` | `TaskConnection!` — `ownerId` must be the caller |
+| `listTasksByCategory` | `ownerId!, categoryId!, limit, nextToken` | `TaskConnection!` — tasks in one real category; **`categoryId` is required** and is validated (owned + exists + not deleting → `NOT_FOUND`/`VALIDATION`, never a silent empty result); `ownerId` must be the caller |
+| `updateTask` | `input: { taskId!, title, categoryId, description, scheduleRule, schedule, notificationEnabled }` | `Task` — **partial edit**; owner-only; see below |
+| `createTaskStep` | `input: { taskId!, order!, text!, description }` | `TaskStep` — **appends** one step at the end (owner-only); see below |
+| `updateTaskStep` | `input: { taskId!, stepId!, text, description, mediaAssetId, removeMedia }` | `TaskStep` — **partial edit** of one step; see below |
 | `deleteTaskStep` | `input: { taskId!, stepId! }` | `TaskStep` — the deleted step; also deletes its single media asset; see below |
+| `reorderTaskSteps` | `input: { taskId!, steps: [{ stepId!, order! }] }` | `[TaskStep!]!` — atomically renumbers all steps; see below |
 | `deleteTask` | `taskId!` | `Task` — the deleted template (minus internal fields); cascades to all its steps + media; see below |
 
 > **`updateTask` is a partial edit.** Only the fields you include change; omitted
 > fields keep their current value. `ownerId` is immutable and **steps are not edited
-> here** (use `createTaskStep`; per-step editing isn't exposed yet). A missing
-> `taskId` returns a not-found error rather than creating a row. Two coupled fields are
-> kept consistent for you: changing `categoryId` recomputes the internal category key
-> (so the task moves buckets in `listTasksByCategory`), and supplying a new `schedule`
-> re-derives `nextOccurrenceAt`. A blank/omitted `categoryId` collapses to
-> `NO_CATEGORY`, exactly as in `createTask`; `title`, if supplied, must be non-empty;
-> and `notificationEnabled` only changes when you pass it explicitly. The `schedule`
-> fields and validation are the same as [`createTask`](#createtask--mutation).
+> here** (use `createTaskStep`/`reorderTaskSteps`; per-step content editing is
+> `updateTaskStep`). A missing `taskId` returns a not-found error rather than creating a
+> row. Two coupled fields are kept consistent for you: changing `categoryId` recomputes the
+> internal category key (so the task moves buckets in `listTasksByCategory`), and supplying
+> a new `schedule` re-derives `nextOccurrenceAt`. A supplied `categoryId` must be a real
+> category **you own** and not mid-deletion; moving the task decrements the old category's
+> internal task count and increments the new one's **in the same transaction** (so a
+> concurrent `deleteCategory` can't attach the task to a category being removed). A **blank
+> string is rejected** (omit it to leave the category unchanged). `title`, if supplied,
+> must be non-empty; and
+> `notificationEnabled` only changes when you pass it explicitly. The `schedule` fields and
+> validation are the same as [`createTask`](#createtask--mutation).
 >
 > ```graphql
 > mutation UpdateTask($input: UpdateTaskInput!) {
->   updateTask(input: $input) { taskId title status categoryId updatedAt }
+>   updateTask(input: $input) { taskId title categoryId updatedAt }
 > }
 > ```
 > ```json
-> { "input": { "taskId": "task-123", "title": "Wash hands well", "status": "ACTIVE", "categoryId": "cat-hygiene" } }
+> { "input": { "taskId": "task-123", "title": "Wash hands well", "categoryId": "cat-hygiene" } }
 > ```
 
 > **`updateTaskStep` is a partial edit of one step.** Identify the step by `taskId` +
-> `stepId`. **Supply at least one of `text`, `mediaAssetId`, or `removeMedia: true`** — a
-> request with none is rejected, and supplying both `mediaAssetId` and `removeMedia: true`
-> is rejected. A supplied `text` is trimmed and may **not** be empty. `stepId`, `taskId`,
-> `order`, and `createdAt` are immutable; `updatedAt` is bumped. A missing step returns a
-> not-found error. To remove the whole step, use `deleteTaskStep` (below).
+> `stepId`. **Supply at least one of `text`, `description`, `mediaAssetId`, or
+> `removeMedia: true`** — a request with none is rejected, and supplying both `mediaAssetId`
+> and `removeMedia: true` is rejected. A supplied `text` is trimmed and may **not** be
+> empty. **`description` semantics:** omitted ⇒ unchanged; explicit `null` ⇒ clears the
+> stored description; a whitespace-only string is rejected; otherwise it's trimmed and
+> stored. `stepId`, `taskId`, and `createdAt` are immutable, and `order` changes only via
+> `reorderTaskSteps`; `updatedAt` is bumped. A missing step returns a not-found error. To
+> remove the whole step, use `deleteTaskStep` (below).
+
+> **`reorderTaskSteps` atomically renumbers a task's steps.** Supply the **complete current
+> set** of the task's steps as `[{ stepId, order }]` (not a partial patch). The server
+> validates that every `stepId` exists under the task, each appears exactly once, and the
+> `order`s are **unique positive integers contiguous from 1..N** (max 99 steps). All steps'
+> `order` attributes are updated in **one DynamoDB transaction** (all-or-nothing); step ids,
+> attached media, task contents, and historical `AssignmentStep`s are **never** touched.
+> Returns the resulting steps sorted by ascending `order`.
 >
+> ```graphql
+> mutation Reorder($input: ReorderTaskStepsInput!) {
+>   reorderTaskSteps(input: $input) { stepId order text }
+> }
+> ```
+> ```json
+> { "input": { "taskId": "task-123", "steps": [
+>   { "stepId": "step-c", "order": 1 },
+>   { "stepId": "step-a", "order": 2 },
+>   { "stepId": "step-b", "order": 3 }
+> ] } }
+> ```
+
+> **`createTaskStep` appends one step at the end.** The task must exist and be yours, and a
+> task may hold **at most 99 steps**. The new step is created at the server-maintained next
+> append position (monotonic between reorders; 1 for a new task); the `order` you pass **must
+> equal** that position — any other value (including one that duplicates an existing step) is
+> rejected. To insert in the middle or reorder, create at the end and then call
+> **`reorderTaskSteps`**. A missing/foreign task returns `NOT_FOUND`/`NOT_AUTHORIZED` (no
+> orphan steps are ever created).
+>
+> _Concurrency note:_ appends are optimistic-concurrency controlled by internal Task step
+> metadata. From the same prior state, exactly one simultaneous `createTaskStep` succeeds;
+> every loser receives a retryable validation/conflict error and must reload then retry. No
+> duplicate `order` values are created. `deleteTaskStep` may leave a gap in `order` — that's
+> fine; ordering is numeric, and `reorderTaskSteps` renumbers it.
+
+> **`listTaskSteps` pagination is order-stable.** A task has at most 99 (small) steps, so the
+> backend reads them all, sorts by numeric `order` (with `stepId` as a stable tiebreaker),
+> then paginates **in application code**. `nextToken` is an **opaque, base64-encoded offset**
+> into that sorted list — **not** a DynamoDB key — and is `null` on the last page. Ascending
+> `order` is therefore preserved across pages (unlike a raw key-order scan). The same numeric
+> ordering is returned by `reorderTaskSteps`.
+
 > **A step holds at most one media asset** (`TaskStep.mediaAssetId`).
 > - **`mediaAssetId`** attaches one existing, currently-**unattached** media asset to the
 >   step. It must exist under the same `taskId`, not be the Task cover image, have no
@@ -430,17 +549,16 @@ fields are marked `!` and everything else is optional; see
 >
 > ```graphql
 > mutation UpdateTaskStep($input: UpdateTaskStepInput!) {
->   updateTaskStep(input: $input) { stepId taskId order text mediaAssetId updatedAt }
+>   updateTaskStep(input: $input) { stepId taskId order text description mediaAssetId updatedAt }
 > }
 > ```
 > ```json
-> { "input": { "taskId": "task-123", "stepId": "step-9", "text": "Scrub for 20 seconds", "mediaAssetId": "asset-7" } }
+> { "input": { "taskId": "task-123", "stepId": "step-9", "text": "Scrub for 20 seconds", "description": "Count to 20", "mediaAssetId": "asset-7" } }
 > ```
 
 > **`deleteTaskStep` removes one step and its single media asset.** Identify the step by
-> `taskId` + `stepId` (located by scanning the task's steps — the storage key is
-> order-based, not `stepId`-based). Returns the deleted `TaskStep` (internal fields
-> stripped); a missing step returns a not-found error.
+> `taskId` + `stepId` (located directly by its stable `STEP#<stepId>` key). Returns the
+> deleted `TaskStep` (internal fields stripped); a missing step returns a not-found error.
 >
 > **Media cleanup.** If the step has a `mediaAssetId`, that one asset's metadata row + S3
 > binary are deleted. Each media asset belongs to exactly one step (or the cover), so there
@@ -490,7 +608,7 @@ fields are marked `!` and everything else is optional; see
 >
 > ```graphql
 > mutation DeleteTask($taskId: ID!) {
->   deleteTask(taskId: $taskId) { taskId title status }
+>   deleteTask(taskId: $taskId) { taskId title categoryId }
 > }
 > ```
 
@@ -737,14 +855,69 @@ Planned but not implemented — don't build against them:
   / `INTERNAL` (see [Error handling](#error-handling)) are the intended contract, but
   resolver errors currently surface as `Lambda:Unhandled` with the cause only in
   `message`. Branch defensively until the codes are wired through.
-- **Delete** exists for tasks (`deleteTask`), task steps (`deleteTaskStep`), assignments
-  (`deleteAssignment`), and media assets (`deleteMediaAsset`); there is **no standalone
-  delete for an `AssignmentStep`** (it is removed only when its parent `Assignment` is
-  deleted). **Update** exists for tasks (`updateTask`), task steps (`updateTaskStep`), and
-  assignment status (`updateAssignmentStatus`); other entities have no update yet.
+- **Delete** exists for categories (`deleteCategory`, non-default only), tasks
+  (`deleteTask`), task steps (`deleteTaskStep`), assignments (`deleteAssignment`), and media
+  assets (`deleteMediaAsset`); there is **no standalone delete for an `AssignmentStep`** (it
+  is removed only when its parent `Assignment` is deleted). **Update** exists for categories
+  (`updateCategory`), tasks (`updateTask`), task steps (`updateTaskStep`), task-step ordering
+  (`reorderTaskSteps`), and assignment status (`updateAssignmentStatus`); other entities have
+  no update yet.
 - **Report generation** — the `Report` type exists in the schema, but no query or
   mutation is exposed for it yet.
 - **Streaming AI responses** — `generateTaskSteps` is request/response only.
+
+---
+
+## Breaking changes: categories & tasks rework
+
+Categories became first-class and private; Task status was removed; TaskStep storage and
+ordering changed. **This is a breaking API change.**
+
+**Removed**
+
+- `TaskStatus` enum and `Task.status` (output), plus `status` on `CreateTaskInput` /
+  `UpdateTaskInput`. Tasks have no status.
+- `ownerId` on `CreateTaskInput` and `CreateCategoryInput` — both are derived from the
+  caller's Cognito identity.
+- `listCategoriesByOwner(ownerId, …)` — replaced by `listMyCategories(…)`.
+
+**Changed**
+
+- `listTasksByCategory` now **requires** a real `categoryId` (no implicit "uncategorized"
+  bucket).
+- `TaskStep` storage moved from order-based sort keys (`STEP#001`) to stable
+  `STEP#<stepId>` keys; `order` is a plain attribute. List/read paths sort by `order`.
+- **Task & TaskStep operations are now owner-scoped** (caller `sub` must equal the task's
+  `ownerId`); `createTaskStep` is **append-only** (next position; max 99 steps).
+
+**Added**
+
+- A real **default category** per user (`No Category`, `isDefault: true`) created
+  atomically with the profile; `UserProfile.defaultCategoryId` and `Category.isDefault`.
+- Category management: `createCategory` (no `ownerId`), `listMyCategories`,
+  `updateCategory`, `deleteCategory` (default-category immutability + reparent-on-delete).
+- An **internal `Category.taskCount`** (not exposed in GraphQL) — a durable, transactionally
+  maintained count of the tasks in each category, so `deleteCategory` is safe despite the
+  eventually-consistent category index.
+- `TaskStep.description` (optional), persisted by create/update; AssignmentStep snapshots
+  are unchanged (no `description`).
+- `reorderTaskSteps` — atomic whole-task reordering.
+
+**Data compatibility / migration**
+
+- A documented, **idempotent, dry-run-by-default** migration
+  (`scripts/migrate-default-categories.ts`) that: ensures **exactly one valid default
+  category** per profile (creating one when missing, **repairing** a missing/invalid
+  `defaultCategoryId` pointer, deterministically keeping the lowest canonical default id,
+  and demoting duplicate/legacy default flags to `Recovered Category <short-id>`); reparents
+  legacy `NO_CATEGORY`/dangling tasks to the owner's default;
+  strips legacy Task `status`; **backfills `Category.taskCount`** to the true number of tasks
+  in each category; backfills Task step append metadata (`stepCount`, `stepVersion`,
+  `nextStepOrder`); and rekeys legacy order-based `TaskStep` rows to `STEP#<stepId>`. Old
+  `STEP#` rows stay readable during the rollout (the prefix is unchanged; reads sort by
+  `order`), so it runs as a maintenance migration after deploy. **Run it before relying on
+  `deleteCategory` against legacy data** (which needs `taskCount`). See the README "Data
+  Migration" section for the runbook.
 
 ---
 

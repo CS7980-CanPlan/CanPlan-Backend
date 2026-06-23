@@ -4,11 +4,11 @@ import {
   assignStepPrefix,
   assignStepSk,
   categorySk,
+  DEFAULT_CATEGORY_NAME,
   ENTITY,
+  isDefaultCategoryName,
   mediaSk,
   META_SK,
-  NO_CATEGORY,
-  padOrder,
   PROFILE_SK,
   reportPk,
   stepSk,
@@ -19,17 +19,19 @@ import {
   userPk,
 } from './keys';
 
-describe('padOrder', () => {
-  it('zero-pads to three digits', () => {
-    expect(padOrder(1)).toBe('001');
-    expect(padOrder(2)).toBe('002');
-    expect(padOrder(10)).toBe('010');
-    expect(padOrder(100)).toBe('100');
+describe('stepSk', () => {
+  it('keys a TaskStep by its stable stepId, not by order', () => {
+    expect(stepSk('abc-123')).toBe('STEP#abc-123');
   });
+});
 
-  it('keeps padded orders lexicographically sortable', () => {
-    const keys = [stepSk(3), stepSk(1), stepSk(10), stepSk(2)];
-    expect([...keys].sort()).toEqual(['STEP#001', 'STEP#002', 'STEP#003', 'STEP#010']);
+describe('default category name', () => {
+  it('matches "No Category" case-insensitively after trimming', () => {
+    expect(DEFAULT_CATEGORY_NAME).toBe('No Category');
+    expect(isDefaultCategoryName('No Category')).toBe(true);
+    expect(isDefaultCategoryName('  no category  ')).toBe(true);
+    expect(isDefaultCategoryName('NO CATEGORY')).toBe(true);
+    expect(isDefaultCategoryName('Hygiene')).toBe(false);
   });
 });
 
@@ -48,7 +50,7 @@ describe('sort keys', () => {
     expect(META_SK).toBe('#META');
     expect(categorySk('c1')).toBe('CATEGORY#c1');
     expect(userLinkSk('u1')).toBe('USER#u1');
-    expect(stepSk(1)).toBe('STEP#001');
+    expect(stepSk('s1')).toBe('STEP#s1');
     expect(assignSk('a1')).toBe('ASSIGN#a1');
     expect(assignStepSk('a1', 's1')).toBe('ASSIGN_STEP#a1#STEP#s1');
     expect(assignStepPrefix('a1')).toBe('ASSIGN_STEP#a1#STEP#');
@@ -64,7 +66,7 @@ describe('sort keys', () => {
 describe('taskCategoryKey', () => {
   it('joins owner and category into the taskCategoryIndex partition key', () => {
     expect(taskCategoryKey('o1', 'c1')).toBe('o1#c1');
-    expect(taskCategoryKey('o1', NO_CATEGORY)).toBe('o1#NO_CATEGORY');
+    expect(taskCategoryKey('o1', 'cat-9')).toBe('o1#cat-9');
   });
 });
 
