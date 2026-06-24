@@ -95,6 +95,7 @@ describe('migration — apply', () => {
     const items = createTx.input.TransactItems as Array<Record<string, { Item?: Record<string, unknown>; UpdateExpression?: string }>>;
     const catItem = items[0].Put!.Item!;
     expect(catItem.name).toBe('No Category');
+    expect(catItem.color).toBe('#64748B');
     expect(catItem.isDefault).toBe(true);
     expect(catItem.taskCount).toBe(1);
     const newId = catItem.categoryId as string;

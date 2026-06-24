@@ -61,6 +61,8 @@ export const USER_LINK_PREFIX = 'USER#';
  * this name for the same owner is rejected so the reserved one stays unambiguous.
  */
 export const DEFAULT_CATEGORY_NAME = 'No Category';
+/** Neutral slate color assigned when the server creates a default Category. */
+export const DEFAULT_CATEGORY_COLOR = '#64748B';
 
 /** True when `name` (trimmed, case-insensitive) collides with the reserved default name. */
 export function isDefaultCategoryName(name: string): boolean {

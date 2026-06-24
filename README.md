@@ -73,7 +73,7 @@ are taken from the authenticated session — clients send only `displayName`,
 is required.
 
 `createUserProfile` also creates the user's **default category** (`name: "No Category"`,
-`isDefault: true`) — a real Category row with its own UUID — in the same transaction, and
+`color: "#64748B"`, `isDefault: true`) — a real Category row with its own UUID — in the same transaction, and
 stores its id on the profile (`defaultCategoryId`). Every Task belongs to a real Category;
 one created without an explicit `categoryId` is filed under this default. The default
 cannot be renamed or deleted. **Categories are private to their owner:** `createCategory`,

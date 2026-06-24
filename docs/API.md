@@ -429,7 +429,7 @@ client-supplied id)
 | `deleteCategory` | `input: { categoryId! }` | `Category!` — the deleted (non-default) category; reparents its tasks first; see below |
 
 > **The default category.** Every user has exactly one default Category named
-> `No Category` with `isDefault: true`, created atomically with their profile
+> `No Category` with `color: "#64748B"` and `isDefault: true`, created atomically with their profile
 > (`createUserProfile`). Use `Category.isDefault` to identify it. A task created without an
 > explicit `categoryId` is filed under it. It **cannot be renamed or deleted**; its `color`
 > and `sortOrder` **can** be changed. You also cannot create or rename another category to

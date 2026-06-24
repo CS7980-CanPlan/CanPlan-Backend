@@ -80,6 +80,7 @@ describe('users handler — UserProfile', () => {
     expect(category.SK).toBe(`CATEGORY#${category.categoryId}`);
     expect(category.entityType).toBe('Category');
     expect(category.name).toBe('No Category');
+    expect(category.color).toBe('#64748B');
     expect(category.isDefault).toBe(true);
     expect(category.taskCount).toBe(0);
     expect(category.ownerId).toBe('sub-1');

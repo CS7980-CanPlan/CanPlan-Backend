@@ -5,6 +5,7 @@ import { getOwnedCategory } from '../../shared/category';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import {
   categorySk,
+  DEFAULT_CATEGORY_COLOR,
   DEFAULT_CATEGORY_NAME,
   ENTITY,
   isDefaultCategoryName,
@@ -146,6 +147,7 @@ async function createMyUserProfile(
     categoryId: defaultCategoryId,
     ownerId: userId,
     name: DEFAULT_CATEGORY_NAME,
+    color: DEFAULT_CATEGORY_COLOR,
     isDefault: true,
     taskCount: 0,
     createdAt: now,

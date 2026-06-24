@@ -4,6 +4,7 @@ import {
   assignStepPrefix,
   assignStepSk,
   categorySk,
+  DEFAULT_CATEGORY_COLOR,
   DEFAULT_CATEGORY_NAME,
   ENTITY,
   isDefaultCategoryName,
@@ -28,6 +29,7 @@ describe('stepSk', () => {
 describe('default category name', () => {
   it('matches "No Category" case-insensitively after trimming', () => {
     expect(DEFAULT_CATEGORY_NAME).toBe('No Category');
+    expect(DEFAULT_CATEGORY_COLOR).toBe('#64748B');
     expect(isDefaultCategoryName('No Category')).toBe(true);
     expect(isDefaultCategoryName('  no category  ')).toBe(true);
     expect(isDefaultCategoryName('NO CATEGORY')).toBe(true);

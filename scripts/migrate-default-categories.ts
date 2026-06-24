@@ -53,6 +53,7 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import {
   categorySk,
+  DEFAULT_CATEGORY_COLOR,
   DEFAULT_CATEGORY_NAME,
   ENTITY,
   ENTITY_TYPE_INDEX,
@@ -396,6 +397,7 @@ export async function runMigration(opts: {
                     categoryId: newId,
                     ownerId,
                     name: DEFAULT_CATEGORY_NAME,
+                    color: DEFAULT_CATEGORY_COLOR,
                     isDefault: true,
                     taskCount: desired,
                     createdAt: now,
