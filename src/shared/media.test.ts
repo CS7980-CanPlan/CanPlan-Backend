@@ -1,7 +1,6 @@
 import {
   ALLOWED_IMAGE_MIME_TYPES,
   clearTaskCoverReference,
-  clearTaskStepMediaReference,
   deleteS3ObjectBestEffort,
   isPendingCoverKey,
   MAX_COVER_IMAGE_BYTES,
@@ -109,11 +108,17 @@ describe('prepareCoverImageAsset', () => {
     expect(asset.s3Key).toBe(`media/t1/${asset.assetId}.png`);
 
     // Verify → copy to final → delete temp.
-    expect(sentCommands()).toEqual(['HeadObjectCommand', 'CopyObjectCommand', 'DeleteObjectCommand']);
+    expect(sentCommands()).toEqual([
+      'HeadObjectCommand',
+      'CopyObjectCommand',
+      'DeleteObjectCommand',
+    ]);
     const copy = mockSend.mock.calls.find((c) => c[0].constructor.name === 'CopyObjectCommand')![0];
     expect(copy.input.Key).toBe(asset.s3Key);
     expect(copy.input.CopySource).toBe(`canplan-media-test/${PENDING}`);
-    const del = mockSend.mock.calls.find((c) => c[0].constructor.name === 'DeleteObjectCommand')![0];
+    const del = mockSend.mock.calls.find(
+      (c) => c[0].constructor.name === 'DeleteObjectCommand',
+    )![0];
     expect(del.input.Key).toBe(PENDING); // temp object cleaned up
   });
 
@@ -122,7 +127,8 @@ describe('prepareCoverImageAsset', () => {
       if (cmd.constructor.name === 'HeadObjectCommand') {
         return Promise.resolve({ ContentType: 'image/jpeg', ContentLength: 10 });
       }
-      if (cmd.constructor.name === 'DeleteObjectCommand') return Promise.reject(new Error('s3 down'));
+      if (cmd.constructor.name === 'DeleteObjectCommand')
+        return Promise.reject(new Error('s3 down'));
       return Promise.resolve({});
     });
     const errSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
@@ -168,7 +174,9 @@ describe('clearTaskCoverReference', () => {
   });
 
   it('swallows ConditionalCheckFailed (asset is not the cover)', async () => {
-    mockDynamo.mockRejectedValueOnce(Object.assign(new Error('x'), { name: 'ConditionalCheckFailedException' }));
+    mockDynamo.mockRejectedValueOnce(
+      Object.assign(new Error('x'), { name: 'ConditionalCheckFailedException' }),
+    );
     await expect(clearTaskCoverReference('t1', 'a1')).resolves.toBeUndefined();
   });
 
@@ -178,43 +186,18 @@ describe('clearTaskCoverReference', () => {
   });
 });
 
-describe('clearTaskStepMediaReference', () => {
-  it('REMOVEs mediaAssetId on the one step that points at the asset', async () => {
-    mockDynamo
-      .mockResolvedValueOnce({
-        Items: [
-          { stepId: 's1', order: 1, mediaAssetId: 'a1' },
-          { stepId: 's2', order: 2, mediaAssetId: 'other' },
-        ],
-      }) // step query
-      .mockResolvedValue({}); // update
-    await clearTaskStepMediaReference('t1', 'a1');
-
-    const updates = mockDynamo.mock.calls.map((c) => c[0].input).filter((i) => i.UpdateExpression);
-    expect(updates).toHaveLength(1);
-    expect(updates[0].Key).toEqual({ PK: 'TASK#t1', SK: 'STEP#001' });
-    expect(updates[0].UpdateExpression).toBe('SET updatedAt = :now REMOVE mediaAssetId');
-  });
-
-  it('is a no-op when no step references the asset', async () => {
-    mockDynamo.mockResolvedValueOnce({ Items: [{ stepId: 's1', order: 1 }] });
-    await clearTaskStepMediaReference('t1', 'a1');
-    const updates = mockDynamo.mock.calls.map((c) => c[0].input).filter((i) => i.UpdateExpression);
-    expect(updates).toHaveLength(0);
-  });
-});
-
 describe('purgeMediaAsset', () => {
   const asset = { taskId: 't1', assetId: 'a1', s3Key: 'media/t1/a1.png' };
 
-  it('clears cover + step back-refs, deletes the row, deletes the S3 object, returns true', async () => {
-    mockDynamo.mockResolvedValue({}); // cover update, step query ({}→[]), row delete
+  it('clears a cover back-ref, deletes the row, deletes the S3 object, returns true', async () => {
+    mockDynamo.mockResolvedValue({});
     mockSend.mockResolvedValue({}); // S3 DeleteObject
     const ok = await purgeMediaAsset(asset, { event: 'deleteTaskStep' });
 
     expect(ok).toBe(true);
     const dynamoInputs = mockDynamo.mock.calls.map((c) => c[0].input);
-    // Cover-ref clear happened; cleanup only ever touches single back-references.
+    // Cover-ref clear happened; Step media is derived from MediaAsset.stepId and needs no
+    // TaskStep rewrite.
     expect(dynamoInputs.some((i) => i.UpdateExpression === 'REMOVE coverImageAssetId')).toBe(true);
     const rowDelete = mockDynamo.mock.calls
       .map((c) => c[0])
@@ -224,7 +207,9 @@ describe('purgeMediaAsset', () => {
     const inputs = mockDynamo.mock.calls.map((c) => c[0].input);
     expect(inputs.some((i) => i.Item?.SK === 'CLEANUP_MEDIA#a1')).toBe(true);
     expect(inputs.some((i) => i.Key?.SK === 'CLEANUP_MEDIA#a1')).toBe(true);
-    const s3Del = mockSend.mock.calls.find((c) => c[0].constructor.name === 'DeleteObjectCommand')![0];
+    const s3Del = mockSend.mock.calls.find(
+      (c) => c[0].constructor.name === 'DeleteObjectCommand',
+    )![0];
     expect(s3Del.input.Key).toBe('media/t1/a1.png');
   });
 
@@ -235,7 +220,9 @@ describe('purgeMediaAsset', () => {
     const ok = await purgeMediaAsset(asset, { event: 'deleteTaskStep' });
     expect(ok).toBe(false);
     // Row still deleted (DB-first); failure logged with context for retry.
-    expect(mockDynamo.mock.calls.map((c) => c[0]).some((c) => c.constructor.name === 'DeleteCommand')).toBe(true);
+    expect(
+      mockDynamo.mock.calls.map((c) => c[0]).some((c) => c.constructor.name === 'DeleteCommand'),
+    ).toBe(true);
     expect(errSpy.mock.calls[0][0]).toContain('media/t1/a1.png');
     // The journal survives, preserving the S3 key for a later retry.
     const inputs = mockDynamo.mock.calls.map((c) => c[0].input);
@@ -254,7 +241,10 @@ describe('retryTaskMediaCleanup', () => {
     await expect(retryTaskMediaCleanup('t1', { event: 'retry-test' })).resolves.toBe(true);
 
     const inputs = mockDynamo.mock.calls.map((c) => c[0].input);
-    expect(inputs[0].ExpressionAttributeValues).toEqual({ ':pk': 'TASK#t1', ':prefix': 'CLEANUP_MEDIA#' });
+    expect(inputs[0].ExpressionAttributeValues).toEqual({
+      ':pk': 'TASK#t1',
+      ':prefix': 'CLEANUP_MEDIA#',
+    });
     expect(inputs.some((i) => i.Key?.SK === 'CLEANUP_MEDIA#a1')).toBe(true);
   });
 

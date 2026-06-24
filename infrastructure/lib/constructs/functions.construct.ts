@@ -69,9 +69,10 @@ export class Functions extends Construct {
 
     // ── createTask ──────────────────────────────────────────────────────────────
     // Writes a Task #META item plus its TaskStep items (and an optional cover-image
-    // MediaAsset) in one transaction.
+    // MediaAsset) in one transaction. Reads the owner's profile (default category) and
+    // validates the chosen category, so it needs read + write on the table.
     this.createTaskFn = dataFn('CreateTaskFunction', 'createTask', 'createTask');
-    table.grantWriteData(this.createTaskFn);
+    table.grantReadWriteData(this.createTaskFn);
     grantCoverImageS3(this.createTaskFn);
 
     // ── Domain Lambdas (read + write the single table, incl. its GSIs) ──────────
@@ -132,7 +133,12 @@ export class Functions extends Construct {
     // needs permission on BOTH the profile and the underlying foundation models.
     this.generateTaskStepsFn.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream', 'bedrock:Converse', 'bedrock:ConverseStream'],
+        actions: [
+          'bedrock:InvokeModel',
+          'bedrock:InvokeModelWithResponseStream',
+          'bedrock:Converse',
+          'bedrock:ConverseStream',
+        ],
         resources: [
           `arn:aws:bedrock:*:${cdk.Stack.of(this).account}:inference-profile/*`,
           'arn:aws:bedrock:*::foundation-model/anthropic.*',
@@ -143,7 +149,9 @@ export class Functions extends Construct {
     this.generateTaskStepsFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['bedrock:Retrieve'],
-        resources: [`arn:aws:bedrock:${bedrockRegion}:${cdk.Stack.of(this).account}:knowledge-base/${knowledgeBaseId}`],
+        resources: [
+          `arn:aws:bedrock:${bedrockRegion}:${cdk.Stack.of(this).account}:knowledge-base/${knowledgeBaseId}`,
+        ],
       }),
     );
   }

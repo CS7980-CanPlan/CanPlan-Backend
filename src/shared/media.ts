@@ -8,11 +8,7 @@
 // copies it to a task-owned final key, and registers a normal MediaAsset row.
 
 import { randomUUID } from 'crypto';
-import {
-  CopyObjectCommand,
-  DeleteObjectCommand,
-  HeadObjectCommand,
-} from '@aws-sdk/client-s3';
+import { CopyObjectCommand, DeleteObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { DeleteCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { queryAllItems } from './batch';
 import { dynamo, TABLE_NAME } from './dynamodb';
@@ -20,15 +16,13 @@ import {
   ENTITY,
   mediaSk,
   META_SK,
-  STEP_PREFIX,
-  stepSk,
   taskMediaCleanupSk,
   taskPk,
   TASK_MEDIA_CLEANUP_PREFIX,
 } from './keys';
 import { NotFoundError, ValidationError } from './response';
 import { MEDIA_BUCKET, s3 } from './s3';
-import type { MediaAsset, TaskStep } from './types';
+import type { MediaAsset } from './types';
 
 /** Cover images accept only these MIME types (verified via HeadObject, not the client). */
 export const ALLOWED_IMAGE_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp'] as const;
@@ -118,7 +112,9 @@ export async function prepareCoverImageAsset(params: {
   }
   if (size <= 0) throw new ValidationError('cover image is empty (zero bytes)');
   if (size > MAX_COVER_IMAGE_BYTES) {
-    throw new ValidationError(`cover image exceeds the ${MAX_COVER_IMAGE_BYTES}-byte (10 MB) limit`);
+    throw new ValidationError(
+      `cover image exceeds the ${MAX_COVER_IMAGE_BYTES}-byte (10 MB) limit`,
+    );
   }
 
   const assetId = randomUUID();
@@ -186,7 +182,9 @@ interface MediaCleanupJournal {
  * Persist an S3 cleanup obligation before the MediaAsset row disappears. This makes a
  * failed S3 delete recoverable even after the caller has removed all live references.
  */
-async function journalMediaCleanup(asset: Pick<MediaAsset, 'taskId' | 'assetId' | 's3Key'>): Promise<void> {
+async function journalMediaCleanup(
+  asset: Pick<MediaAsset, 'taskId' | 'assetId' | 's3Key'>,
+): Promise<void> {
   await dynamo.send(
     new PutCommand({
       TableName: TABLE_NAME,
@@ -210,7 +208,10 @@ export async function retryTaskMediaCleanup(
   taskId: string,
   context: Record<string, unknown> = {},
 ): Promise<boolean> {
-  const journals = await queryAllItems<MediaCleanupJournal>(taskPk(taskId), TASK_MEDIA_CLEANUP_PREFIX);
+  const journals = await queryAllItems<MediaCleanupJournal>(
+    taskPk(taskId),
+    TASK_MEDIA_CLEANUP_PREFIX,
+  );
   let allDeleted = true;
   for (const journal of journals) {
     const deleted = await deleteS3ObjectBestEffort(journal.s3Key, {
@@ -255,32 +256,13 @@ export async function clearTaskCoverReference(taskId: string, assetId: string): 
 }
 
 /**
- * Clear the single `mediaAssetId` back-reference on whichever TaskStep points at this
- * asset (one-to-one: at most one). Paginated scan because the step SK is order-based.
- */
-export async function clearTaskStepMediaReference(taskId: string, assetId: string): Promise<void> {
-  const steps = await queryAllItems<TaskStep>(taskPk(taskId), STEP_PREFIX);
-  const now = new Date().toISOString();
-  for (const step of steps) {
-    if (step.mediaAssetId !== assetId) continue;
-    await dynamo.send(
-      new UpdateCommand({
-        TableName: TABLE_NAME,
-        Key: { PK: taskPk(taskId), SK: stepSk(step.order) },
-        UpdateExpression: 'SET updatedAt = :now REMOVE mediaAssetId',
-        ExpressionAttributeValues: { ':now': now },
-      }),
-    );
-  }
-}
-
 /**
- * Fully remove one MediaAsset: clear its single back-reference (Task cover OR the owning
- * TaskStep's mediaAssetId — whichever applies; both are safe no-ops when not), delete the
- * metadata row, then best-effort delete the S3 binary. DB-first (references + row before
- * the object) so the API never points at a missing file; the S3 delete is logged for
- * retry on failure. This is the shared cleanup path for deleteMediaAsset, deleteTaskStep,
- * and step-media replacement/removal.
+ * Fully remove one MediaAsset: clear a Task-cover back-reference when applicable, delete
+ * the metadata row, then best-effort delete the S3 binary. Step media needs no reference
+ * rewrite: `TaskStep.mediaAssets` is derived from MediaAsset rows whose `stepId` matches the
+ * step. DB-first (reference + row before the object) means the API never points at a missing
+ * binary. This shared cleanup path is used for deleteMediaAsset, deleteTaskStep, and
+ * type-specific step-media replacement/removal.
  *
  * Returns whether the S3 binary was deleted — a caller that must not "silently claim all
  * cleanup succeeded" can surface a `false` (the metadata is gone, but a logged, orphaned
@@ -295,7 +277,6 @@ export async function purgeMediaAsset(
   // subsequent operation can retry from this durable key rather than losing the binary.
   await journalMediaCleanup(asset);
   await clearTaskCoverReference(taskId, assetId);
-  await clearTaskStepMediaReference(taskId, assetId);
   await dynamo.send(
     new DeleteCommand({ TableName: TABLE_NAME, Key: { PK: taskPk(taskId), SK: mediaSk(assetId) } }),
   );

@@ -6,7 +6,6 @@
 // ── Enums (mirror graphql/schema.graphql) ─────────────────────────────────────
 export type UserRole = 'PRIMARY_USER' | 'SUPPORT_PERSON' | 'ORG_ADMIN';
 export type SupportLinkStatus = 'PENDING' | 'ACTIVE' | 'REVOKED';
-export type TaskStatus = 'DRAFT' | 'ACTIVE' | 'ARCHIVED';
 /**
  * Assignment status as surfaced through the API. `OVERDUE` is derived at read time
  * (persisted status TO_DO + a dueDate in the past) — it is never written to storage.
@@ -25,6 +24,13 @@ export interface UserProfile {
   email?: string;
   organizationId?: string;
   accessibilitySettings?: Record<string, unknown>;
+  /**
+   * Id of this user's mandatory default Category (a real Category row with
+   * `isDefault: true`). Written atomically with the profile and never null for a
+   * profile created/migrated under the current model; Tasks created without an
+   * explicit category fall into it.
+   */
+  defaultCategoryId?: string;
   createdAt: string;
   updatedAt?: string;
 }
@@ -47,6 +53,27 @@ export interface Category {
   name: string;
   color?: string;
   sortOrder?: number;
+  /**
+   * True only for the user's reserved default ("No Category") row. Server-controlled
+   * (never client-supplied): the default cannot be renamed or deleted; normal
+   * categories are always `false`.
+   */
+  isDefault: boolean;
+  /**
+   * Internal, transient marker set while a non-default category is being deleted and its
+   * Tasks reparented to the default. While present, new Tasks may not attach to (or move
+   * into) this category. Never exposed in the GraphQL Category type.
+   */
+  deleting?: boolean;
+  /**
+   * Internal, transactionally-maintained count of Tasks currently filed under this
+   * category. Incremented/decremented in the same transaction as the Task write
+   * (create/category-change/delete/reparent), so deleteCategory can prove — via a
+   * strongly-consistent read of `taskCount === 0` — that no Task still references the
+   * category before removing it, despite the category GSI being eventually consistent.
+   * Never exposed in the GraphQL Category type.
+   */
+  taskCount?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -64,16 +91,29 @@ export interface Task {
   taskId: string;
   ownerId: string;
   title: string;
-  /** Defaults to the NO_CATEGORY sentinel when the client supplies none. */
-  categoryId?: string;
+  /**
+   * Id of the real Category this Task belongs to. Always set — a Task with no explicit
+   * category is filed under its owner's default category; never null.
+   */
+  categoryId: string;
   /**
    * Denormalized taskCategoryIndex partition key (<ownerId>#<categoryId>). Written by
    * createTask; not part of the GraphQL Task type — clients query by ownerId/categoryId.
    */
   taskCategoryKey?: string;
+  /**
+   * Internal step bookkeeping for concurrency-safe step management (not exposed in GraphQL):
+   *  - `stepCount`     — number of TaskSteps under this task (≤ 99).
+   *  - `stepVersion`   — optimistic-concurrency version, bumped on every step-set change
+   *                      (create/delete/reorder); a versioned condition serializes appends.
+   *  - `nextStepOrder` — the order a standalone append must use (monotonic; reset by reorder).
+   * Initialized by createTask; backfilled for legacy rows by the migration.
+   */
+  stepCount?: number;
+  stepVersion?: number;
+  nextStepOrder?: number;
   description?: string;
   scheduleRule?: string;
-  status: TaskStatus;
   /** Recurring-schedule metadata; present only when the task was created with a schedule. */
   schedule?: TaskSchedule;
   /** First (next) fire time — equals schedule.firstOccurrenceAt at creation. */
@@ -97,8 +137,12 @@ export interface TaskStep {
   taskId: string;
   order: number;
   text: string;
-  /** At most one media asset (singular media model); absent when the step has none. */
-  mediaAssetId?: string;
+  /** Optional longer description, separate from `text` and from `Task.description`. */
+  description?: string;
+  /** API-only hydrated assets: one per MediaType, sorted IMAGE → AUDIO → VIDEO. */
+  mediaAssets?: MediaAsset[];
+  /** Internal optimistic-concurrency counter for type-specific media updates. */
+  mediaVersion?: number;
   createdAt: string;
   updatedAt?: string;
 }
@@ -162,6 +206,20 @@ export interface CreateMyUserProfileInput {
   accessibilitySettings?: Record<string, unknown>;
 }
 
+/**
+ * Partial update of the caller's OWN profile. The owner is derived from the Cognito
+ * identity (never client-supplied), so there is no userId — and userId, email, role,
+ * organizationId, defaultCategoryId, and timestamps are intentionally absent: they cannot
+ * be changed here. At least one of `displayName`/`accessibilitySettings` must be supplied.
+ * `displayName`: omitted ⇒ unchanged; otherwise trimmed and may not be empty/whitespace.
+ * `accessibilitySettings`: omitted ⇒ unchanged; explicit `null` ⇒ cleared; a non-null value
+ * ⇒ FULL replacement of the stored settings (never deep-merged).
+ */
+export interface UpdateMyUserProfileInput {
+  displayName?: string | null;
+  accessibilitySettings?: Record<string, unknown> | null;
+}
+
 export interface CreateSupportLinkInput {
   supporterId: string;
   primaryUserId: string;
@@ -169,15 +227,37 @@ export interface CreateSupportLinkInput {
   permissions?: Record<string, unknown>;
 }
 
+// ownerId is intentionally absent — the owner is derived from the authenticated
+// Cognito identity (event.identity.sub), never client-supplied. Categories are private
+// to their owner.
 export interface CreateCategoryInput {
-  ownerId: string;
   name: string;
   color?: string;
   sortOrder?: number;
 }
 
+/**
+ * Partial edit of one of the caller's own categories. At least one updatable field
+ * (name, color, sortOrder) must be supplied. The default category's `name` may not be
+ * changed (color/sortOrder are allowed); a normal category may not be renamed to the
+ * reserved default name.
+ */
+export interface UpdateCategoryInput {
+  categoryId: string;
+  name?: string;
+  color?: string;
+  sortOrder?: number;
+}
+
+/** Identifies one of the caller's own categories to delete. The default cannot be deleted. */
+export interface DeleteCategoryInput {
+  categoryId: string;
+}
+
 export interface CreateTaskStepNestedInput {
   text: string;
+  /** Optional longer description, separate from `text`. Trimmed when stored. */
+  description?: string;
 }
 
 /** Schedule metadata accepted at task creation. `enabled` defaults to true when stored. */
@@ -189,13 +269,17 @@ export interface TaskScheduleInput {
   enabled?: boolean;
 }
 
+// ownerId is intentionally absent — the owner is derived from the authenticated
+// Cognito identity (event.identity.sub), never client-supplied.
 export interface CreateTaskInput {
-  ownerId: string;
   title: string;
+  /**
+   * Optional. Omitted/null ⇒ the owner's default category. A blank string is rejected.
+   * A supplied id must be a real, owned, non-deleting Category.
+   */
   categoryId?: string;
   description?: string;
   scheduleRule?: string;
-  status?: TaskStatus;
   steps?: CreateTaskStepNestedInput[];
   schedule?: TaskScheduleInput;
   notificationEnabled?: boolean;
@@ -213,10 +297,13 @@ export interface CreateTaskInput {
 export interface UpdateTaskInput {
   taskId: string;
   title?: string;
+  /**
+   * Omitted ⇒ unchanged. A blank string is rejected. A supplied id must be a real,
+   * owned, non-deleting Category belonging to the task's owner.
+   */
   categoryId?: string;
   description?: string;
   scheduleRule?: string;
-  status?: TaskStatus;
   schedule?: TaskScheduleInput;
   notificationEnabled?: boolean;
   /**
@@ -231,32 +318,60 @@ export interface CreateTaskStepInput {
   taskId: string;
   order: number;
   text: string;
+  /** Optional longer description, separate from `text`. Trimmed when stored. */
+  description?: string;
+  /** Optional initial type-specific media; every entry must supply a non-null asset id. */
+  media?: StepMediaUpdateInput[];
 }
 
 /**
  * Partial edit of one TaskStep, located by (taskId, stepId). At least one of `text`,
- * `mediaAssetId`, or `removeMedia: true` must be supplied. `text` is trimmed and must be
- * non-empty. `mediaAssetId` attaches one existing, currently-unattached media asset
- * (replacing any current one). `removeMedia: true` removes+deletes the current asset.
- * Supplying both `mediaAssetId` and `removeMedia: true` is rejected. `stepId`, `taskId`,
- * `order`, and `createdAt` are immutable.
+ * `description`, or `media` must be supplied. `text` is trimmed and must be non-empty.
+ * `description` semantics: omitted ⇒ unchanged; explicit `null` ⇒ clear; whitespace-only
+ * ⇒ rejected; otherwise trimmed and stored. Each `media` entry sets one media type: a
+ * non-null asset id attaches a currently-unattached matching asset (replacing that type's
+ * prior asset), while null removes the current asset of that type. `stepId`, `taskId`, and
+ * `createdAt` are immutable (use reorderTaskSteps to change `order`).
  */
 export interface UpdateTaskStepInput {
   taskId: string;
   stepId: string;
   text?: string;
-  mediaAssetId?: string;
-  removeMedia?: boolean;
+  /** Omitted ⇒ unchanged; `null` ⇒ clear; whitespace-only ⇒ rejected; else trimmed + stored. */
+  description?: string | null;
+  media?: StepMediaUpdateInput[];
+}
+
+/** One type-specific TaskStep media change; types must be unique within one request. */
+export interface StepMediaUpdateInput {
+  type: MediaType;
+  assetId?: string | null;
 }
 
 /**
- * Identifies one TaskStep for deletion. The step is located by (taskId, stepId) — the
- * storage SK is derived from `order`, not stepId, so the row is found by query. Deleting
- * a step also cleans up media assets that are exclusive to it (see the tasks handler).
+ * Identifies one TaskStep for deletion, located by (taskId, stepId) — the storage SK is
+ * STEP#<stepId>. Deleting a step also cleans up every media asset attached to it (see the
+ * tasks handler).
  */
 export interface DeleteTaskStepInput {
   taskId: string;
   stepId: string;
+}
+
+/** One step's target position in a whole-task reorder. */
+export interface ReorderTaskStepInput {
+  stepId: string;
+  order: number;
+}
+
+/**
+ * Atomically reorder ALL of a task's steps. `steps` must be the complete current set:
+ * every existing stepId exactly once, orders a contiguous 1..N permutation. Applied in a
+ * single DynamoDB transaction (all-or-nothing); only the `order` attribute changes.
+ */
+export interface ReorderTaskStepsInput {
+  taskId: string;
+  steps: ReorderTaskStepInput[];
 }
 
 export interface CreateAssignmentInput {
@@ -293,7 +408,7 @@ export interface DeleteAssignmentInput {
 }
 
 // Newly registered media is always created UNATTACHED — there is no stepId here; an asset
-// is bound to a step only via updateTaskStep(mediaAssetId) (or used as a cover image).
+// is bound to a step only via updateTaskStep(media) (or used as a cover image).
 export interface CreateMediaAssetInput {
   taskId: string;
   s3Key: string;

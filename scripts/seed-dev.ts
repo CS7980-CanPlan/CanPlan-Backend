@@ -19,7 +19,15 @@
 import { randomUUID } from 'crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
-import { ENTITY, META_SK, stepSk, taskPk } from '../src/shared/keys';
+import {
+  categorySk,
+  ENTITY,
+  META_SK,
+  stepSk,
+  taskCategoryKey,
+  taskPk,
+  userPk,
+} from '../src/shared/keys';
 
 // Default to the backend region (ca-central-1), matching src/shared/dynamodb.ts, so
 // the seed targets the right table even if the profile's default region differs.
@@ -35,8 +43,31 @@ const taskId = randomUUID();
 // OrgAdmin who created the template; here it's a known value so you can exercise
 // listTasksByOwner without a real account.
 const ownerId = 'seed-support-1';
+// Every task belongs to a real Category, so seed one and file the task under it. (A real
+// account also has a "No Category" default created with its profile; this standalone
+// content seed just needs one valid category to reference.)
+const categoryId = randomUUID();
+
+const steps = (
+  ['Wet your hands with warm water', 'Add soap and scrub for 20 seconds', 'Rinse and dry'] as const
+).map((text, index) => ({
+  stepId: randomUUID(),
+  order: index + 1,
+  text,
+}));
 
 const items: Array<Record<string, unknown>> = [
+  {
+    PK: userPk(ownerId),
+    SK: categorySk(categoryId),
+    entityType: ENTITY.CATEGORY,
+    categoryId,
+    ownerId,
+    name: 'Hygiene',
+    isDefault: false,
+    createdAt: now,
+    updatedAt: now,
+  },
   {
     PK: taskPk(taskId),
     SK: META_SK,
@@ -44,23 +75,22 @@ const items: Array<Record<string, unknown>> = [
     taskId,
     ownerId,
     title: 'Wash your hands',
-    status: 'ACTIVE',
+    categoryId,
+    taskCategoryKey: taskCategoryKey(ownerId, categoryId),
     createdAt: now,
     updatedAt: now,
   },
-  ...['Wet your hands with warm water', 'Add soap and scrub for 20 seconds', 'Rinse and dry'].map(
-    (text, index) => ({
-      PK: taskPk(taskId),
-      SK: stepSk(index + 1),
-      entityType: ENTITY.TASK_STEP,
-      stepId: randomUUID(),
-      taskId,
-      order: index + 1,
-      text,
-      createdAt: now,
-      updatedAt: now,
-    }),
-  ),
+  ...steps.map((step) => ({
+    PK: taskPk(taskId),
+    SK: stepSk(step.stepId),
+    entityType: ENTITY.TASK_STEP,
+    stepId: step.stepId,
+    taskId,
+    order: step.order,
+    text: step.text,
+    createdAt: now,
+    updatedAt: now,
+  })),
 ];
 
 async function seed() {
@@ -69,7 +99,9 @@ async function seed() {
     await client.send(new PutCommand({ TableName: TABLE, Item: item }));
     console.log(`  Put ${item.entityType}: ${item.PK} / ${item.SK}`);
   }
-  console.log(`Done. Seeded task ${taskId} (owner ${ownerId}) with ${items.length - 1} steps.`);
+  console.log(
+    `Done. Seeded category ${categoryId} + task ${taskId} (owner ${ownerId}) with ${steps.length} steps.`,
+  );
 }
 
 seed().catch((err) => {

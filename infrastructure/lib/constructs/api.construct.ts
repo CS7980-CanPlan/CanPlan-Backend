@@ -73,7 +73,9 @@ export class Api extends Construct {
     };
 
     // createTask — dedicated Lambda (writes a task + its steps atomically).
-    wire('CreateTaskDataSource', props.createTaskFn, [{ typeName: 'Mutation', fieldName: 'createTask' }]);
+    wire('CreateTaskDataSource', props.createTaskFn, [
+      { typeName: 'Mutation', fieldName: 'createTask' },
+    ]);
 
     // generateTaskSteps — Bedrock KB + RAG.
     wire('GenerateTaskStepsDataSource', props.generateTaskStepsFn, [
@@ -83,24 +85,28 @@ export class Api extends Construct {
     // UserProfile + SupportLink.
     wire('UsersDataSource', props.usersFn, [
       { typeName: 'Mutation', fieldName: 'createUserProfile' },
+      { typeName: 'Mutation', fieldName: 'updateMyUserProfile' },
       { typeName: 'Mutation', fieldName: 'createSupportLink' },
       { typeName: 'Query', fieldName: 'getUserProfile' },
       { typeName: 'Query', fieldName: 'listUsersByOrganization' },
       { typeName: 'Query', fieldName: 'listPrimaryUsersBySupporter' },
     ]);
 
-    // User-owned task categories.
+    // User-owned task categories (private to the caller — owner derived from identity).
     wire('CategoriesDataSource', props.categoriesFn, [
       { typeName: 'Mutation', fieldName: 'createCategory' },
-      { typeName: 'Query', fieldName: 'listCategoriesByOwner' },
+      { typeName: 'Mutation', fieldName: 'updateCategory' },
+      { typeName: 'Mutation', fieldName: 'deleteCategory' },
+      { typeName: 'Query', fieldName: 'listMyCategories' },
     ]);
 
-    // Task reads + edits + standalone step creation.
+    // Task reads + edits + standalone step creation, update, delete, and reordering.
     wire('TasksDataSource', props.tasksFn, [
       { typeName: 'Mutation', fieldName: 'updateTask' },
       { typeName: 'Mutation', fieldName: 'createTaskStep' },
       { typeName: 'Mutation', fieldName: 'updateTaskStep' },
       { typeName: 'Mutation', fieldName: 'deleteTaskStep' },
+      { typeName: 'Mutation', fieldName: 'reorderTaskSteps' },
       { typeName: 'Mutation', fieldName: 'deleteTask' },
       { typeName: 'Query', fieldName: 'getTask' },
       { typeName: 'Query', fieldName: 'listTaskSteps' },
@@ -140,7 +146,9 @@ export class Api extends Construct {
     noneDs.createResolver('HealthCheckResolver', {
       typeName: 'Query',
       fieldName: 'healthCheck',
-      requestMappingTemplate: appsync.MappingTemplate.fromString('{"version":"2018-05-29","payload":{}}'),
+      requestMappingTemplate: appsync.MappingTemplate.fromString(
+        '{"version":"2018-05-29","payload":{}}',
+      ),
       responseMappingTemplate: appsync.MappingTemplate.fromString('"OK"'),
     });
 

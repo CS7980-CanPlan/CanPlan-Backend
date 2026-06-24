@@ -70,8 +70,8 @@ describe('createAssignment', () => {
 
   it('snapshots one AssignmentStep per TaskStep, copying text only (NOT media) and completed=false', async () => {
     stubTask([
-      // The TaskStep may carry a live mediaAssetId — it must NOT be copied into the snapshot.
-      { stepId: 's1', taskId: 'task-1', order: 1, text: 'Wet brush', mediaAssetId: 'm1' },
+      // The TaskStep may carry live media assets — they must NOT be copied into the snapshot.
+      { stepId: 's1', taskId: 'task-1', order: 1, text: 'Wet brush', mediaAssets: [{ assetId: 'm1' }] },
       { stepId: 's2', taskId: 'task-1', order: 2, text: 'Add paste' },
     ]);
     await handler(event('createAssignment', { input: { taskId: 'task-1', userId: 'u1' } }));
@@ -84,7 +84,7 @@ describe('createAssignment', () => {
     expect(s1.order).toBe(1);
     expect(s1.text).toBe('Wet brush');
     // A live Task MediaAsset is never copied into an immutable assignment snapshot.
-    expect(s1.mediaAssetId).toBeUndefined();
+    expect(s1.mediaAssets).toBeUndefined();
     expect(s1.completed).toBe(false);
     expect(s1.completedAt).toBeUndefined();
     expect(typeof s1.createdAt).toBe('string');

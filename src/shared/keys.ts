@@ -52,13 +52,22 @@ export const MEDIA_PREFIX = 'MEDIA#';
 export const TASK_MEDIA_CLEANUP_PREFIX = 'CLEANUP_MEDIA#';
 export const USER_LINK_PREFIX = 'USER#';
 
-// ── Reserved ids ──────────────────────────────────────────────────────────────
+// ── Reserved category ─────────────────────────────────────────────────────────
 /**
- * Default category a Task falls into when none is supplied. Stored verbatim (not a
- * null) so every Task carries a queryable taskCategoryKey and "uncategorized" is a
- * first-class bucket in taskCategoryIndex, not a missing-attribute special case.
+ * Name of every user's mandatory default Category. It is a real, persisted Category
+ * row (its own generated UUID, `isDefault: true`) — not a synthetic fallback id. A Task created
+ * without an explicit category falls into its owner's default category, and the
+ * default category can be neither renamed nor deleted. Creating another category with
+ * this name for the same owner is rejected so the reserved one stays unambiguous.
  */
-export const NO_CATEGORY = 'NO_CATEGORY';
+export const DEFAULT_CATEGORY_NAME = 'No Category';
+/** Neutral slate color assigned when the server creates a default Category. */
+export const DEFAULT_CATEGORY_COLOR = '#64748B';
+
+/** True when `name` (trimmed, case-insensitive) collides with the reserved default name. */
+export function isDefaultCategoryName(name: string): boolean {
+  return name.trim().toLowerCase() === DEFAULT_CATEGORY_NAME.toLowerCase();
+}
 
 // ── Partition keys ────────────────────────────────────────────────────────────
 export const userPk = (userId: string): string => `USER#${userId}`;
@@ -79,8 +88,13 @@ export const taskCategoryKey = (ownerId: string, categoryId: string): string =>
 export const categorySk = (categoryId: string): string => `${CATEGORY_PREFIX}${categoryId}`;
 /** SupportLink SK — one row per managed primary user under a supporter. */
 export const userLinkSk = (primaryUserId: string): string => `USER#${primaryUserId}`;
-/** TaskStep SK — zero-padded order keeps steps lexicographically ordered (STEP#001). */
-export const stepSk = (order: number): string => `${STEP_PREFIX}${padOrder(order)}`;
+/**
+ * TaskStep SK — keyed by the stable, immutable stepId (STEP#<stepId>), NOT by `order`.
+ * `order` is a plain item attribute, so a step can be reordered with a single in-place
+ * attribute update (no key rewrite), and a whole-task reorder is one atomic transaction.
+ * Read paths sort by the numeric `order` attribute, never by key order.
+ */
+export const stepSk = (stepId: string): string => `${STEP_PREFIX}${stepId}`;
 /** Assignment SK — keyed by the globally-unique assignmentId, never the taskId. */
 export const assignSk = (assignmentId: string): string => `${ASSIGN_PREFIX}${assignmentId}`;
 /** AssignmentStep SK — one snapshot row per TaskStep within one assignment. */
@@ -92,9 +106,5 @@ export const assignStepPrefix = (assignmentId: string): string =>
 /** MediaAsset SK — keyed by the unique assetId under the owning task. */
 export const mediaSk = (assetId: string): string => `${MEDIA_PREFIX}${assetId}`;
 /** Task-media cleanup journal SK — retains an S3 key until the binary is deleted. */
-export const taskMediaCleanupSk = (assetId: string): string => `${TASK_MEDIA_CLEANUP_PREFIX}${assetId}`;
-
-/** Zero-pad a step order to three digits: 1 → "001". Keeps STEP#001 < STEP#010 < STEP#100. */
-export function padOrder(order: number): string {
-  return String(order).padStart(3, '0');
-}
+export const taskMediaCleanupSk = (assetId: string): string =>
+  `${TASK_MEDIA_CLEANUP_PREFIX}${assetId}`;

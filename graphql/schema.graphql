@@ -19,12 +19,6 @@ enum SupportLinkStatus {
   REVOKED
 }
 
-enum TaskStatus {
-  DRAFT
-  ACTIVE
-  ARCHIVED
-}
-
 # Assignment lifecycle. Only TO_DO, COMPLETED, and SKIPPED are ever persisted.
 # OVERDUE is a derived, read-only status: returned when a TO_DO assignment has a
 # dueDate in the past. Clients must never send OVERDUE to a mutation.
@@ -59,6 +53,10 @@ type UserProfile {
   email: String
   organizationId: ID
   accessibilitySettings: AWSJSON
+  # Id of this user's mandatory default Category (a real Category row with isDefault:true),
+  # created atomically with the profile. Tasks created without an explicit category fall
+  # into it. Server-managed; never client-supplied.
+  defaultCategoryId: ID
   # Nullable: the orgIndex roster projection (listUsersByOrganization) omits it.
   createdAt: String
   updatedAt: String
@@ -75,15 +73,20 @@ type SupportLink {
   updatedAt: String
 }
 
-# A user-owned grouping for tasks (folder-like). Owned by one user; queried via
-# listCategoriesByOwner. The reserved id "NO_CATEGORY" is never stored as a Category
-# row — it's the implicit bucket for tasks created without one.
+# A user-owned grouping for tasks (folder-like). PRIVATE to its owner: every category
+# API derives the owner from the caller's Cognito identity, not a client-supplied id.
+# Listed via listMyCategories. Every user has exactly one default category named
+# "No Category" (isDefault:true) created with their profile — it cannot be renamed or
+# deleted, and a Task with no explicit category is filed under it.
 type Category {
   categoryId: ID!
   ownerId: ID!
   name: String!
   color: String
   sortOrder: Int
+  # True only for the reserved default ("No Category") row. Server-controlled — clients
+  # use it to identify the default reliably; it is never accepted as input.
+  isDefault: Boolean!
   createdAt: String!
   updatedAt: String!
 }
@@ -102,11 +105,11 @@ type Task {
   taskId: ID!
   ownerId: ID!
   title: String!
-  # Defaults to "NO_CATEGORY" when the client supplies none at creation.
-  categoryId: ID
+  # The real Category this task belongs to. Always set — a task created without an
+  # explicit category is filed under its owner's default category.
+  categoryId: ID!
   description: String
   scheduleRule: String
-  status: TaskStatus!
   # Recurring-schedule metadata; null unless the task was created with a schedule.
   schedule: TaskSchedule
   # First/next fire time — equals schedule.firstOccurrenceAt at creation.
@@ -128,9 +131,11 @@ type TaskStep {
   taskId: ID!
   order: Int!
   text: String!
-  # At most one media asset (the singular media model). Null when the step has none.
-  # Attach/replace/remove via updateTaskStep; fetch a URL with getMediaDownloadUrl.
-  mediaAssetId: ID
+  # Optional longer description, separate from `text` and from Task.description.
+  description: String
+  # At most one asset of each MediaType (IMAGE, AUDIO, VIDEO). Set/replace/remove an
+  # individual type via updateTaskStep(media); fetch each binary with getMediaDownloadUrl.
+  mediaAssets: [MediaAsset!]!
   createdAt: String!
   updatedAt: String
 }
@@ -170,9 +175,8 @@ type AssignmentStep {
 type MediaAsset {
   assetId: ID!
   taskId: ID!
-  # Ownership marker for step media: set to the owning TaskStep's id when (and only when)
-  # this asset is that step's mediaAssetId. Null when the asset is a Task cover image or is
-  # temporarily unattached (uploaded but not yet assigned). Never set for cover images.
+  # Ownership marker for step media. A step may own one asset per MediaType. Null when this
+  # asset is a Task cover image or temporarily unattached. Never set for cover images.
   stepId: ID
   s3Key: String!
   type: MediaType!
@@ -241,6 +245,17 @@ input CreateMyUserProfileInput {
   accessibilitySettings: AWSJSON
 }
 
+# Partial update of the signed-in caller's OWN profile. The owner is derived from the
+# Cognito identity — there is no userId. Only displayName and accessibilitySettings may be
+# changed here; userId, email, role, organizationId, defaultCategoryId, and timestamps are
+# not editable. Supply at least one field. displayName: omitted ⇒ unchanged; otherwise
+# trimmed and may not be empty/whitespace. accessibilitySettings: omitted ⇒ unchanged;
+# explicit null ⇒ cleared; a value ⇒ FULL replacement of the stored settings (never merged).
+input UpdateMyUserProfileInput {
+  displayName: String
+  accessibilitySettings: AWSJSON
+}
+
 input CreateSupportLinkInput {
   supporterId: ID!
   primaryUserId: ID!
@@ -248,11 +263,27 @@ input CreateSupportLinkInput {
   permissions: AWSJSON
 }
 
+# Create one of the caller's own categories. The owner is derived from the Cognito
+# identity — there is no ownerId. `name` may not be the reserved "No Category".
 input CreateCategoryInput {
-  ownerId: ID!
   name: String!
   color: String
   sortOrder: Int
+}
+
+# Partial edit of one of the caller's own categories — at least one of name/color/
+# sortOrder is required. The default category's name cannot be changed (color/sortOrder
+# are allowed); a normal category cannot be renamed to the reserved "No Category".
+input UpdateCategoryInput {
+  categoryId: ID!
+  name: String
+  color: String
+  sortOrder: Int
+}
+
+# Identifies one of the caller's own categories to delete. The default cannot be deleted.
+input DeleteCategoryInput {
+  categoryId: ID!
 }
 
 # Schedule metadata accepted at task creation. `enabled` defaults to true when stored.
@@ -264,14 +295,14 @@ input TaskScheduleInput {
   enabled: Boolean
 }
 
+# The owner is derived from the Cognito identity — there is no ownerId.
 input CreateTaskInput {
-  ownerId: ID!
   title: String!
-  # Optional; blank/omitted falls back to the "NO_CATEGORY" bucket.
+  # Optional. Omitted/null ⇒ the owner's default category. A blank string is rejected; a
+  # supplied id must be a real, owned, non-deleting Category.
   categoryId: ID
   description: String
   scheduleRule: String
-  status: TaskStatus
   steps: [CreateTaskStepNestedInput!]
   # Optional recurring schedule (stored only in phase 1; no delivery yet).
   schedule: TaskScheduleInput
@@ -288,10 +319,11 @@ input CreateTaskInput {
 input UpdateTaskInput {
   taskId: ID!
   title: String
+  # Omitted ⇒ unchanged. A blank string is rejected; a supplied id must be a real, owned,
+  # non-deleting Category belonging to the task's owner.
   categoryId: ID
   description: String
   scheduleRule: String
-  status: TaskStatus
   schedule: TaskScheduleInput
   notificationEnabled: Boolean
   # Optional new cover image: the pending s3Key from createTaskCoverImageUploadUrl.
@@ -300,36 +332,65 @@ input UpdateTaskInput {
   coverImageS3Key: String
 }
 
-# Nested step at task creation — text only. The task and step ids don't exist yet, so
-# media is attached afterward (createMediaUploadUrl → createMediaAsset → updateTaskStep).
+# Nested step at task creation — text (+ optional description). The task and step ids
+# don't exist yet, so media is attached afterward (createMediaUploadUrl →
+# createMediaAsset → updateTaskStep).
 input CreateTaskStepNestedInput {
   text: String!
+  # Optional longer description, separate from `text`. Trimmed when stored.
+  description: String
 }
 
 input CreateTaskStepInput {
   taskId: ID!
   order: Int!
   text: String!
+  # Optional longer description, separate from `text`. Trimmed when stored.
+  description: String
+  # Optional initial media slots. Each entry requires a non-null assetId; types must be unique.
+  media: [SetTaskStepMediaInput!]
 }
 
-# Partial edit of one TaskStep, located by (taskId, stepId). Supply at least one of
-# `text`, `mediaAssetId`, or `removeMedia: true`. `text` is trimmed and may not be empty.
-# `mediaAssetId` attaches one existing, currently-unattached media asset (replacing any
-# current one, which is then deleted). `removeMedia: true` removes and deletes the step's
-# current media asset. Supplying both `mediaAssetId` and `removeMedia: true` is rejected.
-# `stepId`, `taskId`, `order`, and `createdAt` are immutable.
+# Set one media-type slot on a TaskStep. An assetId attaches a currently-unattached asset of
+# exactly this type, replacing and deleting the existing asset of the same type. Explicit
+# null (or omitted) assetId removes the current asset of this type. Types may appear only
+# once per update; omitted types are unchanged.
+input SetTaskStepMediaInput {
+  type: MediaType!
+  assetId: ID
+}
+
+# Partial edit of one TaskStep, located by (taskId, stepId). Supply at least one of `text`,
+# `description`, or `media`. `text` is trimmed and may not be empty. `description` semantics:
+# omitted ⇒ unchanged; explicit null ⇒ clear; whitespace-only ⇒ rejected; otherwise trimmed
+# and stored. `media` sets/replaces/removes one or more type-specific media slots. `stepId`,
+# `taskId`, and `createdAt` are immutable (use reorderTaskSteps to change order).
 input UpdateTaskStepInput {
   taskId: ID!
   stepId: ID!
   text: String
-  mediaAssetId: ID
-  removeMedia: Boolean
+  description: String
+  media: [SetTaskStepMediaInput!]
 }
 
-# Identifies one TaskStep for deletion. Deleting it also deletes the step's single media
-# asset (metadata row + S3 object), if any. Shared media does not exist in this model —
-# each asset belongs to exactly one step or the cover. Assignments/AssignmentSteps are
-# never touched.
+# One step's target position in a whole-task reorder.
+input ReorderTaskStepInput {
+  stepId: ID!
+  order: Int!
+}
+
+# Atomically reorder ALL of a task's steps. `steps` must be the complete current set:
+# every existing stepId exactly once, with orders forming a contiguous 1..N permutation
+# (max 99 steps). Applied in one DynamoDB transaction (all-or-nothing); only the `order`
+# attribute changes — step ids, media, task contents, and assignments are untouched.
+input ReorderTaskStepsInput {
+  taskId: ID!
+  steps: [ReorderTaskStepInput!]!
+}
+
+# Identifies one TaskStep for deletion. Deleting it also deletes every media asset attached
+# to the step (metadata rows + S3 objects), if any. Assets are never shared between steps or
+# the cover. Assignments/AssignmentSteps are never touched.
 input DeleteTaskStepInput {
   taskId: ID!
   stepId: ID!
@@ -367,7 +428,7 @@ input DeleteAssignmentInput {
 }
 
 # Register an uploaded object's metadata. The asset is created UNATTACHED — it is bound
-# to a step only via updateTaskStep(mediaAssetId), or used as a cover via the cover flow.
+# to a step only via updateTaskStep(media), or used as a cover via the cover flow.
 input CreateMediaAssetInput {
   taskId: ID!
   s3Key: String!
@@ -391,8 +452,8 @@ input CreateTaskCoverImageUploadUrlInput {
   fileName: String
 }
 
-# Identifies one MediaAsset to delete (its S3 binary + metadata row). Also clears the one
-# back-reference to it (Task.coverImageAssetId, or the owning TaskStep's mediaAssetId).
+# Identifies one MediaAsset to delete (its S3 binary + metadata row). It also clears a Task
+# cover reference when applicable; Step media is discovered from MediaAsset.stepId at read time.
 input DeleteMediaAssetInput {
   taskId: ID!
   assetId: ID!
@@ -466,13 +527,15 @@ type Query {
   listUsersByOrganization(organizationId: ID!, limit: Int, nextToken: String): UserProfileConnection!
   listPrimaryUsersBySupporter(supporterId: ID!, limit: Int, nextToken: String): SupportLinkConnection!
 
-  listCategoriesByOwner(ownerId: ID!, limit: Int, nextToken: String): CategoryConnection!
+  # The authenticated caller's own categories (owner derived from the Cognito identity).
+  listMyCategories(limit: Int, nextToken: String): CategoryConnection!
 
   getTask(taskId: ID!): Task
+  # A task's steps, sorted by ascending numeric `order`.
   listTaskSteps(taskId: ID!, limit: Int, nextToken: String): TaskStepConnection!
   listTasksByOwner(ownerId: ID!, limit: Int, nextToken: String): TaskConnection!
-  # Tasks in one of an owner's categories. Omit/blank categoryId for the "NO_CATEGORY" bucket.
-  listTasksByCategory(ownerId: ID!, categoryId: ID, limit: Int, nextToken: String): TaskConnection!
+  # Tasks in one of an owner's real categories. categoryId is required.
+  listTasksByCategory(ownerId: ID!, categoryId: ID!, limit: Int, nextToken: String): TaskConnection!
 
   listAssignmentsForUser(userId: ID!, limit: Int, nextToken: String): AssignmentConnection!
   # One assignment's step snapshots, sorted by `order`.
@@ -493,22 +556,39 @@ type Mutation {
   # Create the signed-in caller's own profile. userId, email, and role are taken
   # from the Cognito session (role derived from group membership), not the input.
   createUserProfile(input: CreateMyUserProfileInput!): UserProfile
+  # Partial update of the caller's OWN profile (owner derived from the Cognito identity).
+  # Only displayName and accessibilitySettings are editable; accessibilitySettings is a full
+  # replacement, not a merge. Errors (NotFound) if the profile doesn't exist — it never
+  # creates one. organizationId, role, email, etc. cannot be changed here.
+  updateMyUserProfile(input: UpdateMyUserProfileInput!): UserProfile!
   createSupportLink(input: CreateSupportLinkInput!): SupportLink
 
-  # Create a user-owned task category (folder-like grouping).
+  # Create one of the caller's own task categories (owner derived from identity).
   createCategory(input: CreateCategoryInput!): Category
+  # Edit one of the caller's own categories (partial update). The default category's name
+  # is immutable; normal categories cannot take the reserved "No Category" name.
+  updateCategory(input: UpdateCategoryInput!): Category!
+  # Delete one of the caller's own NON-default categories. Every task in it is first moved
+  # to the owner's default category, then the category row is removed. Internally this may
+  # run across multiple batches for large categories; it is safe to retry. Returns the
+  # deleted category. The default category cannot be deleted.
+  deleteCategory(input: DeleteCategoryInput!): Category!
 
   # Create a reusable task template (and optionally its ordered steps).
   createTask(input: CreateTaskInput!): Task
   # Edit an existing task template's fields (partial update). Errors if not found.
   updateTask(input: UpdateTaskInput!): Task
   createTaskStep(input: CreateTaskStepInput!): TaskStep
-  # Partial edit of one TaskStep: text, and/or attach (mediaAssetId) / remove (removeMedia)
-  # its single media asset. Errors if not found.
+  # Partial edit of one TaskStep: text, description, and/or type-specific media slots.
+  # A step may have one IMAGE, one AUDIO, and one VIDEO asset. Errors if not found.
   updateTaskStep(input: UpdateTaskStepInput!): TaskStep
-  # Delete one TaskStep and its single media asset (metadata row + S3 object), if any.
+  # Delete one TaskStep and every attached media asset (metadata rows + S3 objects), if any.
   # Historical AssignmentSteps are unaffected. Returns the deleted TaskStep.
   deleteTaskStep(input: DeleteTaskStepInput!): TaskStep
+  # Atomically reorder ALL of a task's steps (must supply the complete current set).
+  # Returns the steps sorted by ascending order. Step ids, media, and assignments are
+  # untouched.
+  reorderTaskSteps(input: ReorderTaskStepsInput!): [TaskStep!]!
   # Delete a task template and all of its TaskSteps. Historical Assignments and
   # AssignmentSteps snapshotted from it are NOT deleted. Returns the deleted Task.
   deleteTask(taskId: ID!): Task
@@ -529,8 +609,8 @@ type Mutation {
   # non-image content types. Pass the returned s3Key as coverImageS3Key to createTask/
   # updateTask, which verifies and promotes the upload to a task-owned MediaAsset.
   createTaskCoverImageUploadUrl(input: CreateTaskCoverImageUploadUrlInput!): MediaUploadTarget!
-  # Delete one MediaAsset: its S3 binary and metadata row, plus the single back-reference
-  # to it (clears Task.coverImageAssetId, or the owning TaskStep's mediaAssetId). Returns
+  # Delete one MediaAsset: its S3 binary and metadata row, plus a Task cover back-reference
+  # when applicable. Step media is resolved through MediaAsset.stepId. Returns
   # the deleted asset; NotFound if it doesn't exist. Does not delete the Task or its steps.
   deleteMediaAsset(input: DeleteMediaAssetInput!): MediaAsset
 
