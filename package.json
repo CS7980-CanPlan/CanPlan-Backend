@@ -21,8 +21,7 @@
     "@aws-sdk/client-dynamodb": "^3.600.0",
     "@aws-sdk/client-s3": "^3.1069.0",
     "@aws-sdk/lib-dynamodb": "^3.600.0",
-    "@aws-sdk/s3-request-presigner": "^3.1069.0",
-    "@cdklabs/generative-ai-cdk-constructs": "^0.1.317"
+    "@aws-sdk/s3-request-presigner": "^3.1069.0"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.140",
