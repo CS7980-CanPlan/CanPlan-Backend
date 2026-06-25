@@ -18,6 +18,7 @@ export interface ApiProps {
   readonly assignmentsFn: lambda.IFunction;
   readonly mediaFn: lambda.IFunction;
   readonly adminFn: lambda.IFunction;
+  readonly createAiTaskFn: lambda.IFunction;
 }
 
 /** A (typeName, fieldName) pair wired to a Lambda data source. */
@@ -80,6 +81,11 @@ export class Api extends Construct {
     // generateTaskSteps — Bedrock KB + RAG.
     wire('GenerateTaskStepsDataSource', props.generateTaskStepsFn, [
       { typeName: 'Mutation', fieldName: 'generateTaskSteps' },
+    ]);
+
+    // createAiTask — Bedrock-powered task creation with AI-generated steps.
+    wire('CreateAiTaskDataSource', props.createAiTaskFn, [
+      { typeName: 'Mutation', fieldName: 'createAiTask' },
     ]);
 
     // UserProfile + SupportLink.
