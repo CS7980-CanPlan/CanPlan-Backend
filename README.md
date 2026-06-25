@@ -25,11 +25,20 @@ AssignmentStep, MediaAsset, Report. The item-key conventions live in
 | `createMediaUploadUrl`, `createTaskCoverImageUploadUrl`, `createMediaAsset`, `deleteMediaAsset`, `getMediaDownloadUrl`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB + S3 media bucket (presigned upload/download, cover images, cascade delete) |
 | `listAllUsers`, `listAllTasks` | Query | `canplan-admin-<env>` Lambda + DynamoDB `entityTypeIndex` (SystemAdmin only, paginated) |
 | `generateTaskSteps` | Mutation | `canplan-generateTaskSteps-<env>` Lambda + Bedrock KB RAG |
+| `createAiTask` | Mutation | `canplan-createAiTask-<env>` Lambda + Bedrock KB RAG + DynamoDB (generate + persist in one call) |
 
 Domain Lambdas back several fields each, routing on the resolved GraphQL field
-(`event.info.fieldName`). AI usage is through `generateTaskSteps`: retrieve relevant
-corpus passages from the Knowledge Base, then call Bedrock Converse to generate
-cited task steps.
+(`event.info.fieldName`). AI usage is through two mutations. `generateTaskSteps`
+retrieves relevant corpus passages from the Knowledge Base, then calls Bedrock
+Converse to generate cited task steps (it returns the steps; it does not save a
+task). `createAiTask` takes a single free-text `query`, generates a clean title
+plus ordered steps over the same Knowledge Base, and creates and saves the Task
+under the caller in one call; it does not surface or store citations. It reuses
+the same KB/Bedrock generation as `generateTaskSteps` (via `src/shared/stepsService.ts`)
+and the same persistence as `createTask` (via `src/shared/task.ts`). Any generation
+failure throws before any write, so a failed generation never creates a task. A
+caregiver review/approval flow over the cited sources is a separate future project,
+not part of this mutation.
 
 Default authorization is Cognito User Pool — frontend clients send a signed-in
 user's JWT. A few fields carry auth directives; see [Authentication](#authentication).
@@ -78,8 +87,8 @@ stores its id on the profile (`defaultCategoryId`). Every Task belongs to a real
 one created without an explicit `categoryId` is filed under this default. The default
 cannot be renamed or deleted. **Categories are private to their owner:** `createCategory`,
 `updateCategory`, `deleteCategory`, and `listMyCategories` all derive the owner from the
-Cognito identity and never accept a client-supplied owner id. Likewise `createTask` derives
-the task owner from the identity. Before using a profile's default category, runtime code
+Cognito identity and never accept a client-supplied owner id. Likewise `createTask` and
+`createAiTask` derive the task owner from the identity. Before using a profile's default category, runtime code
 strongly reads and verifies the profile pointer, owner, exact `No Category` name,
 `isDefault: true`, and that it is not being deleted; an invalid legacy row fails clearly
 until the migration is applied.
@@ -96,11 +105,11 @@ The app deploys two CDK stacks with `--all`.
 
 | Region | Stack | Main resources |
 | ------ | ----- | -------------- |
-| `CANPLAN_BACKEND_REGION` default `ca-central-1` | `canplan-backend-<env>` | AppSync, Cognito, single-table DynamoDB `CanPlanTasks-<env>`, media S3 bucket, `createTask` + domain Lambdas (`users`/`categories`/`tasks`/`assignments`/`media`/`admin`) + `generateTaskSteps` Lambda, `postConfirmation` Cognito trigger Lambda, CloudWatch logs |
+| `CANPLAN_BACKEND_REGION` default `ca-central-1` | `canplan-backend-<env>` | AppSync, Cognito, single-table DynamoDB `CanPlanTasks-<env>`, media S3 bucket, `createTask` + domain Lambdas (`users`/`categories`/`tasks`/`assignments`/`media`/`admin`) + `generateTaskSteps` + `createAiTask` Lambdas, `postConfirmation` Cognito trigger Lambda, CloudWatch logs |
 | `CANPLAN_KNOWLEDGE_BASE_REGION` default `us-east-1` | `canplan-knowledge-base-<env>` | Bedrock Knowledge Base, S3 corpus bucket, Bedrock S3 data source, S3 Vectors vector bucket/index |
 
-`generateTaskSteps` runs in `ca-central-1` by default, but calls Bedrock Agent
-Runtime and Bedrock Runtime in the Knowledge Base region. CDK passes the KB id
+`generateTaskSteps` and `createAiTask` run in `ca-central-1` by default, but call
+Bedrock Agent Runtime and Bedrock Runtime in the Knowledge Base region. CDK passes the KB id
 across regions using `crossRegionReferences: true`, which creates CDK helper
 custom resources.
 
@@ -109,7 +118,7 @@ region:
 
 | Region | Lambda functions you should expect |
 | ------ | ---------------------------------- |
-| Backend region | `canplan-createTask-<env>`, `canplan-users-<env>`, `canplan-categories-<env>`, `canplan-tasks-<env>`, `canplan-assignments-<env>`, `canplan-media-<env>`, `canplan-admin-<env>`, `canplan-generateTaskSteps-<env>`, CDK cross-region reader, sandbox S3 auto-delete helper |
+| Backend region | `canplan-createTask-<env>`, `canplan-users-<env>`, `canplan-categories-<env>`, `canplan-tasks-<env>`, `canplan-assignments-<env>`, `canplan-media-<env>`, `canplan-admin-<env>`, `canplan-generateTaskSteps-<env>`, `canplan-createAiTask-<env>`, CDK cross-region reader, sandbox S3 auto-delete helper |
 | Knowledge Base region | bucket deployment helper, CDK cross-region writer, sandbox S3 auto-delete helper |
 
 ## Prerequisites
@@ -316,6 +325,9 @@ src/lambdas/createTask/handler.ts              createTask resolver (Task + steps
 src/lambdas/{users,categories,tasks,assignments,media}/handler.ts   Domain resolvers (routed by fieldName)
 src/lambdas/admin/handler.ts                   SystemAdmin list-all-by-entityType resolvers
 src/lambdas/generateTaskSteps/handler.ts       KB Retrieve -> Converse resolver
+src/lambdas/createAiTask/handler.ts            createAiTask resolver (generate titled steps -> persist)
+src/shared/stepsService.ts                     KB Retrieve + Converse orchestration (generate steps / titled steps)
+src/shared/task.ts                             persistTask: Task + steps transaction (shared by createTask/createAiTask)
 src/shared/keys.ts                             Single-table PK/SK + entityType conventions
 src/shared/category.ts                         Task↔Category lookup/validation + taskCount deltas
 src/shared/authz.ts                            Owner-scoped authorization helpers
