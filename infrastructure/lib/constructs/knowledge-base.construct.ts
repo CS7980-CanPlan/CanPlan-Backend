@@ -98,6 +98,12 @@ export class KnowledgeBase extends Construct {
       },
     });
     cfnKb.addDependency(vectorIndex);
+    // The KB validates its storage config at create time by calling s3vectors on
+    // the index *as kbRole*, so it must wait for kbRole's inline policy to attach
+    // — not just the role itself. node.addDependency on the L2 role makes the KB
+    // depend on the role's DefaultPolicy too; without it the KB races ahead of
+    // the policy and fails with a 403 on s3vectors:QueryVectors.
+    cfnKb.node.addDependency(kbRole);
 
     // S3 data source — chunking NONE so one object = one chunk.
     new bedrock.CfnDataSource(this, 'CorpusDataSource', {
