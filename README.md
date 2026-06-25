@@ -2,7 +2,7 @@
 
 AWS CDK backend for CanPlan. It deploys an AppSync GraphQL API, Cognito auth,
 DynamoDB task storage, S3 buckets, Lambda resolvers, and a Bedrock Knowledge Base
-backed by OpenSearch Serverless.
+backed by S3 Vectors.
 
 ## Current API
 
@@ -97,7 +97,7 @@ The app deploys two CDK stacks with `--all`.
 | Region | Stack | Main resources |
 | ------ | ----- | -------------- |
 | `CANPLAN_BACKEND_REGION` default `ca-central-1` | `canplan-backend-<env>` | AppSync, Cognito, single-table DynamoDB `CanPlanTasks-<env>`, media S3 bucket, `createTask` + domain Lambdas (`users`/`categories`/`tasks`/`assignments`/`media`/`admin`) + `generateTaskSteps` Lambda, `postConfirmation` Cognito trigger Lambda, CloudWatch logs |
-| `CANPLAN_KNOWLEDGE_BASE_REGION` default `us-east-1` | `canplan-knowledge-base-<env>` | Bedrock Knowledge Base, S3 corpus bucket, Bedrock S3 data source, OpenSearch Serverless vector collection/index |
+| `CANPLAN_KNOWLEDGE_BASE_REGION` default `us-east-1` | `canplan-knowledge-base-<env>` | Bedrock Knowledge Base, S3 corpus bucket, Bedrock S3 data source, S3 Vectors vector bucket/index |
 
 `generateTaskSteps` runs in `ca-central-1` by default, but calls Bedrock Agent
 Runtime and Bedrock Runtime in the Knowledge Base region. CDK passes the KB id
@@ -110,17 +110,16 @@ region:
 | Region | Lambda functions you should expect |
 | ------ | ---------------------------------- |
 | Backend region | `canplan-createTask-<env>`, `canplan-users-<env>`, `canplan-categories-<env>`, `canplan-tasks-<env>`, `canplan-assignments-<env>`, `canplan-media-<env>`, `canplan-admin-<env>`, `canplan-generateTaskSteps-<env>`, CDK cross-region reader, sandbox S3 auto-delete helper |
-| Knowledge Base region | OpenSearch index custom-resource provider, bucket deployment helper, CDK cross-region writer, sandbox S3 auto-delete helper |
+| Knowledge Base region | bucket deployment helper, CDK cross-region writer, sandbox S3 auto-delete helper |
 
 ## Prerequisites
 
 - Node.js 20+
 - AWS CLI v2 authenticated with AWS SSO
-- Docker Desktop running for `cdk synth` / `cdk deploy`
 
-Docker is required because `@cdklabs/generative-ai-cdk-constructs` bundles the
-OpenSearch Serverless index custom-resource Lambda with Docker. The business
-Lambdas use local `esbuild` bundling.
+No Docker is required: the S3 Vectors store uses first-class CloudFormation
+resources (`CfnVectorBucket` / `CfnIndex`), so there is no bundled
+custom-resource Lambda. The business Lambdas use local `esbuild` bundling.
 
 ## Quick Setup
 
@@ -278,7 +277,7 @@ The CDK app reads `--context env=...`; only `env=sandbox` is treated as sandbox.
 | Media S3 bucket | Emptied and deleted | Retained |
 | Cognito User Pool | Deleted | Retained |
 | KB corpus S3 bucket | Emptied and deleted | Retained |
-| OpenSearch Serverless collection | Deleted | Retained |
+| S3 Vectors bucket + index | Deleted | Retained |
 | AppSync, Lambdas, IAM, log groups | Deleted | Deleted |
 
 Dev/prod `cdk destroy` still destroys the stacks and non-retained infrastructure.
