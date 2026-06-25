@@ -29,8 +29,8 @@ interface RawSteps {
   steps: { text: string; citations: string[] }[];
 }
 
-/** Parse + shape-validate the model output. Strips ``` fences like the prototype. */
-export function parseSteps(raw: string): RawSteps {
+/** Strip a ```/```json code fence (if present) and return the trimmed inner text. */
+function stripJsonFences(raw: string): string {
   let text = raw.trim();
   if (text.startsWith('```')) {
     text = text.replace(/^```/, '').replace(/```$/, '').trim();
@@ -38,6 +38,12 @@ export function parseSteps(raw: string): RawSteps {
       text = text.slice(4).trim();
     }
   }
+  return text;
+}
+
+/** Parse + shape-validate the model output. Strips ``` fences like the prototype. */
+export function parseSteps(raw: string): RawSteps {
+  const text = stripJsonFences(raw);
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -105,13 +111,7 @@ interface RawTitledSteps {
 
 /** Parse + shape-validate a { title, steps } model output. Strips ``` fences like parseSteps. */
 export function parseTitledSteps(raw: string): RawTitledSteps {
-  let text = raw.trim();
-  if (text.startsWith('```')) {
-    text = text.replace(/^```/, '').replace(/```$/, '').trim();
-    if (text.toLowerCase().startsWith('json')) {
-      text = text.slice(4).trim();
-    }
-  }
+  const text = stripJsonFences(raw);
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);

@@ -63,7 +63,7 @@ export async function generateSteps(
   const passages = await retrievePassages(query);
   const prompt = buildStepsPrompt(query, passages);
   const { raw, usage } = await converse(prompt);
-  let rawSteps;
+  let rawSteps: ReturnType<typeof parseSteps>;
   try {
     rawSteps = parseSteps(raw);
   } catch {
@@ -80,7 +80,7 @@ export async function generateTitledSteps(
   const passages = await retrievePassages(query);
   const prompt = buildTitledStepsPrompt(query, passages);
   const { raw, usage } = await converse(prompt);
-  let parsed;
+  let parsed: ReturnType<typeof parseTitledSteps>;
   try {
     parsed = parseTitledSteps(raw);
   } catch {
