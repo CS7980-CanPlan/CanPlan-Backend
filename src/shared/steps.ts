@@ -80,3 +80,47 @@ export function resolveCitations(chunkIds: string[], passages: RetrievedPassage[
 export function toTaskSteps(raw: RawSteps, passages: RetrievedPassage[]): GeneratedStep[] {
   return raw.steps.map((s) => ({ text: s.text, citations: resolveCitations(s.citations, passages) }));
 }
+
+/**
+ * Like buildStepsPrompt, but also asks the model for a short, clean task title.
+ * Used by createAiTask (one-shot generate + save). Verbatim step style as the
+ * untitled prompt; only the requested JSON shape gains a `title`.
+ */
+export function buildTitledStepsPrompt(query: string, passages: RetrievedPassage[]): string {
+  const sources = passages.map((p) => `[${p.chunkId}] ${p.text}`).join('\n');
+  return (
+    `Task: ${query}\n\n` +
+    `Sources:\n${sources}\n\n` +
+    'Also give the task a short, clear title in plain everyday words (a few words, no jargon).\n' +
+    'Return JSON shaped exactly as: ' +
+    '{"title": "<short clear task title>", "steps": [{"text": "<one simple action, ' +
+    'one short sentence, no jargon>", "citations": ["<chunk_id used>"]}]}'
+  );
+}
+
+interface RawTitledSteps {
+  title: string;
+  steps: RawSteps['steps'];
+}
+
+/** Parse + shape-validate a { title, steps } model output. Strips ``` fences like parseSteps. */
+export function parseTitledSteps(raw: string): RawTitledSteps {
+  let text = raw.trim();
+  if (text.startsWith('```')) {
+    text = text.replace(/^```/, '').replace(/```$/, '').trim();
+    if (text.toLowerCase().startsWith('json')) {
+      text = text.slice(4).trim();
+    }
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`could not parse titled steps from model output: ${(err as Error).message}`);
+  }
+  const title = (parsed as { title?: unknown }).title;
+  if (typeof title !== 'string' || title.trim() === '' || !isRawSteps(parsed)) {
+    throw new Error('could not parse titled steps from model output: shape mismatch');
+  }
+  return { title: title.trim(), steps: (parsed as RawSteps).steps };
+}
