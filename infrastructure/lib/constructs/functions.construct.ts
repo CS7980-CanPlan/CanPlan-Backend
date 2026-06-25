@@ -26,6 +26,7 @@ export interface FunctionsProps {
 export class Functions extends Construct {
   public readonly createTaskFn: NodejsFunction;
   public readonly generateTaskStepsFn: NodejsFunction;
+  public readonly createAiTaskFn: NodejsFunction;
   /** Domain Lambdas — each backs several fields of one domain (routed by fieldName). */
   public readonly usersFn: NodejsFunction;
   public readonly categoriesFn: NodejsFunction;
@@ -147,6 +148,54 @@ export class Functions extends Construct {
     );
     // KB Retrieve — scoped to the one Knowledge Base in the Bedrock region.
     this.generateTaskStepsFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['bedrock:Retrieve'],
+        resources: [
+          `arn:aws:bedrock:${bedrockRegion}:${cdk.Stack.of(this).account}:knowledge-base/${knowledgeBaseId}`,
+        ],
+      }),
+    );
+
+    // ── createAiTask (Bedrock KB + RAG, then persist) ────────────────────────────
+    this.createAiTaskFn = new NodejsFunction(this, 'CreateAiTaskFunction', {
+      functionName: `canplan-createAiTask-${envName}`,
+      entry: path.join(__dirname, '../../../src/lambdas/createAiTask/handler.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      environment: {
+        DYNAMODB_TABLE_NAME: table.tableName,
+        BEDROCK_REGION: bedrockRegion,
+        BEDROCK_MODEL_ID: bedrockModelId,
+        BEDROCK_MAX_TOKENS: '1024',
+        KNOWLEDGE_BASE_ID: knowledgeBaseId,
+        RETRIEVAL_TOP_K: '4',
+        AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
+      },
+      logRetention: logs.RetentionDays.ONE_WEEK,
+      timeout: cdk.Duration.seconds(29),
+      memorySize: 256,
+    });
+
+    // DynamoDB read/write — same grant pattern as createTaskFn.
+    table.grantReadWriteData(this.createAiTaskFn);
+
+    // Converse (Sonnet) — same cross-region inference-profile grant as generateTaskSteps.
+    this.createAiTaskFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          'bedrock:InvokeModel',
+          'bedrock:InvokeModelWithResponseStream',
+          'bedrock:Converse',
+          'bedrock:ConverseStream',
+        ],
+        resources: [
+          `arn:aws:bedrock:*:${cdk.Stack.of(this).account}:inference-profile/*`,
+          'arn:aws:bedrock:*::foundation-model/anthropic.*',
+        ],
+      }),
+    );
+    // KB Retrieve — scoped to the one Knowledge Base in the Bedrock region.
+    this.createAiTaskFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['bedrock:Retrieve'],
         resources: [
