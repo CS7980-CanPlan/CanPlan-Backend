@@ -290,6 +290,12 @@ export interface CreateTaskInput {
   coverImageS3Key?: string;
 }
 
+// AI one-shot task creation input: one free-text request (+ optional category).
+export interface CreateAiTaskInput {
+  query: string;
+  categoryId?: string;
+}
+
 /**
  * Partial edit of a Task `#META` item. Only fields that are present (non-null) are
  * changed; `ownerId` and `taskId` are immutable, and steps are edited separately.

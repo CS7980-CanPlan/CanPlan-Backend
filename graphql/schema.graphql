@@ -313,6 +313,15 @@ input CreateTaskInput {
   coverImageS3Key: String
 }
 
+# AI one-shot task creation: the user gives one request; the AI generates a clean
+# title + steps and the task is created directly. No citations are surfaced or
+# stored (end users have cognitive disabilities). Owner is derived from the
+# Cognito identity.
+input CreateAiTaskInput {
+  query: String!          # the user's request, e.g. "wash my hair"; drives generation + title
+  categoryId: ID          # optional, as in createTask: omitted ⇒ owner's default category
+}
+
 # Partial edit of an existing task. Only fields you include are changed; omitted
 # fields keep their current value. `ownerId` and the task's steps are not editable
 # here (steps have their own createTaskStep). Errors if the task doesn't exist.
@@ -576,6 +585,8 @@ type Mutation {
 
   # Create a reusable task template (and optionally its ordered steps).
   createTask(input: CreateTaskInput!): Task
+  # Generate a titled, stepped task from one request and save it (no citations).
+  createAiTask(input: CreateAiTaskInput!): Task
   # Edit an existing task template's fields (partial update). Errors if not found.
   updateTask(input: UpdateTaskInput!): Task
   createTaskStep(input: CreateTaskStepInput!): TaskStep
