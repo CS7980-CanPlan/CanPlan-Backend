@@ -47,6 +47,7 @@ export class CanPlanBackendStack extends cdk.Stack {
       envName,
       table: database.table,
       mediaBucket: storage.mediaBucket,
+      userPool: auth.userPool,
       bedrockModelId: ai.bedrockModelId,
       bedrockRegion: ai.bedrockRegion,
       knowledgeBaseId,

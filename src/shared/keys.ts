@@ -33,6 +33,11 @@ export const TASK_CATEGORY_INDEX = 'taskCategoryIndex';
 // (list-all-by-type) without scanning the table. Every item carries entityType +
 // createdAt, so all entities are queryable by type, newest-first.
 export const ENTITY_TYPE_INDEX = 'entityTypeIndex';
+// SupportLink lookup by primary user. SupportLink rows live under PK = SUPPORTER#<supporterId>,
+// SK = USER#<primaryUserId>; supporterIndex finds a supporter's links, but full user deletion
+// also needs the links where the target user is the PRIMARY user. SupportLink mirrors
+// primaryUserId onto `userId`, so this GSI keys on userId (HASH) + supporterId (RANGE).
+export const PRIMARY_USER_SUPPORT_LINK_INDEX = 'primaryUserSupportLinkIndex';
 
 // ── Fixed sort-key values ─────────────────────────────────────────────────────
 export const PROFILE_SK = '#PROFILE';

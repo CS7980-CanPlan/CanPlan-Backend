@@ -49,6 +49,21 @@ describe('Database construct — DynamoDB single table', () => {
     });
   });
 
+  it('defines the primaryUserSupportLinkIndex GSI with userId (HASH) + supporterId (RANGE), projection ALL', () => {
+    synth().hasResourceProperties('AWS::DynamoDB::Table', {
+      GlobalSecondaryIndexes: Match.arrayWith([
+        Match.objectLike({
+          IndexName: 'primaryUserSupportLinkIndex',
+          KeySchema: [
+            { AttributeName: 'userId', KeyType: 'HASH' },
+            { AttributeName: 'supporterId', KeyType: 'RANGE' },
+          ],
+          Projection: { ProjectionType: 'ALL' },
+        }),
+      ]),
+    });
+  });
+
   it('still defines the original GSIs alongside taskCategoryIndex', () => {
     const template = synth();
     const table = Object.values(template.findResources('AWS::DynamoDB::Table'))[0];
@@ -62,6 +77,7 @@ describe('Database construct — DynamoDB single table', () => {
         'taskOwnerIndex',
         'taskCategoryIndex',
         'entityTypeIndex',
+        'primaryUserSupportLinkIndex',
       ]),
     );
   });

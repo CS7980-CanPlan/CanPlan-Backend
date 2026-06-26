@@ -155,12 +155,14 @@ GraphQL types below. The key layout (for reference):
 | AssignmentStep | `USER#<userId>` | `ASSIGN_STEP#<assignmentId>#STEP#<stepId>` |
 | MediaAsset | `TASK#<taskId>` | `MEDIA#<assetId>` |
 
-Five GSIs serve the cross-cutting lists: `supporterIndex` (users managed by a
-supporter), `orgIndex` (users in an organization), `taskOwnerIndex` (task templates
-by owner), `taskCategoryIndex` (tasks within one owner's category — keyed on a
-denormalized `<ownerId>#<categoryId>`, newest-first), and `entityTypeIndex` (every
-item of one `entityType`, newest-first — backs the SystemAdmin list-all APIs without
-a Scan).
+Six GSIs serve the cross-cutting lists: `supporterIndex` (users managed by a
+supporter), `primaryUserSupportLinkIndex` (`SupportLink`s by primary user — keyed on
+`userId`/`supporterId`, the inverse of `supporterIndex`; sparse to `SupportLink`,
+used by `adminDeleteUser`), `orgIndex` (users in an organization), `taskOwnerIndex`
+(task templates by owner), `taskCategoryIndex` (tasks within one owner's category —
+keyed on a denormalized `<ownerId>#<categoryId>`, newest-first), and `entityTypeIndex`
+(every item of one `entityType`, newest-first — backs the SystemAdmin list-all APIs
+without a Scan).
 
 `Assignment` and its `AssignmentStep` snapshots share the `USER#<userId>` partition.
 `ASSIGN_STEP#…` deliberately does **not** begin with `ASSIGN#` (its 7th character is
@@ -819,6 +821,83 @@ do {
 
 `listAllTasks` returns Task `#META` items only (TaskStep items have
 `entityType = "TaskStep"`, so they don't appear here).
+
+---
+
+### Admin mutations (SystemAdmin only)
+
+Cognito role management + destructive data cleanup, in the same `canplan-admin-<env>`
+Lambda. Every mutation is **restricted to the `SystemAdmin` group** — both at the AppSync
+edge (`@aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])`) and re-checked in the
+resolver. **Cognito group membership remains the authorization source of truth**; these
+APIs manage that membership and the data behind it.
+
+The `userId` in every input is the **app-level id = the Cognito `sub`**. The resolver maps
+it to the Cognito `Username` with a `ListUsers` `sub = "…"` filter (Cognito's Admin\* APIs
+need the `Username`, which is not the `sub` for an email-alias pool).
+
+> **Bootstrap:** there is no API to mint the first SystemAdmin — add the first admin to the
+> `SystemAdmin` Cognito group manually (console, or `aws cognito-idp admin-add-user-to-group`).
+> Admins log in through the **same** Cognito app client as everyone else.
+>
+> **Group changes propagate via new JWTs:** Cognito groups are embedded in the issued token,
+> so a user must **refresh their tokens or re-login** after an invite / `setUserBaseRole` /
+> `setSystemAdmin` before the change takes effect.
+
+| Operation | Returns | Effect |
+|---|---|---|
+| `inviteSupportPerson(input: InviteUserInput!)` | `AdminUserResult!` | `AdminCreateUser` (or adopt an existing user on `UsernameExistsException`) + add **only** `SupportPerson`. Never adds `PrimaryUser`. No `UserProfile` is created. |
+| `inviteOrganizationAdmin(input: InviteUserInput!)` | `AdminUserResult!` | Same, adding **only** `OrganizationAdmin`. |
+| `setUserBaseRole(input: SetUserBaseRoleInput!)` | `AdminUserResult!` | Remove all base groups, add the one target (`PRIMARY_USER`/`SUPPORT_PERSON`/`ORG_ADMIN`). Mirror onto an existing `UserProfile.role` (never creates one). `SystemAdmin` untouched. |
+| `setSystemAdmin(input: SetSystemAdminInput!)` | `AdminUserResult!` | `enabled:true` grants / `false` revokes the `SystemAdmin` group (base roles untouched). **Self-demotion rejected.** |
+| `adminDeleteTask(taskId: ID!)` | `Task` | Delete **any** task regardless of owner — same cascade as the owner `deleteTask` (steps, media rows + S3 binaries, category `taskCount`). Returns the deleted task, or `null` if already gone. |
+| `adminDeleteUser(input: AdminDeleteUserInput!)` | `AdminDeleteUserResult!` | Full user deletion (see below). **Self-deletion rejected.** |
+
+**Inputs**
+
+- `InviteUserInput`: `email: AWSEmail!`, `displayName: String`, `organizationId: ID`
+  (reserved; not persisted yet).
+- `SetUserBaseRoleInput`: `userId: ID!`, `role: AdminBaseRole!` (`PRIMARY_USER` /
+  `SUPPORT_PERSON` / `ORG_ADMIN`).
+- `SetSystemAdminInput`: `userId: ID!`, `enabled: Boolean!`.
+- `AdminDeleteUserInput`: `userId: ID!`, `deleteCognitoUser: Boolean = true`,
+  `disableFirst: Boolean = true`.
+
+`AdminUserResult` is `{ userId, email, groups: [String!]!, profile: UserProfile }` — the
+user's `sub`, email, **current** Cognito groups, and their profile if one exists (`null`
+otherwise — invites don't create a profile).
+
+**`adminDeleteUser` order (retryable; no Scan):**
+
+1. If `deleteCognitoUser` and `disableFirst`, `AdminDisableUser` first (so an in-flight
+   session can't race the cleanup).
+2. Delete every **owned task** via `taskOwnerIndex` → the shared cascade each.
+3. Delete every row in the **`USER#<userId>` partition** (profile, categories, assignments,
+   assignment steps, progress events, …) with one PK query + batch delete.
+4. Delete every `SupportLink` where the user is the **supporter** (`SUPPORTER#<userId>`
+   partition) **and** where they are the **primary user** (`primaryUserSupportLinkIndex`).
+5. **Last**, if `deleteCognitoUser`, `AdminDeleteUser`. Any DynamoDB/S3 failure above throws
+   before this step, so the login is never removed while data remains; an already-missing
+   user counts as success once data cleanup completes.
+
+Returns `AdminDeleteUserResult { userId, deletedTasks, deletedUserItems, deletedSupportLinks,
+deletedCognitoUser }`.
+
+```graphql
+mutation InviteSupport($input: InviteUserInput!) {
+  inviteSupportPerson(input: $input) { userId email groups profile { displayName role } }
+}
+
+mutation PromoteToAdmin($input: SetSystemAdminInput!) {
+  setSystemAdmin(input: $input) { userId groups }   # userId = the target user's Cognito sub
+}
+
+mutation DeleteUser($input: AdminDeleteUserInput!) {
+  adminDeleteUser(input: $input) {
+    userId deletedTasks deletedUserItems deletedSupportLinks deletedCognitoUser
+  }
+}
+```
 
 ---
 
