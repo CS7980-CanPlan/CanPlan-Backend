@@ -1,0 +1,11 @@
+{
+  "folders": [
+    {
+      "name": "WebPortal",
+      "path": "WebPortal"
+    }
+  ],
+  "settings": {
+    "terminal.integrated.cwd": "${workspaceFolder:WebPortal}"
+  }
+}
