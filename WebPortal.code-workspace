@@ -1,0 +1,18 @@
+{
+  "folders": [
+    {
+      "name": "Backend",
+      "path": ".",
+    },
+    {
+      "name": "WebPortal",
+      "path": "WebPortal",
+    },
+  ],
+  "settings": {
+    "terminal.integrated.cwd": "${workspaceFolder:WebPortal}",
+    "files.exclude": {
+      "WebPortal": true,
+    },
+  },
+}
