@@ -1,4 +1,5 @@
 import * as cdk from 'aws-cdk-lib';
+import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3 from 'aws-cdk-lib/aws-s3';
@@ -14,6 +15,8 @@ export interface FunctionsProps {
   readonly table: dynamodb.ITable;
   /** Media bucket the media Lambda mints presigned upload URLs for. */
   readonly mediaBucket: s3.IBucket;
+  /** User Pool the admin Lambda manages (invite / role / delete) — scopes its Cognito IAM. */
+  readonly userPool: cognito.IUserPool;
   /** Bedrock model id passed to the generateTaskSteps Lambda. */
   readonly bedrockModelId: string;
   /** Region the generateTaskSteps Lambda calls Bedrock in (e.g. us-east-1). */
@@ -38,7 +41,8 @@ export class Functions extends Construct {
   constructor(scope: Construct, id: string, props: FunctionsProps) {
     super(scope, id);
 
-    const { envName, table, mediaBucket, bedrockModelId, bedrockRegion, knowledgeBaseId } = props;
+    const { envName, table, mediaBucket, userPool, bedrockModelId, bedrockRegion, knowledgeBaseId } =
+      props;
 
     // Shared factory for a DynamoDB-backed resolver Lambda. Each gets the table
     // name in its env and connection reuse enabled.
@@ -93,9 +97,31 @@ export class Functions extends Construct {
       table.grantReadWriteData(fn);
     }
 
-    // admin — read-only list-all-by-entityType (queries entityTypeIndex; never writes).
+    // admin — SystemAdmin-only listings PLUS Cognito role management and destructive data
+    // APIs (delete any task, full user deletion). Needs table read+write (incl. GSIs), the
+    // same media-bucket cleanup access as the tasks Lambda, and scoped Cognito admin actions.
     this.adminFn = dataFn('AdminFunction', 'admin', 'admin');
-    table.grantReadData(this.adminFn);
+    table.grantReadWriteData(this.adminFn);
+    grantCoverImageS3(this.adminFn); // S3 read/put/delete for task-media cascade cleanup
+    this.adminFn.addEnvironment('USER_POOL_ID', userPool.userPoolId);
+    // Least-privilege Cognito admin actions, scoped to the deployed User Pool. No circular
+    // dependency: the admin Lambda is not a trigger ON the pool (unlike postConfirmation), so
+    // it can reference the concrete pool ARN directly.
+    this.adminFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          'cognito-idp:AdminCreateUser',
+          'cognito-idp:AdminAddUserToGroup',
+          'cognito-idp:AdminRemoveUserFromGroup',
+          'cognito-idp:AdminListGroupsForUser',
+          'cognito-idp:AdminGetUser',
+          'cognito-idp:AdminDisableUser',
+          'cognito-idp:AdminDeleteUser',
+          'cognito-idp:ListUsers',
+        ],
+        resources: [userPool.userPoolArn],
+      }),
+    );
 
     // The media Lambda mints presigned S3 URLs (createMediaUploadUrl /
     // createTaskCoverImageUploadUrl / getMediaDownloadUrl); each signed URL inherits the

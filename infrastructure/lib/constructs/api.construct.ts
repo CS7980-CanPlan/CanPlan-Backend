@@ -134,11 +134,19 @@ export class Api extends Construct {
       { typeName: 'Query', fieldName: 'listMediaForTask' },
     ]);
 
-    // SystemAdmin-only list-all APIs (the schema also gates these to the SystemAdmin
-    // group via @aws_cognito_user_pools; the Lambda re-checks as defense-in-depth).
+    // SystemAdmin-only APIs (the schema also gates these to the SystemAdmin group via
+    // @aws_cognito_user_pools; the Lambda re-checks as defense-in-depth): read-only listings
+    // plus Cognito role management and destructive data mutations.
     wire('AdminDataSource', props.adminFn, [
       { typeName: 'Query', fieldName: 'listAllUsers' },
       { typeName: 'Query', fieldName: 'listAllTasks' },
+      { typeName: 'Query', fieldName: 'adminGetUserData' },
+      { typeName: 'Mutation', fieldName: 'inviteSupportPerson' },
+      { typeName: 'Mutation', fieldName: 'inviteOrganizationAdmin' },
+      { typeName: 'Mutation', fieldName: 'setUserBaseRole' },
+      { typeName: 'Mutation', fieldName: 'setSystemAdmin' },
+      { typeName: 'Mutation', fieldName: 'adminDeleteTask' },
+      { typeName: 'Mutation', fieldName: 'adminDeleteUser' },
     ]);
 
     // healthCheck query — returns a static string, no data source needed

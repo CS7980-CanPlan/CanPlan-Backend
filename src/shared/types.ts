@@ -487,6 +487,70 @@ export interface Connection<T> {
   nextToken: string | null;
 }
 
+// ── Admin (SystemAdmin-only) ──────────────────────────────────────────────────
+// The base business role an admin assigns. Values are identical to UserRole (so the
+// projection onto UserProfile.role needs no remapping); SystemAdmin is deliberately NOT
+// one of these — it's an elevated group, not a base role.
+export type AdminBaseRole = 'PRIMARY_USER' | 'SUPPORT_PERSON' | 'ORG_ADMIN';
+
+export interface InviteUserInput {
+  email: string;
+  displayName?: string;
+  organizationId?: string;
+}
+
+export interface SetUserBaseRoleInput {
+  /** App-level userId — the Cognito `sub`. */
+  userId: string;
+  role: AdminBaseRole;
+}
+
+export interface SetSystemAdminInput {
+  /** App-level userId — the Cognito `sub`. */
+  userId: string;
+  enabled: boolean;
+}
+
+export interface AdminDeleteUserInput {
+  /** App-level userId — the Cognito `sub`. */
+  userId: string;
+  /** Default true: also delete the Cognito user after data cleanup succeeds. */
+  deleteCognitoUser?: boolean;
+  /** Default true: AdminDisableUser before data deletion (only when deleteCognitoUser). */
+  disableFirst?: boolean;
+}
+
+/** Result of an admin user mutation: the user's id, email, current groups, and profile (if any). */
+export interface AdminUserResult {
+  userId: string;
+  email?: string;
+  groups: string[];
+  profile?: UserProfile | null;
+}
+
+/** Tally returned by adminDeleteUser. */
+export interface AdminDeleteUserResult {
+  userId: string;
+  deletedTasks: number;
+  deletedUserItems: number;
+  deletedSupportLinks: number;
+  deletedCognitoUser: boolean;
+}
+
+/**
+ * Full read-only snapshot of everything one user owns, for the SystemAdmin user-detail
+ * view: their profile, owned tasks, categories, assignments, and support links (in either
+ * direction). Gathered with PK queries + GSIs (no Scan).
+ */
+export interface AdminUserData {
+  userId: string;
+  profile?: UserProfile | null;
+  tasks: Task[];
+  categories: Category[];
+  assignments: Assignment[];
+  supportLinks: SupportLink[];
+}
+
 // Step generation: a task query in, ordered source-cited steps out
 export interface QueryContext {
   role?: string;

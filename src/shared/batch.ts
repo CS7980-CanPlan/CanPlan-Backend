@@ -20,19 +20,22 @@ export interface ItemKey {
 }
 
 /**
- * Collect the PK/SK of every row under `pk` whose SK begins with `skPrefix`,
- * following Query pagination so the result is complete regardless of row count.
- * Projects only the key attributes — the caller just needs keys to delete.
+ * Collect the PK/SK of every row under `pk`, following Query pagination so the result
+ * is complete regardless of row count. With `skPrefix` only rows whose SK begins with it
+ * are returned; omit it to collect EVERY row in the partition (e.g. an entire USER#<id>
+ * partition for a full user deletion). Projects only the key attributes.
  */
-export async function queryAllKeys(pk: string, skPrefix: string): Promise<ItemKey[]> {
+export async function queryAllKeys(pk: string, skPrefix?: string): Promise<ItemKey[]> {
   const keys: ItemKey[] = [];
   let startKey: Record<string, unknown> | undefined;
   do {
     const result = await dynamo.send(
       new QueryCommand({
         TableName: TABLE_NAME,
-        KeyConditionExpression: 'PK = :pk AND begins_with(SK, :prefix)',
-        ExpressionAttributeValues: { ':pk': pk, ':prefix': skPrefix },
+        KeyConditionExpression: skPrefix
+          ? 'PK = :pk AND begins_with(SK, :prefix)'
+          : 'PK = :pk',
+        ExpressionAttributeValues: skPrefix ? { ':pk': pk, ':prefix': skPrefix } : { ':pk': pk },
         ProjectionExpression: 'PK, SK',
         ExclusiveStartKey: startKey,
       }),

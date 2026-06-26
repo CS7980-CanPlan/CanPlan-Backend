@@ -24,6 +24,7 @@ AssignmentStep, MediaAsset, Report. The item-key conventions live in
 | `createAssignment`, `updateAssignmentStatus`, `setAssignmentStepCompletion`, `deleteAssignment`, `listAssignmentsForUser`, `listAssignmentSteps` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB |
 | `createMediaUploadUrl`, `createTaskCoverImageUploadUrl`, `createMediaAsset`, `deleteMediaAsset`, `getMediaDownloadUrl`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB + S3 media bucket (presigned upload/download, cover images, cascade delete) |
 | `listAllUsers`, `listAllTasks` | Query | `canplan-admin-<env>` Lambda + DynamoDB `entityTypeIndex` (SystemAdmin only, paginated) |
+| `inviteSupportPerson`, `inviteOrganizationAdmin`, `setUserBaseRole`, `setSystemAdmin`, `adminDeleteTask`, `adminDeleteUser` | Mutation | `canplan-admin-<env>` Lambda + Cognito + DynamoDB + S3 (SystemAdmin only — manage Cognito roles, delete any task, full user deletion) |
 | `generateTaskSteps` | Mutation | `canplan-generateTaskSteps-<env>` Lambda + Bedrock KB RAG |
 
 Domain Lambdas back several fields each, routing on the resolved GraphQL field
@@ -46,6 +47,7 @@ The only fields with auth directives:
 | ----- | ---- |
 | `healthCheck` | `@aws_api_key @aws_cognito_user_pools` — the API key **or** any signed-in user |
 | `listAllUsers`, `listAllTasks` | `@aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])` — SystemAdmin group only |
+| `inviteSupportPerson`, `inviteOrganizationAdmin`, `setUserBaseRole`, `setSystemAdmin`, `adminDeleteTask`, `adminDeleteUser` | `@aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])` — SystemAdmin group only (re-checked in the Lambda) |
 | everything else | default Cognito User Pool (any signed-in user) |
 
 The frontend needs the `UserPoolId` and `UserPoolClientId` deploy outputs to run the
@@ -71,6 +73,41 @@ creates only the **caller's own** profile: `userId` (Cognito `sub`), `email`, an
 are taken from the authenticated session — clients send only `displayName`,
 `organizationId`, and `accessibilitySettings` (`CreateMyUserProfileInput`); `displayName`
 is required.
+
+### SystemAdmin APIs
+
+Six SystemAdmin-only mutations (in the `canplan-admin-<env>` Lambda) manage Cognito roles
+and destructive data cleanup. Each is gated to the `SystemAdmin` group at the AppSync edge
+**and** re-checks the group inside the Lambda, with Cognito remaining the authorization
+source of truth:
+
+| Mutation | Effect |
+| -------- | ------ |
+| `inviteSupportPerson(input)` | Create/adopt a Cognito user and add **only** the `SupportPerson` group (never `PrimaryUser`). Idempotent if the user already exists. |
+| `inviteOrganizationAdmin(input)` | Same, adding **only** the `OrganizationAdmin` group. |
+| `setUserBaseRole(input)` | Remove the user from all base groups, then add the one target (`PRIMARY_USER`/`SUPPORT_PERSON`/`ORG_ADMIN`). Mirrors the role onto an existing `UserProfile` (never creates one). `SystemAdmin` is untouched. |
+| `setSystemAdmin(input)` | Grant/revoke the elevated `SystemAdmin` group (base roles untouched). **Self-demotion is rejected** — another admin must do it. |
+| `adminDeleteTask(taskId)` | Delete **any** task regardless of owner, via the same cascade as the owner `deleteTask` (steps, media rows, S3 binaries, category `taskCount`). Idempotent. |
+| `adminDeleteUser(input)` | Fully delete a user: all owned tasks (cascade), every `USER#<id>` partition row, all `SupportLink`s where they are supporter **or** primary user, and finally the Cognito login. Uses PK queries + GSIs (no Scan); the Cognito delete runs **last** so a data-cleanup failure leaves it safely retryable. **Self-deletion is rejected.** |
+
+User ids in these inputs are the app-level `userId` (the Cognito `sub`); the Lambda resolves
+the Cognito `Username` via a `ListUsers` `sub = "…"` filter. `inviteSupportPerson`/
+`inviteOrganizationAdmin` do **not** create a `UserProfile` — the invitee's profile is created
+by `createUserProfile` after they first log in.
+
+**Bootstrap the first admin manually.** There is no API to mint the first SystemAdmin, so add
+yourself to the group once in the AWS console (Cognito → your user pool → Users → pick the
+user → add to the `SystemAdmin` group) or via the CLI:
+
+```bash
+aws cognito-idp admin-add-user-to-group \
+  --user-pool-id <UserPoolId> --username <email-or-username> --group-name SystemAdmin
+```
+
+Admin users **log in through the same Cognito app client** as everyone else — there is no
+separate admin pool. Because Cognito groups are embedded in the issued JWT, **a user must
+refresh their tokens or re-login after any group change** (invite, `setUserBaseRole`,
+`setSystemAdmin`) before the new role/permissions take effect.
 
 `createUserProfile` also creates the user's **default category** (`name: "No Category"`,
 `color: "#64748B"`, `isDefault: true`) — a real Category row with its own UUID — in the same transaction, and
@@ -314,10 +351,12 @@ scripts/build-corpus.ts                        seed.jsonl -> data/corpus/dist
 scripts/migrate-default-categories.ts          idempotent default-category + TaskStep-key migration
 src/lambdas/createTask/handler.ts              createTask resolver (Task + steps)
 src/lambdas/{users,categories,tasks,assignments,media}/handler.ts   Domain resolvers (routed by fieldName)
-src/lambdas/admin/handler.ts                   SystemAdmin list-all-by-entityType resolvers
+src/lambdas/admin/handler.ts                   SystemAdmin resolvers (listings + Cognito role mgmt + deletes)
 src/lambdas/generateTaskSteps/handler.ts       KB Retrieve -> Converse resolver
 src/shared/keys.ts                             Single-table PK/SK + entityType conventions
 src/shared/category.ts                         Task↔Category lookup/validation + taskCount deltas
+src/shared/taskCascade.ts                      Shared Task cascade delete (owner deleteTask + adminDeleteTask)
+src/shared/cognito.ts                          Cognito client, group constants, sub→Username/group helpers
 src/shared/authz.ts                            Owner-scoped authorization helpers
 src/shared/{auth,pagination}.ts                Cognito group checks + nextToken cursors
 src/shared/{dynamodb,s3,bedrock,kb}.ts         Shared AWS clients (s3 = media presign)

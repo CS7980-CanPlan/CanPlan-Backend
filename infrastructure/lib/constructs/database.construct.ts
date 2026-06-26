@@ -42,6 +42,17 @@ export class Database extends Construct {
       projectionType: dynamodb.ProjectionType.ALL,
     });
 
+    // primaryUserSupportLinkIndex — SupportLinks by the PRIMARY user they manage. Keyed on
+    // userId (a SupportLink's mirror of primaryUserId) + supporterId. supporterIndex finds a
+    // supporter's links; this finds the links where a given user is the primary, which full
+    // user deletion needs. Sparse to SupportLink (only it carries supporterId).
+    this.table.addGlobalSecondaryIndex({
+      indexName: 'primaryUserSupportLinkIndex',
+      partitionKey: { name: 'userId', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'supporterId', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
     // orgIndex — all users in an organization. UserProfile items carry organizationId.
     // Lightweight roster projection: just enough to render a list (name + role).
     this.table.addGlobalSecondaryIndex({

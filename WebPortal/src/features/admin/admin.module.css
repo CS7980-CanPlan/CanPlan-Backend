@@ -1,0 +1,446 @@
+/* Shared styles for the admin area: shell, sections, panels, tables, metrics. */
+
+/* ── Shell ───────────────────────────────────────────────────────────────────── */
+.shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-bg);
+}
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.topbarInner {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 0.6rem 1.25rem;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 700;
+  color: var(--color-text);
+  flex-shrink: 0;
+}
+
+.brandMark {
+  display: grid;
+  place-items: center;
+  width: 1.7rem;
+  height: 1.7rem;
+  border-radius: 7px;
+  background: var(--color-primary);
+  color: #fff;
+}
+
+.topbarSpacer {
+  flex: 1;
+}
+
+.account {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.accountEmail {
+  font-size: 0.8125rem;
+  color: var(--color-text-muted);
+  max-width: 18ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tabs {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 0 1.25rem;
+  display: flex;
+  gap: 0.25rem;
+  overflow-x: auto;
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.6rem 0.75rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  text-decoration: none;
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+}
+.tab:hover {
+  color: var(--color-text);
+}
+.tabActive {
+  color: var(--color-primary);
+  border-bottom-color: var(--color-primary);
+}
+
+.content {
+  flex: 1;
+  width: 100%;
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 1.5rem 1.25rem 3rem;
+}
+
+/* ── Section / page heading ──────────────────────────────────────────────────── */
+.pageHead {
+  margin-bottom: 1.25rem;
+}
+.pageTitle {
+  font-size: 1.25rem;
+  margin-bottom: 0.2rem;
+}
+.pageSubtitle {
+  color: var(--color-text-muted);
+  font-size: 0.875rem;
+}
+
+.sectionGrid {
+  display: grid;
+  gap: 1.25rem;
+}
+@media (min-width: 880px) {
+  .sectionGridTwo {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+/* ── Panel (form card) ───────────────────────────────────────────────────────── */
+.panel {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 1.1rem 1.15rem;
+}
+.panelHead {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.85rem;
+}
+.panelIcon {
+  display: grid;
+  place-items: center;
+  width: 1.9rem;
+  height: 1.9rem;
+  border-radius: 7px;
+  background: var(--color-bg);
+  color: var(--color-primary);
+  flex-shrink: 0;
+}
+.panelTitle {
+  font-size: 0.975rem;
+  font-weight: 700;
+}
+.panelDesc {
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+  margin-top: 0.1rem;
+}
+.panelForm {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+.formRow {
+  display: grid;
+  gap: 0.85rem;
+}
+@media (min-width: 560px) {
+  .formRowTwo {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+.formActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+/* ── Toolbar (table controls) ────────────────────────────────────────────────── */
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+.toolbarMeta {
+  font-size: 0.8125rem;
+  color: var(--color-text-muted);
+}
+.pager {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+/* ── Table ───────────────────────────────────────────────────────────────────── */
+.tableCard {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.tableScroll {
+  overflow-x: auto;
+}
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+.table th,
+.table td {
+  text-align: left;
+  padding: 0.55rem 0.85rem;
+  border-bottom: 1px solid var(--color-border);
+  vertical-align: middle;
+}
+.table th {
+  background: #fafbfd;
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  position: sticky;
+  top: 0;
+}
+.table tbody tr:last-child td {
+  border-bottom: none;
+}
+.table tbody tr:hover {
+  background: #fafbfd;
+}
+.cellPrimary {
+  font-weight: 600;
+  color: var(--color-text);
+}
+.cellMuted {
+  color: var(--color-text-muted);
+}
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+.idCell {
+  max-width: 16rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.copyBtn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  padding: 0.15rem;
+  border-radius: 4px;
+  display: inline-flex;
+  vertical-align: middle;
+  margin-left: 0.25rem;
+}
+.copyBtn:hover {
+  color: var(--color-primary);
+  background: var(--color-bg);
+}
+.groupCell {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+.rowActions {
+  display: flex;
+  gap: 0.35rem;
+  justify-content: flex-end;
+}
+
+/* ── Metric strip ────────────────────────────────────────────────────────────── */
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 0.85rem;
+  margin-bottom: 1.5rem;
+}
+.metric {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 0.9rem 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.metricIcon {
+  display: grid;
+  place-items: center;
+  width: 2.2rem;
+  height: 2.2rem;
+  border-radius: 8px;
+  background: var(--color-bg);
+  color: var(--color-primary);
+  flex-shrink: 0;
+}
+.metricBody {
+  min-width: 0;
+}
+.metricValue {
+  font-size: 1.35rem;
+  font-weight: 700;
+  line-height: 1.1;
+}
+.metricLabel {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+
+/* ── Mutation result panel ───────────────────────────────────────────────────── */
+.resultBlock {
+  margin-top: 0.25rem;
+}
+.resultJson {
+  margin: 0.5rem 0 0;
+  padding: 0.65rem 0.8rem;
+  background: #0f1729;
+  color: #d6e2ff;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  line-height: 1.5;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+/* ── Confirm danger action ───────────────────────────────────────────────────── */
+.confirmBox {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg);
+  padding: 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+.confirmTarget {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  padding: 0.1rem 0.35rem;
+  word-break: break-all;
+}
+
+/* ── Overview nav tiles ──────────────────────────────────────────────────────── */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 1rem;
+}
+.tile {
+  display: flex;
+  gap: 0.75rem;
+  padding: 1.1rem;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+.tile:hover {
+  border-color: var(--color-primary);
+  box-shadow: var(--shadow-sm);
+}
+.tileIcon {
+  display: grid;
+  place-items: center;
+  width: 2.4rem;
+  height: 2.4rem;
+  border-radius: 9px;
+  background: var(--color-bg);
+  color: var(--color-primary);
+  flex-shrink: 0;
+}
+.tileTitle {
+  font-weight: 700;
+  font-size: 0.95rem;
+  margin-bottom: 0.1rem;
+}
+.tileDesc {
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+}
+.tileDanger .tileIcon {
+  color: var(--color-danger);
+}
+
+/* ── User detail page ──────────────────────────────────────────────────────── */
+.backLink {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+  text-decoration: none;
+  margin-bottom: 0.75rem;
+}
+.backLink:hover {
+  color: var(--color-primary);
+}
+.detailGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 0.85rem 1.5rem;
+}
+.detailItem {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+}
+.detailLabel {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-muted);
+}
+.detailValue {
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+.sectionTitle {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 1rem;
+  font-weight: 700;
+  margin: 1.5rem 0 0.6rem;
+}
+.sectionCount {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+}

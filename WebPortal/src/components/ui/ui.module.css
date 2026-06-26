@@ -1,0 +1,247 @@
+/* Shared styles for the UI primitives. Imported by Button, TextField, Select, etc. */
+
+/* ── Button ──────────────────────────────────────────────────────────────────── */
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  font: inherit;
+  font-weight: 600;
+  line-height: 1.1;
+  white-space: nowrap;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+  text-decoration: none;
+}
+.button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.sizeMd {
+  padding: 0.5rem 0.9rem;
+  font-size: 0.875rem;
+}
+.sizeSm {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.8125rem;
+}
+.fullWidth {
+  width: 100%;
+}
+.primary {
+  background-color: var(--color-primary);
+  border-color: var(--color-primary);
+  color: #fff;
+}
+.primary:not(:disabled):hover {
+  background-color: var(--color-primary-dark);
+  border-color: var(--color-primary-dark);
+}
+.secondary {
+  background-color: var(--color-surface);
+  border-color: var(--color-border);
+  color: var(--color-text);
+}
+.secondary:not(:disabled):hover {
+  border-color: var(--color-text-muted);
+  background-color: var(--color-bg);
+}
+.danger {
+  background-color: var(--color-danger);
+  border-color: var(--color-danger);
+  color: #fff;
+}
+.danger:not(:disabled):hover {
+  background-color: var(--color-danger-dark);
+  border-color: var(--color-danger-dark);
+}
+.ghost {
+  background-color: transparent;
+  border-color: transparent;
+  color: var(--color-text-muted);
+}
+.ghost:not(:disabled):hover {
+  background-color: var(--color-bg);
+  color: var(--color-text);
+}
+.buttonIcon {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+/* ── Field (TextField / Select) ──────────────────────────────────────────────── */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  min-width: 0;
+}
+.label {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--color-text);
+}
+.required {
+  color: var(--color-danger);
+  margin-left: 0.15rem;
+}
+.control {
+  font: inherit;
+  font-size: 0.875rem;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background-color: var(--color-surface);
+  color: var(--color-text);
+  width: 100%;
+  min-width: 0;
+}
+.control:focus {
+  outline: none;
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 2px rgba(31, 111, 235, 0.18);
+}
+.control:disabled {
+  background-color: var(--color-bg);
+  cursor: not-allowed;
+}
+.controlInvalid {
+  border-color: var(--color-danger);
+}
+.hint {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+.errorText {
+  font-size: 0.75rem;
+  color: var(--color-danger);
+}
+
+/* ── Badge ───────────────────────────────────────────────────────────────────── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.1rem 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.5;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.badgeNeutral {
+  background-color: #eef1f6;
+  color: #41506b;
+  border-color: #dde3ec;
+}
+.badgeInfo {
+  background-color: #e7f0fe;
+  color: #1858c4;
+  border-color: #cfe0fc;
+}
+.badgeSuccess {
+  background-color: #e3f5ea;
+  color: #15703f;
+  border-color: #c7e9d4;
+}
+.badgeWarning {
+  background-color: #fbf0db;
+  color: #8a5208;
+  border-color: #f1ddb4;
+}
+.badgeDanger {
+  background-color: #fbe4e4;
+  color: #a82424;
+  border-color: #f3c9c9;
+}
+
+/* ── Alert ───────────────────────────────────────────────────────────────────── */
+.alert {
+  display: flex;
+  gap: 0.6rem;
+  padding: 0.7rem 0.85rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  font-size: 0.8625rem;
+}
+.alertIcon {
+  flex-shrink: 0;
+  margin-top: 0.05rem;
+}
+.alertBody {
+  min-width: 0;
+  word-break: break-word;
+}
+.alertTitle {
+  font-weight: 600;
+  margin-bottom: 0.15rem;
+}
+.alertInfo {
+  background-color: #eef4fe;
+  border-color: #d2e2fb;
+  color: #1c3b66;
+}
+.alertSuccess {
+  background-color: #eaf7ef;
+  border-color: #cce9d6;
+  color: #155e36;
+}
+.alertWarning {
+  background-color: #fcf4e3;
+  border-color: #f0ddb6;
+  color: #7a4a08;
+}
+.alertError {
+  background-color: #fcebeb;
+  border-color: #f1cccc;
+  color: #952020;
+}
+
+/* ── Spinner ─────────────────────────────────────────────────────────────────── */
+.spinnerWrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--color-text-muted);
+  font-size: 0.875rem;
+}
+.spinner {
+  width: 1.1rem;
+  height: 1.1rem;
+  border: 2px solid var(--color-border);
+  border-top-color: var(--color-primary);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ── EmptyState ──────────────────────────────────────────────────────────────── */
+.emptyState {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+  text-align: center;
+  padding: 2rem 1rem;
+  color: var(--color-text-muted);
+}
+.emptyIcon {
+  color: var(--color-border);
+}
+.emptyTitle {
+  font-weight: 600;
+  color: var(--color-text);
+}
+.emptyDesc {
+  font-size: 0.8125rem;
+  max-width: 32ch;
+}

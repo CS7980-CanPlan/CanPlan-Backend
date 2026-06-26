@@ -44,6 +44,14 @@ enum RepeatUnit {
   MONTH
 }
 
+# The mutually-exclusive base business role a SystemAdmin assigns. Values mirror UserRole;
+# SystemAdmin is intentionally NOT here — it is an elevated group, not a base role.
+enum AdminBaseRole {
+  PRIMARY_USER
+  SUPPORT_PERSON
+  ORG_ADMIN
+}
+
 # ─── Domain types ───────────────────────────────────────────────────────────--
 
 type UserProfile {
@@ -209,6 +217,37 @@ type MediaDownloadTarget {
   downloadUrl: String!
   s3Key: String!
   expiresIn: Int!
+}
+
+# ─── Admin (SystemAdmin-only) ───────────────────────────────────────────────--
+
+# Result of an admin user mutation: the user's id (Cognito sub), email, current Cognito
+# groups (the source of truth for authorization), and their UserProfile if one exists.
+type AdminUserResult {
+  userId: ID!
+  email: AWSEmail
+  groups: [String!]!
+  profile: UserProfile
+}
+
+# Tally returned by adminDeleteUser describing what was removed.
+type AdminDeleteUserResult {
+  userId: ID!
+  deletedTasks: Int!
+  deletedUserItems: Int!
+  deletedSupportLinks: Int!
+  deletedCognitoUser: Boolean!
+}
+
+# Full read-only snapshot of everything one user owns (SystemAdmin user-detail view):
+# their profile, owned tasks, categories, assignments, and support links (either direction).
+type AdminUserData {
+  userId: ID!
+  profile: UserProfile
+  tasks: [Task!]!
+  categories: [Category!]!
+  assignments: [Assignment!]!
+  supportLinks: [SupportLink!]!
 }
 
 # ─── AI step generation (Bedrock KB + RAG) ──────────────────────────────────--
@@ -459,6 +498,37 @@ input DeleteMediaAssetInput {
   assetId: ID!
 }
 
+# ─── Admin inputs (SystemAdmin-only) ─────────────────────────────────────────--
+
+# Invite (or adopt an existing) Cognito user. No UserProfile is created — the app creates
+# that via createUserProfile after the invitee first logs in. organizationId is reserved for
+# future org assignment and is not persisted yet.
+input InviteUserInput {
+  email: AWSEmail!
+  displayName: String
+  organizationId: ID
+}
+
+# userId is the app-level id (the Cognito sub).
+input SetUserBaseRoleInput {
+  userId: ID!
+  role: AdminBaseRole!
+}
+
+# userId is the app-level id (the Cognito sub). enabled=true grants SystemAdmin, false revokes.
+input SetSystemAdminInput {
+  userId: ID!
+  enabled: Boolean!
+}
+
+# userId is the app-level id (the Cognito sub). deleteCognitoUser (default true) also removes
+# the Cognito login after data cleanup; disableFirst (default true) disables it beforehand.
+input AdminDeleteUserInput {
+  userId: ID!
+  deleteCognitoUser: Boolean = true
+  disableFirst: Boolean = true
+}
+
 # AI step generation
 input QueryContext {
   role: String
@@ -550,6 +620,10 @@ type Query {
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
   listAllTasks(limit: Int, nextToken: String): TaskConnection!
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Full read-only snapshot of one user's data (profile, tasks, categories, assignments,
+  # support links) for the admin user-detail view. PK queries + GSIs only (no Scan).
+  adminGetUserData(userId: ID!): AdminUserData!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 }
 
 type Mutation {
@@ -616,6 +690,34 @@ type Mutation {
 
   # Break a daily-living task into ordered, source-cited steps via Bedrock KB + RAG.
   generateTaskSteps(input: GenerateTaskStepsInput!): TaskStepsResponse!
+
+  # ─── Admin mutations (SystemAdmin-only) ──────────────────────────────────────
+  # All gated to the SystemAdmin Cognito group at the AppSync edge AND re-checked in the
+  # admin Lambda. Cognito group membership stays the source of truth for authorization;
+  # users may need to refresh/re-login after a group change to pick it up in a new JWT.
+
+  # Invite a support person: create/adopt a Cognito user and add ONLY the SupportPerson
+  # group (never PrimaryUser). Idempotent if the user already exists.
+  inviteSupportPerson(input: InviteUserInput!): AdminUserResult!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Invite an organization admin: same as above but adds ONLY the OrganizationAdmin group.
+  inviteOrganizationAdmin(input: InviteUserInput!): AdminUserResult!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Set a user's single base role: removes all base groups, adds the target one, mirrors the
+  # role onto an existing UserProfile. SystemAdmin membership is unchanged.
+  setUserBaseRole(input: SetUserBaseRoleInput!): AdminUserResult!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Grant/revoke the elevated SystemAdmin group (base roles untouched). Self-demotion rejected.
+  setSystemAdmin(input: SetSystemAdminInput!): AdminUserResult!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Delete ANY task regardless of owner (same cascade as the owner deleteTask). Returns the
+  # deleted Task, or null if it was already gone.
+  adminDeleteTask(taskId: ID!): Task
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Fully delete a user: owned tasks, their USER# partition rows, SupportLinks (both sides),
+  # and the Cognito login (last). Deleting yourself is rejected.
+  adminDeleteUser(input: AdminDeleteUserInput!): AdminDeleteUserResult!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 }
 
 schema {

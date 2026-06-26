@@ -6,13 +6,7 @@ import {
   TransactWriteCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
-import {
-  batchDelete,
-  batchPut,
-  type ItemKey,
-  queryAllItems,
-  queryAllKeys,
-} from '../../shared/batch';
+import { queryAllItems } from '../../shared/batch';
 import { assertCallerOwns } from '../../shared/authz';
 import { assertUsableCategory, categoryCountDelta } from '../../shared/category';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
@@ -25,9 +19,7 @@ import {
   stepSk,
   TASK_CATEGORY_INDEX,
   taskCategoryKey,
-  TASK_MEDIA_CLEANUP_PREFIX,
   TASK_OWNER_INDEX,
-  taskMediaCleanupSk,
   taskPk,
 } from '../../shared/keys';
 import {
@@ -36,6 +28,7 @@ import {
   purgeMediaAsset,
   retryTaskMediaCleanup,
 } from '../../shared/media';
+import { deleteTaskCascade, readTaskMeta } from '../../shared/taskCascade';
 import {
   decodeNextToken,
   encodeNextToken,
@@ -110,14 +103,6 @@ export const handler = async (
       throw new Error(`tasks handler: unsupported field "${event.info?.fieldName}"`);
   }
 };
-
-/** Read a task's #META row (undefined if absent). */
-async function readTaskMeta(taskId: string): Promise<Task | undefined> {
-  const result = await dynamo.send(
-    new GetCommand({ TableName: TABLE_NAME, Key: { PK: taskPk(taskId), SK: META_SK } }),
-  );
-  return result.Item as Task | undefined;
-}
 
 /**
  * Load a task #META, asserting it exists and the caller owns it. Shared by every Task/
@@ -1089,21 +1074,11 @@ async function deleteTaskStep(
 }
 
 /**
- * deleteTask — delete a Task and ALL of its owned children: the `#META` item, every
- * TaskStep row, and every MediaAsset row (cover image, step media, and any task-level
- * media without a stepId) plus each MediaAsset's S3 binary.
- *
- * Deletion strategy & consistency: a DynamoDB transaction is capped at 100 items, so a
- * task with >99 children cannot be deleted atomically. Before a MediaAsset can be
- * removed, a durable cleanup journal retains its S3 key. We then bulk-delete child rows
- * via BatchWriteItem (chunks of 25, see src/shared/batch.ts). Children go first; journal
- * rows drive idempotent S3 deletion; the journal and #META are removed only after every
- * binary delete succeeds. Thus an interruption keeps the Task + journal retryable even
- * if some MediaAsset metadata was already removed. Children are read with full Query
- * pagination (any count).
- *
- * Preserved: Assignments/AssignmentSteps snapshotted from this task (under USER#<userId>
- * partitions) are historical records and are intentionally never deleted here.
+ * deleteTask — owner-scoped delete of a Task and ALL of its owned children (the `#META`
+ * item, every TaskStep, every MediaAsset + S3 binary). Enforces ownership, then delegates
+ * the cascade to the shared `deleteTaskCascade` (the same path the SystemAdmin
+ * `adminDeleteTask` uses without an ownership check). Historical Assignments/AssignmentSteps
+ * snapshotted from this task are intentionally never deleted.
  */
 async function deleteTask(
   identity: AppSyncIdentity | undefined,
@@ -1112,115 +1087,8 @@ async function deleteTask(
   const id = taskId?.trim();
   if (!id) throw new ValidationError('taskId is required and cannot be empty');
 
-  // Existence + ownership.
+  // Existence + ownership, then the shared cascade (task already loaded, so it won't re-read).
   const stored = await loadOwnedTask(identity, id);
-
-  // Collect every child row (paginated). Media items carry s3Key for binary cleanup.
-  const stepKeys = await queryAllKeys(taskPk(id), STEP_PREFIX);
-  const mediaItems = await queryAllItems<MediaAsset & ItemKey>(taskPk(id), MEDIA_PREFIX);
-
-  // Persist every S3 key BEFORE deleting a MediaAsset row. If a later BatchWrite
-  // partially succeeds, a retry can still read these journal records and clean up all
-  // corresponding binaries — including metadata rows already removed in the first run.
-  await journalTaskMediaCleanup(id, mediaItems);
-
-  // 1) child rows first (steps + media), chunked under the transaction/batch limits …
-  const childKeys: ItemKey[] = [
-    ...stepKeys,
-    ...mediaItems.map((m) => ({ PK: taskPk(id), SK: mediaSk(m.assetId) })),
-  ];
-  await batchDelete(childKeys);
-  // 2) S3 binaries last, driven by durable journal rows rather than the now-deleted
-  // MediaAsset rows. Do not delete #META until every S3 delete has succeeded; an error
-  // leaves the Task + journal retryable instead of losing the only copy of an S3 key.
-  const cleanupItems = await queryAllItems<TaskMediaCleanup>(taskPk(id), TASK_MEDIA_CLEANUP_PREFIX);
-  const failedS3Deletes: string[] = [];
-  for (const cleanup of cleanupItems) {
-    const deleted = await deleteS3ObjectBestEffort(cleanup.s3Key, {
-      event: 'deleteTask',
-      taskId: id,
-      assetId: cleanup.assetId,
-    });
-    if (!deleted) failedS3Deletes.push(cleanup.assetId);
-  }
-  if (failedS3Deletes.length) {
-    throw new Error(
-      `deleteTask: ${failedS3Deletes.length} media object(s) could not be deleted; retry the operation`,
-    );
-  }
-  await batchDelete(cleanupItems.map(({ PK, SK }) => ({ PK, SK })));
-  // 3) Only after children and every binary are gone, remove the parent anchor AND
-  // decrement its category's task count — atomically. The #META delete is guarded on the
-  // task still being in `stored.categoryId`, so a concurrent reparent (which changed the
-  // category + already adjusted counts) makes this fail; a retry re-reads and decrements
-  // the correct category. Keeps the durable category `taskCount` accurate.
-  if (stored.categoryId) {
-    try {
-      await dynamo.send(
-        new TransactWriteCommand({
-          TransactItems: [
-            {
-              Delete: {
-                TableName: TABLE_NAME,
-                Key: { PK: taskPk(id), SK: META_SK },
-                ConditionExpression: 'attribute_exists(PK) AND categoryId = :cat',
-                ExpressionAttributeValues: { ':cat': stored.categoryId },
-              },
-            },
-            categoryCountDelta(stored.ownerId, stored.categoryId, -1, { blockIfDeleting: false }),
-          ],
-        }),
-      );
-    } catch (err) {
-      if ((err as { name?: string }).name === 'TransactionCanceledException') {
-        throw new Error(
-          `deleteTask: task ${id} was modified concurrently (its category changed); retry the operation`,
-        );
-      }
-      throw err;
-    }
-  } else {
-    // Legacy task without a category (pre-migration) — just remove the anchor.
-    await dynamo.send(
-      new DeleteCommand({
-        TableName: TABLE_NAME,
-        Key: { PK: taskPk(id), SK: META_SK },
-        ConditionExpression: 'attribute_exists(PK)',
-      }),
-    );
-  }
-
-  // Return the deleted metadata minus internal storage attributes.
-  const out: Record<string, unknown> = { ...stored };
-  delete out.PK;
-  delete out.SK;
-  delete out.entityType;
-  delete out.taskCategoryKey;
-  return out as unknown as Task;
-}
-
-/** Durable S3-cleanup row written before a Task's MediaAsset metadata can disappear. */
-interface TaskMediaCleanup extends ItemKey {
-  assetId: string;
-  s3Key: string;
-}
-
-async function journalTaskMediaCleanup(
-  taskId: string,
-  mediaItems: Array<MediaAsset & ItemKey>,
-): Promise<void> {
-  if (!mediaItems.length) return;
-  const now = new Date().toISOString();
-  await batchPut(
-    mediaItems
-      .filter((media) => !!media.s3Key)
-      .map((media) => ({
-        PK: taskPk(taskId),
-        SK: taskMediaCleanupSk(media.assetId),
-        entityType: ENTITY.TASK_MEDIA_CLEANUP,
-        assetId: media.assetId,
-        s3Key: media.s3Key,
-        createdAt: now,
-      })),
-  );
+  // loadOwnedTask proved the task exists, so the cascade returns the deleted task (never null).
+  return (await deleteTaskCascade(id, { task: stored })) as Task;
 }

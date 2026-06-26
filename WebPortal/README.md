@@ -1,63 +1,57 @@
-# CanPlan 2.0 — Supporter Web Portal
+# CanPlan 2.0 — Admin Web Portal
 
-A web portal for **support people** and **organization admins** using CanPlan 2.0,
-the cloud-based expansion of the CanPlan app. From the portal, supporters can see
-the people they support, monitor task progress, and respond to help requests.
+A **SystemAdmin-only** web portal for operating the CanPlan 2.0 backend. Administrators
+sign in with Cognito and manage users (invite support people / org admins, change base
+roles, grant or revoke SystemAdmin) and data (delete any task, fully delete a user) against
+the deployed AppSync GraphQL API.
 
-> **Initial setup — mocked data.** This portal is currently a scaffold inside the
-> CanPlan backend repository. It is intentionally limited to a start page and
-> project scaffolding.
-> **All data is currently mocked.** The backend CDK app provides AppSync and
-> Cognito, but this frontend is not wired to those deploy outputs yet. The fake API
-> layer is designed to be swapped for real AppSync GraphQL calls with minimal
-> changes to component code.
+This portal is wired to the **real** backend — there is no mock-data mode. Every admin
+request carries the signed-in user's Cognito **ID token** in the `Authorization` header, and
+the AppSync API gates the admin operations to the `SystemAdmin` Cognito group.
 
 ## Tech stack
 
-- **React** + **TypeScript**
-- **Vite** (dev server and build tooling)
-- **React Router** for client-side routing
+- **React** + **TypeScript** + **Vite**
+- **react-router-dom** — routing (login gate at `/`, guarded `/admin/*`)
+- **@tanstack/react-query** — query/mutation state, caching, invalidation
+- **graphql-request** — typed GraphQL calls to AppSync
+- **aws-amplify** — Cognito authentication (incl. forced-new-password flow)
+- **lucide-react** — action icons
 - **CSS Modules** + a small global stylesheet (design tokens)
-- A **fake GraphQL API service** (`src/api/fakeGraphqlClient.ts`) backed by in-memory mock data
-- Static production build output in `dist/`
 
-## Project structure
+## Authentication & access flow
 
-```
-.
-├── index.html               # Vite HTML entry point
-├── public/                  # Static assets (favicon, etc.)
-├── src/
-│   ├── api/                 # Data-access layer (fake GraphQL client for now)
-│   │   └── fakeGraphqlClient.ts
-│   ├── components/          # Reusable UI components (Header, cards, activity feed)
-│   ├── data/                # In-memory mock data (NOT imported by components)
-│   │   └── mockData.ts
-│   ├── pages/               # Route-level pages (StartPage / dashboard)
-│   ├── styles/              # Global styles and design tokens
-│   ├── types/               # Shared TypeScript domain types
-│   ├── App.tsx              # Route table + layout shell
-│   └── main.tsx             # App bootstrap (Router + render)
-└── README.md
-```
+1. The first screen at `/` is a **login page**. Users authenticate with Cognito
+   (`VITE_USER_POOL_ID` / `VITE_USER_POOL_CLIENT_ID`).
+2. Invited admins created with a temporary password hit the Cognito
+   `FORCE_CHANGE_PASSWORD` challenge; the login page shows a **set-new-password** step.
+3. After sign-in the portal inspects the ID token's `cognito:groups` claim:
+   - In the **`SystemAdmin`** group → redirected to `/admin`.
+   - Authenticated but **not** SystemAdmin → a **forbidden** screen with a sign-out action.
+4. Admin screens never render before the session check completes.
 
-### How data flows
+Tokens are managed by Amplify's session store and read via `fetchAuthSession()` — they are
+**never** persisted to `localStorage` by this app. The GraphQL client fetches a fresh ID
+token per request so a silently-refreshed token is always used.
 
-Components **never** import mock data directly. They call async functions from
-`src/api/fakeGraphqlClient.ts`, which simulate network latency and return data
-shaped like the future AppSync GraphQL responses:
+> **Bootstrap the first admin:** there is no self-service way to become SystemAdmin. Add the
+> first admin to the `SystemAdmin` Cognito group manually (AWS console, or
+> `aws cognito-idp admin-add-user-to-group …`). After any group change a user must
+> re-login (or refresh tokens) for the new group to appear in their JWT.
 
-- `getDashboardSummary()` — counts for the dashboard cards
-- `getAssignedUsers()` — users assigned to the current supporter
-- `getRecentActivity(limit?)` — recent progress/activity events
-- `getTasks()` — tasks for assigned users
+## Required environment variables
 
-When the portal is wired to the backend, reimplement these functions using
-AppSync GraphQL requests authenticated with the signed-in Cognito user's ID token.
-As long as the function signatures and return types stay the same, the UI does
-not need to change.
+Copy [`.env.example`](.env.example) to `.env.local` and fill in the backend deploy outputs.
+**All four are required** — the app fails fast on startup if any is missing.
 
-## Local setup
+| Variable | Backend CDK output | Example |
+| -------- | ------------------ | ------- |
+| `VITE_AWS_REGION` | `AwsRegion` | `ca-central-1` |
+| `VITE_USER_POOL_ID` | `UserPoolId` | `ca-central-1_abc123` |
+| `VITE_USER_POOL_CLIENT_ID` | `UserPoolClientId` | `1a2b3c…` |
+| `VITE_GRAPHQL_API_URL` | `GraphQLApiUrl` | `https://….appsync-api.ca-central-1.amazonaws.com/graphql` |
+
+## Local startup
 
 Requires **Node.js 18+** and npm.
 
@@ -68,58 +62,77 @@ cd WebPortal
 # 1. Install dependencies
 npm install
 
-# 2. Start the local dev server (http://localhost:5173)
+# 2. Configure env (one-time): copy the template and fill in deploy outputs
+cp .env.example .env.local
+#   then edit .env.local
+
+# 3. Start the dev server (http://localhost:5173)
 npm run dev
 
-# 3. Type-check + build for production (outputs to ./dist)
+# 4. Type-check + production build (outputs to ./dist)
 npm run build
-
-# 4. Preview the production build locally
-npm run preview
 ```
 
-| Script            | Description                                   |
-| ----------------- | --------------------------------------------- |
-| `npm run dev`     | Start the Vite dev server with hot reload     |
-| `npm run build`   | Type-check (`tsc -b`) and build to `dist/`    |
-| `npm run preview` | Serve the production build locally            |
-| `npm run lint`    | Type-check only (`tsc --noEmit`)              |
+| Script | Description |
+| ------ | ----------- |
+| `npm run dev` | Start the Vite dev server with hot reload |
+| `npm run build` | Type-check (`tsc -b`) and build to `dist/` |
+| `npm run preview` | Serve the production build locally |
+| `npm run lint` | Type-check only (`tsc --noEmit`) |
+
+## Project structure
+
+```
+src/
+  app/            App shell — providers (React Query, Auth, Router) + route table
+  auth/           Amplify config, AuthProvider/useAuth, RequireSystemAdmin guard
+  api/            GraphQL client, documents, raw admin API, React Query hooks, types
+  config/         Typed env config (fails fast on missing vars)
+  features/
+    login/        Login page + forced-new-password form
+    forbidden/    Forbidden screen (authenticated non-admins)
+    admin/        Admin shell, overview, users + tasks sections, dangerous actions
+  components/ui/  Reusable primitives (Button, TextField, Select, Badge, Alert, …)
+  styles/         Global styles + design tokens
+```
+
+### Layering
+
+- **GraphQL documents** are centralized in `src/api/graphqlDocuments.ts`.
+- **Raw API calls** (no React) live in `src/api/adminApi.ts`.
+- **React Query hooks** wrap those in `src/api/adminHooks.ts`; components use only the hooks.
+- Inputs/results are strictly typed in `src/api/apiTypes.ts` to mirror the backend schema.
+
+## Admin operations
+
+Queries: `listAllUsers`, `listAllTasks` (paginated tables, cursor `nextToken`).
+
+Mutations: `inviteSupportPerson`, `inviteOrganizationAdmin`, `setUserBaseRole`,
+`setSystemAdmin`, `adminDeleteTask`, `adminDeleteUser`. Each surfaces loading / success /
+validation / error states, shows the returned payload in a result panel, and invalidates the
+relevant React Query caches on success. Destructive deletes require typing the exact
+`userId` / `taskId` to enable the submit button.
 
 ## Static deployment
 
-This portal is no longer configured for AWS Amplify Hosting. A production build
-is a static Vite artifact:
+A production build is a static Vite artifact:
 
 ```bash
 npm ci
 npm run build
 ```
 
-Publish the generated `dist/` directory with the static hosting option for the
-environment, such as S3 + CloudFront or another static host.
+Publish `dist/` to any static host (e.g. S3 + CloudFront). Because the portal uses
+client-side routing, configure the host to rewrite deep links to `index.html`:
 
-### SPA routing note
+- **Source:** `/<*>` → **Target:** `/index.html` → **Type:** `200 (Rewrite)`
 
-Because the portal uses client-side routing (React Router), configure the static
-host so deep links resolve to `index.html`:
-
-- **Source address:** `/<*>`
-- **Target address:** `/index.html`
-- **Type:** `200 (Rewrite)`
+The four `VITE_*` variables must be present at **build time** for the environment you deploy.
 
 ## Security notes
 
-- **No real authentication in the portal yet.** The backend already deploys
-  Cognito, but the frontend still needs to be wired to it.
-- **No AWS credentials or secrets are committed.** Do not hardcode secrets in this repo.
-  Environment-specific values should come from the static host's environment
-  configuration or generated config files that are safe to expose publicly.
-- `.env*` files and generated AWS config files are git-ignored.
-
-## Roadmap (future phases)
-
-- Replace the fake API layer with AWS AppSync GraphQL using the backend deploy
-  outputs (`GraphQLApiUrl`, `UserPoolId`, `UserPoolClientId`, `AwsRegion`).
-- Add Amazon Cognito authentication and role-based access (supporter vs. admin).
-- Add S3 for media/attachments and CloudWatch for monitoring.
-- Expand pages: user detail, task management, help-request handling.
+- Admin operations are authorized by Cognito group membership (`SystemAdmin`), enforced at
+  the AppSync edge and re-checked in the backend Lambda. The portal also guards routes and
+  hides admin UI from non-admins, but the server is the source of truth.
+- No AWS credentials or secrets are committed. `.env*` files (except `.env.example`) are
+  git-ignored; the `VITE_*` values are non-secret client configuration.
