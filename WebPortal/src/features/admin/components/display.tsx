@@ -22,6 +22,24 @@ export function RoleBadge({ role }: { role: UserRole | null | undefined }) {
   return <Badge tone={ROLE_TONE[role]}>{ROLE_LABEL[role]}</Badge>;
 }
 
+const STATUS_TONE: Record<string, BadgeTone> = {
+  // Assignment statuses
+  TO_DO: 'neutral',
+  OVERDUE: 'danger',
+  COMPLETED: 'success',
+  SKIPPED: 'warning',
+  // SupportLink statuses
+  PENDING: 'warning',
+  ACTIVE: 'success',
+  REVOKED: 'danger',
+};
+
+/** Render an assignment/support-link status string as a toned badge. */
+export function StatusBadge({ status }: { status: string | null | undefined }) {
+  if (!status) return <span className={styles.cellMuted}>—</span>;
+  return <Badge tone={STATUS_TONE[status] ?? 'neutral'}>{status.replace(/_/g, ' ')}</Badge>;
+}
+
 /** Render a user's Cognito groups as badges (SystemAdmin highlighted). */
 export function GroupBadges({ groups }: { groups: string[] }) {
   if (!groups.length) return <span className={styles.cellMuted}>—</span>;

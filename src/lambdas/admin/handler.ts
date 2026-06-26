@@ -10,7 +10,7 @@ import {
 import { GetCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { requireGroup } from '../../shared/auth';
 import { requireCaller } from '../../shared/authz';
-import { batchDelete, type ItemKey, queryAllKeys } from '../../shared/batch';
+import { batchDelete, type ItemKey, queryAllItems, queryAllKeys } from '../../shared/batch';
 import {
   BASE_ROLE_GROUPS,
   BASE_ROLE_TO_GROUP,
@@ -22,6 +22,8 @@ import {
 } from '../../shared/cognito';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import {
+  ASSIGN_PREFIX,
+  CATEGORY_PREFIX,
   ENTITY,
   ENTITY_TYPE_INDEX,
   type EntityType,
@@ -29,6 +31,7 @@ import {
   PROFILE_SK,
   supporterPk,
   TASK_OWNER_INDEX,
+  USER_LINK_PREFIX,
   userPk,
 } from '../../shared/keys';
 import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
@@ -37,13 +40,17 @@ import { deleteTaskCascade } from '../../shared/taskCascade';
 import type {
   AdminDeleteUserInput,
   AdminDeleteUserResult,
+  AdminUserData,
   AdminUserResult,
   AppSyncEvent,
   AppSyncIdentity,
+  Assignment,
+  Category,
   Connection,
   InviteUserInput,
   SetSystemAdminInput,
   SetUserBaseRoleInput,
+  SupportLink,
   Task,
   UserProfile,
 } from '../../shared/types';
@@ -55,6 +62,7 @@ type AdminResult =
   | Connection<UserProfile>
   | Connection<Task>
   | AdminUserResult
+  | AdminUserData
   | AdminDeleteUserResult
   | Task
   | null;
@@ -81,6 +89,8 @@ export const handler = async (
       return listByEntityType<UserProfile>(ENTITY.USER_PROFILE, pageArgs(args));
     case 'listAllTasks':
       return listByEntityType<Task>(ENTITY.TASK, pageArgs(args));
+    case 'adminGetUserData':
+      return adminGetUserData(args.userId as string);
     // ── Cognito role management ─────────────────────────────────────────────────
     case 'inviteSupportPerson':
       return inviteUser(args.input as InviteUserInput, BASE_ROLE_TO_GROUP.SUPPORT_PERSON);
@@ -112,6 +122,70 @@ function listByEntityType<T>(entityType: EntityType, page: PageArgs): Promise<Co
     },
     page,
   );
+}
+
+/**
+ * Aggregate everything one user owns, for the SystemAdmin user-detail view. Gathers the
+ * profile, owned tasks (taskOwnerIndex), categories + assignments (the USER#<id> partition),
+ * and support links in BOTH directions — all with PK queries + GSIs, never a Scan. Each
+ * collection is read in full (no pagination); a single user's footprint is bounded and this
+ * mirrors what adminDeleteUser already traverses. Internal storage attributes (PK/SK/etc.)
+ * on the items are simply not selected by the GraphQL type, so they are not returned.
+ */
+async function adminGetUserData(userId: string): Promise<AdminUserData> {
+  const id = userId?.trim();
+  if (!id) throw new ValidationError('userId is required and cannot be empty');
+
+  const [profile, tasks, categories, assignments, supportLinks] = await Promise.all([
+    readProfile(id),
+    queryAllOwnedTasks(id),
+    queryAllItems<Category>(userPk(id), CATEGORY_PREFIX),
+    queryAllItems<Assignment>(userPk(id), ASSIGN_PREFIX),
+    gatherSupportLinks(id),
+  ]);
+
+  return { userId: id, profile, tasks, categories, assignments, supportLinks };
+}
+
+/**
+ * All SupportLinks touching a user — both where they are the supporter (SUPPORTER#<id>
+ * partition) and where they are the primary user (primaryUserSupportLinkIndex). Deduped by
+ * the supporter/primary pair in case a row qualifies under both reads.
+ */
+async function gatherSupportLinks(userId: string): Promise<SupportLink[]> {
+  const [asSupporter, asPrimary] = await Promise.all([
+    queryAllItems<SupportLink>(supporterPk(userId), USER_LINK_PREFIX),
+    queryAllPrimaryUserSupportLinks(userId),
+  ]);
+  const seen = new Set<string>();
+  const links: SupportLink[] = [];
+  for (const link of [...asSupporter, ...asPrimary]) {
+    const key = `${link.supporterId}|${link.primaryUserId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    links.push(link);
+  }
+  return links;
+}
+
+/** Full SupportLink items where the target user is the PRIMARY user (primaryUserSupportLinkIndex). */
+async function queryAllPrimaryUserSupportLinks(userId: string): Promise<SupportLink[]> {
+  const items: SupportLink[] = [];
+  let startKey: Record<string, unknown> | undefined;
+  do {
+    const result = await dynamo.send(
+      new QueryCommand({
+        TableName: TABLE_NAME,
+        IndexName: PRIMARY_USER_SUPPORT_LINK_INDEX,
+        KeyConditionExpression: 'userId = :uid',
+        ExpressionAttributeValues: { ':uid': userId },
+        ExclusiveStartKey: startKey,
+      }),
+    );
+    items.push(...((result.Items as SupportLink[]) ?? []));
+    startKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+  } while (startKey);
+  return items;
 }
 
 // ── Cognito role management ──────────────────────────────────────────────────────

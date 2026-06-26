@@ -1,4 +1,5 @@
-import { ChevronLeft, ChevronRight, RefreshCw, Users as UsersIcon } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Eye, RefreshCw, Users as UsersIcon } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { useUsersPage } from '../../../api/adminHooks';
 import { Alert } from '../../../components/ui/Alert';
 import { Button } from '../../../components/ui/Button';
@@ -13,6 +14,7 @@ const PAGE_SIZE = 25;
 /** Paginated table of all users (listAllUsers). */
 export function UsersTable() {
   const cursor = usePageCursor();
+  const navigate = useNavigate();
   const query = useUsersPage({ limit: PAGE_SIZE, nextToken: cursor.cursor });
   const users = query.data?.items ?? [];
 
@@ -82,6 +84,7 @@ export function UsersTable() {
                   <th>User id (sub)</th>
                   <th>Org</th>
                   <th>Created</th>
+                  <th aria-label="Actions" />
                 </tr>
               </thead>
               <tbody>
@@ -93,6 +96,18 @@ export function UsersTable() {
                     <td><IdCell id={user.userId} /></td>
                     <td className={styles.cellMuted}>{user.organizationId ?? '—'}</td>
                     <td className={styles.cellMuted}>{formatDate(user.createdAt)}</td>
+                    <td>
+                      <div className={styles.rowActions}>
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          icon={<Eye size={14} />}
+                          onClick={() => navigate(`/admin/users/${encodeURIComponent(user.userId)}`)}
+                        >
+                          View
+                        </Button>
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </tbody>

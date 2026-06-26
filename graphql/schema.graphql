@@ -239,6 +239,17 @@ type AdminDeleteUserResult {
   deletedCognitoUser: Boolean!
 }
 
+# Full read-only snapshot of everything one user owns (SystemAdmin user-detail view):
+# their profile, owned tasks, categories, assignments, and support links (either direction).
+type AdminUserData {
+  userId: ID!
+  profile: UserProfile
+  tasks: [Task!]!
+  categories: [Category!]!
+  assignments: [Assignment!]!
+  supportLinks: [SupportLink!]!
+}
+
 # ─── AI step generation (Bedrock KB + RAG) ──────────────────────────────────--
 
 type Citation {
@@ -608,6 +619,10 @@ type Query {
   listAllUsers(limit: Int, nextToken: String): UserProfileConnection!
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
   listAllTasks(limit: Int, nextToken: String): TaskConnection!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Full read-only snapshot of one user's data (profile, tasks, categories, assignments,
+  # support links) for the admin user-detail view. PK queries + GSIs only (no Scan).
+  adminGetUserData(userId: ID!): AdminUserData!
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 }
 

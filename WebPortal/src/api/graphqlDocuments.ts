@@ -58,6 +58,49 @@ export const LIST_ALL_TASKS = /* GraphQL */ `
   }
 `;
 
+export const ADMIN_GET_USER_DATA = /* GraphQL */ `
+  query AdminGetUserData($userId: ID!) {
+    adminGetUserData(userId: $userId) {
+      userId
+      profile {
+        ${USER_PROFILE_FIELDS}
+      }
+      tasks {
+        ${TASK_FIELDS}
+      }
+      categories {
+        categoryId
+        ownerId
+        name
+        color
+        sortOrder
+        isDefault
+        createdAt
+        updatedAt
+      }
+      assignments {
+        assignmentId
+        taskId
+        userId
+        assignedBy
+        dueDate
+        status
+        assignedAt
+        createdAt
+        updatedAt
+      }
+      supportLinks {
+        supporterId
+        primaryUserId
+        userId
+        status
+        createdAt
+        updatedAt
+      }
+    }
+  }
+`;
+
 // ── Mutations ────────────────────────────────────────────────────────────────────
 export const INVITE_SUPPORT_PERSON = /* GraphQL */ `
   mutation InviteSupportPerson($input: InviteUserInput!) {

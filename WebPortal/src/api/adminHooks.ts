@@ -6,6 +6,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   adminDeleteTask,
   adminDeleteUser,
+  adminGetUserData,
   inviteOrganizationAdmin,
   inviteSupportPerson,
   listAllTasks,
@@ -27,6 +28,7 @@ export const adminKeys = {
   usersPage: (page: PageArgs) => ['admin', 'users', page] as const,
   tasks: ['admin', 'tasks'] as const,
   tasksPage: (page: PageArgs) => ['admin', 'tasks', page] as const,
+  userData: (userId: string) => ['admin', 'userData', userId] as const,
 };
 
 // ── Queries ──────────────────────────────────────────────────────────────────────
@@ -43,6 +45,15 @@ export function useTasksPage(page: PageArgs) {
     queryKey: adminKeys.tasksPage(page),
     queryFn: () => listAllTasks(page),
     placeholderData: (prev) => prev,
+  });
+}
+
+/** Full data snapshot for one user. Disabled until a non-empty userId is provided. */
+export function useUserData(userId: string | undefined) {
+  return useQuery({
+    queryKey: adminKeys.userData(userId ?? ''),
+    queryFn: () => adminGetUserData(userId as string),
+    enabled: Boolean(userId),
   });
 }
 

@@ -5,6 +5,7 @@ import ForbiddenPage from '../features/forbidden/ForbiddenPage';
 import AdminLayout from '../features/admin/AdminLayout';
 import AdminHomePage from '../features/admin/AdminHomePage';
 import UsersPage from '../features/admin/users/UsersPage';
+import UserDetailPage from '../features/admin/users/UserDetailPage';
 import TasksPage from '../features/admin/tasks/TasksPage';
 import DangerZonePage from '../features/admin/DangerZonePage';
 
@@ -24,6 +25,7 @@ export function AppRoutes() {
       >
         <Route index element={<AdminHomePage />} />
         <Route path="users" element={<UsersPage />} />
+        <Route path="users/:userId" element={<UserDetailPage />} />
         <Route path="tasks" element={<TasksPage />} />
         <Route path="danger" element={<DangerZonePage />} />
       </Route>

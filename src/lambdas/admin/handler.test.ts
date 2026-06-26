@@ -1,7 +1,7 @@
 import { handler } from './handler';
 import { dynamo } from '../../shared/dynamodb';
 import { cognito, findCognitoUsernameBySub, listGroupsForUser } from '../../shared/cognito';
-import { batchDelete, queryAllKeys } from '../../shared/batch';
+import { batchDelete, queryAllItems, queryAllKeys } from '../../shared/batch';
 import { deleteTaskCascade } from '../../shared/taskCascade';
 import { decodeNextToken, encodeNextToken } from '../../shared/pagination';
 import type { Connection, Task } from '../../shared/types';
@@ -29,6 +29,7 @@ jest.mock('../../shared/taskCascade', () => ({ deleteTaskCascade: jest.fn() }));
 jest.mock('../../shared/batch', () => ({
   batchDelete: jest.fn(),
   queryAllKeys: jest.fn(),
+  queryAllItems: jest.fn(),
 }));
 
 const mockSend = dynamo.send as jest.Mock;
@@ -38,6 +39,7 @@ const mockListGroups = listGroupsForUser as jest.Mock;
 const mockCascade = deleteTaskCascade as jest.Mock;
 const mockBatchDelete = batchDelete as jest.Mock;
 const mockQueryAllKeys = queryAllKeys as jest.Mock;
+const mockQueryAllItems = queryAllItems as jest.Mock;
 
 /** Default Cognito responses keyed by command type (overridable per test). */
 function defaultCognito(command: { constructor: { name: string }; input: Record<string, unknown> }) {
@@ -67,6 +69,7 @@ beforeEach(() => {
   mockCascade.mockResolvedValue(null);
   mockBatchDelete.mockResolvedValue(undefined);
   mockQueryAllKeys.mockResolvedValue([]);
+  mockQueryAllItems.mockResolvedValue([]);
 });
 afterEach(() => jest.resetAllMocks());
 
@@ -128,6 +131,53 @@ describe('admin handler — entityTypeIndex listings', () => {
 
     await handler(event('listAllUsers', { nextToken: encodeNextToken(lek)! }));
     expect(dynamoCalls().at(-1).input.ExclusiveStartKey).toEqual(lek);
+  });
+});
+
+describe('admin handler — adminGetUserData', () => {
+  it('aggregates profile, tasks, categories, assignments, and support links (no Scan)', async () => {
+    // GetCommand → profile; taskOwnerIndex → tasks; primaryUserSupportLinkIndex → primary-side links.
+    mockSend.mockImplementation((command: { constructor: { name: string }; input?: Record<string, unknown> }) => {
+      const input = command.input ?? {};
+      if (command.constructor.name === 'GetCommand') {
+        return Promise.resolve({ Item: { userId: 'u1', role: 'PRIMARY_USER' } });
+      }
+      if (input.IndexName === 'taskOwnerIndex') return Promise.resolve({ Items: [{ taskId: 't1' }] });
+      if (input.IndexName === 'primaryUserSupportLinkIndex') {
+        return Promise.resolve({ Items: [{ supporterId: 's9', primaryUserId: 'u1' }] });
+      }
+      return Promise.resolve({});
+    });
+    // queryAllItems(pk, prefix) drives categories / assignments / supporter-side links.
+    mockQueryAllItems.mockImplementation((_pk: string, prefix: string) => {
+      if (prefix === 'CATEGORY#') return Promise.resolve([{ categoryId: 'c1' }, { categoryId: 'c2' }]);
+      if (prefix === 'ASSIGN#') return Promise.resolve([{ assignmentId: 'a1' }]);
+      if (prefix === 'USER#') return Promise.resolve([{ supporterId: 'u1', primaryUserId: 'p1' }]);
+      return Promise.resolve([]);
+    });
+
+    const result = (await handler(event('adminGetUserData', { userId: 'u1' }))) as {
+      userId: string;
+      profile: { userId: string } | null;
+      tasks: unknown[];
+      categories: unknown[];
+      assignments: unknown[];
+      supportLinks: Array<{ supporterId: string; primaryUserId: string }>;
+    };
+
+    expect(result.userId).toBe('u1');
+    expect(result.profile?.userId).toBe('u1');
+    expect(result.tasks).toHaveLength(1);
+    expect(result.categories).toHaveLength(2);
+    expect(result.assignments).toHaveLength(1);
+    // One link as supporter (u1→p1) + one as primary (s9→u1), deduped by pair.
+    expect(result.supportLinks).toHaveLength(2);
+    // Never a Scan.
+    expect(dynamoCalls().every((c) => c.constructor.name !== 'ScanCommand')).toBe(true);
+  });
+
+  it('rejects a blank userId', async () => {
+    await expect(handler(event('adminGetUserData', { userId: '   ' }))).rejects.toThrow('userId is required');
   });
 });
 

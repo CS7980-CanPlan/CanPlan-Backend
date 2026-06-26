@@ -5,6 +5,7 @@
 import type {
   AdminDeleteUserInput,
   AdminDeleteUserResult,
+  AdminUserData,
   AdminUserResult,
   InviteUserInput,
   PageArgs,
@@ -18,6 +19,7 @@ import { gqlRequest } from './graphqlClient';
 import {
   ADMIN_DELETE_TASK,
   ADMIN_DELETE_USER,
+  ADMIN_GET_USER_DATA,
   INVITE_ORGANIZATION_ADMIN,
   INVITE_SUPPORT_PERSON,
   LIST_ALL_TASKS,
@@ -41,6 +43,14 @@ export async function listAllTasks(args: PageArgs = {}): Promise<TaskConnection>
     nextToken: args.nextToken ?? null,
   });
   return data.listAllTasks;
+}
+
+/** Full read-only snapshot of one user's data (profile, tasks, categories, assignments, links). */
+export async function adminGetUserData(userId: string): Promise<AdminUserData> {
+  const data = await gqlRequest<{ adminGetUserData: AdminUserData }>(ADMIN_GET_USER_DATA, {
+    userId,
+  });
+  return data.adminGetUserData;
 }
 
 // ── Mutations ────────────────────────────────────────────────────────────────────

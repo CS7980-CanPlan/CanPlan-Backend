@@ -537,6 +537,20 @@ export interface AdminDeleteUserResult {
   deletedCognitoUser: boolean;
 }
 
+/**
+ * Full read-only snapshot of everything one user owns, for the SystemAdmin user-detail
+ * view: their profile, owned tasks, categories, assignments, and support links (in either
+ * direction). Gathered with PK queries + GSIs (no Scan).
+ */
+export interface AdminUserData {
+  userId: string;
+  profile?: UserProfile | null;
+  tasks: Task[];
+  categories: Category[];
+  assignments: Assignment[];
+  supportLinks: SupportLink[];
+}
+
 // Step generation: a task query in, ordered source-cited steps out
 export interface QueryContext {
   role?: string;

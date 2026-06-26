@@ -31,6 +31,52 @@ export interface Task {
   updatedAt?: string | null;
 }
 
+export interface Category {
+  categoryId: string;
+  ownerId: string;
+  name: string;
+  color?: string | null;
+  sortOrder?: number | null;
+  isDefault: boolean;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export type AssignmentStatus = 'TO_DO' | 'OVERDUE' | 'COMPLETED' | 'SKIPPED';
+
+export interface Assignment {
+  assignmentId: string;
+  taskId: string;
+  userId: string;
+  assignedBy?: string | null;
+  dueDate?: string | null;
+  status: AssignmentStatus;
+  assignedAt?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export type SupportLinkStatus = 'PENDING' | 'ACTIVE' | 'REVOKED';
+
+export interface SupportLink {
+  supporterId: string;
+  primaryUserId: string;
+  userId: string;
+  status: SupportLinkStatus;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+/** Full read-only snapshot of one user's data (adminGetUserData). */
+export interface AdminUserData {
+  userId: string;
+  profile: UserProfile | null;
+  tasks: Task[];
+  categories: Category[];
+  assignments: Assignment[];
+  supportLinks: SupportLink[];
+}
+
 export interface UserProfileConnection {
   items: UserProfile[];
   nextToken: string | null;

@@ -140,6 +140,7 @@ export class Api extends Construct {
     wire('AdminDataSource', props.adminFn, [
       { typeName: 'Query', fieldName: 'listAllUsers' },
       { typeName: 'Query', fieldName: 'listAllTasks' },
+      { typeName: 'Query', fieldName: 'adminGetUserData' },
       { typeName: 'Mutation', fieldName: 'inviteSupportPerson' },
       { typeName: 'Mutation', fieldName: 'inviteOrganizationAdmin' },
       { typeName: 'Mutation', fieldName: 'setUserBaseRole' },
