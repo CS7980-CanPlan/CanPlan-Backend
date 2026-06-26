@@ -31,3 +31,30 @@ jobs:
 
       - name: TypeScript build check
         run: npm run build
+
+  web-portal:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: WebPortal
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: WebPortal/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run lint
+        run: npm run lint
+
+      - name: Build web portal
+        run: npm run build

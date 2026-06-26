@@ -1,0 +1,42 @@
+.card {
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  padding: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.label {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  margin: 0;
+}
+
+.value {
+  font-size: 2.25rem;
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+.hint {
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+}
+
+/* Accent stripe at the top of each card to differentiate metrics. */
+.card[data-accent='primary'] {
+  border-top: 4px solid var(--color-primary);
+}
+.card[data-accent='success'] {
+  border-top: 4px solid var(--color-success);
+}
+.card[data-accent='warning'] {
+  border-top: 4px solid var(--color-warning);
+}
+.card[data-accent='danger'] {
+  border-top: 4px solid var(--color-danger);
+}
