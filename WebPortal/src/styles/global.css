@@ -11,13 +11,17 @@
   --color-success: #1a7f4b;
   --color-warning: #b5680b;
   --color-danger: #c23030;
+  --color-danger-dark: #a82424;
 
   --radius: 10px;
+  --radius-sm: 6px;
   --shadow-sm: 0 1px 2px rgba(20, 30, 50, 0.06);
   --shadow-md: 0 4px 14px rgba(20, 30, 50, 0.08);
 
   --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial,
     sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Code', 'Fira Code', Menlo, Consolas,
+    monospace;
 }
 
 * {
