@@ -1,4 +1,4 @@
-import { buildStepsPrompt, parseSteps, resolveCitations, SYSTEM_PROMPT } from './steps';
+import { buildStepsPrompt, parseSteps, resolveCitations, SYSTEM_PROMPT, buildTitledStepsPrompt, parseTitledSteps } from './steps';
 import type { RetrievedPassage } from './types';
 
 const passages: RetrievedPassage[] = [
@@ -63,5 +63,46 @@ describe('SYSTEM_PROMPT', () => {
   it('is the Round-3 prompt requiring completeness and JSON-only output', () => {
     expect(SYSTEM_PROMPT).toContain('person with cognitive challenges');
     expect(SYSTEM_PROMPT).toContain('Respond with JSON only');
+  });
+});
+
+describe('buildTitledStepsPrompt', () => {
+  it('includes the request, the sources block, and a title+steps JSON shape', () => {
+    const prompt = buildTitledStepsPrompt('wash my hands', passages);
+    expect(prompt).toContain('Task: wash my hands');
+    expect(prompt).toContain('[hlbc-85-handwash-steps] Wet your hands, use soap for 20 seconds.');
+    expect(prompt).toContain('"title"');
+    expect(prompt).toContain('"steps"');
+  });
+});
+
+describe('parseTitledSteps', () => {
+  it('parses a clean { title, steps } object', () => {
+    const raw = '{"title":"Wash your hands","steps":[{"text":"Wet your hands.","citations":["hlbc-85-handwash-steps"]}]}';
+    expect(parseTitledSteps(raw)).toEqual({
+      title: 'Wash your hands',
+      steps: [{ text: 'Wet your hands.', citations: ['hlbc-85-handwash-steps'] }],
+    });
+  });
+
+  it('strips ``` code fences before parsing', () => {
+    const raw = '```json\n{"title":"Dry hands","steps":[{"text":"Dry your hands.","citations":[]}]}\n```';
+    expect(parseTitledSteps(raw)).toEqual({
+      title: 'Dry hands',
+      steps: [{ text: 'Dry your hands.', citations: [] }],
+    });
+  });
+
+  it('throws when title is missing or empty', () => {
+    expect(() => parseTitledSteps('{"steps":[{"text":"x","citations":[]}]}')).toThrow('could not parse titled steps');
+    expect(() => parseTitledSteps('{"title":"   ","steps":[{"text":"x","citations":[]}]}')).toThrow('could not parse titled steps');
+  });
+
+  it('throws when steps shape is wrong', () => {
+    expect(() => parseTitledSteps('{"title":"t","steps":[{"citations":[]}]}')).toThrow('could not parse titled steps');
+  });
+
+  it('throws on malformed JSON', () => {
+    expect(() => parseTitledSteps('not json')).toThrow('could not parse titled steps');
   });
 });

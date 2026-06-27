@@ -29,8 +29,8 @@ interface RawSteps {
   steps: { text: string; citations: string[] }[];
 }
 
-/** Parse + shape-validate the model output. Strips ``` fences like the prototype. */
-export function parseSteps(raw: string): RawSteps {
+/** Strip a ```/```json code fence (if present) and return the trimmed inner text. */
+function stripJsonFences(raw: string): string {
   let text = raw.trim();
   if (text.startsWith('```')) {
     text = text.replace(/^```/, '').replace(/```$/, '').trim();
@@ -38,6 +38,12 @@ export function parseSteps(raw: string): RawSteps {
       text = text.slice(4).trim();
     }
   }
+  return text;
+}
+
+/** Parse + shape-validate the model output. Strips ``` fences like the prototype. */
+export function parseSteps(raw: string): RawSteps {
+  const text = stripJsonFences(raw);
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -79,4 +85,42 @@ export function resolveCitations(chunkIds: string[], passages: RetrievedPassage[
 /** Convenience: map raw parsed steps + retrieved passages into resolved GeneratedSteps. */
 export function toTaskSteps(raw: RawSteps, passages: RetrievedPassage[]): GeneratedStep[] {
   return raw.steps.map((s) => ({ text: s.text, citations: resolveCitations(s.citations, passages) }));
+}
+
+/**
+ * Like buildStepsPrompt, but also asks the model for a short, clean task title.
+ * Used by createAiTask (one-shot generate + save). Verbatim step style as the
+ * untitled prompt; only the requested JSON shape gains a `title`.
+ */
+export function buildTitledStepsPrompt(query: string, passages: RetrievedPassage[]): string {
+  const sources = passages.map((p) => `[${p.chunkId}] ${p.text}`).join('\n');
+  return (
+    `Task: ${query}\n\n` +
+    `Sources:\n${sources}\n\n` +
+    'Also give the task a short, clear title in plain everyday words (a few words, no jargon).\n' +
+    'Return JSON shaped exactly as: ' +
+    '{"title": "<short clear task title>", "steps": [{"text": "<one simple action, ' +
+    'one short sentence, no jargon>", "citations": ["<chunk_id used>"]}]}'
+  );
+}
+
+interface RawTitledSteps {
+  title: string;
+  steps: RawSteps['steps'];
+}
+
+/** Parse + shape-validate a { title, steps } model output. Strips ``` fences like parseSteps. */
+export function parseTitledSteps(raw: string): RawTitledSteps {
+  const text = stripJsonFences(raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`could not parse titled steps from model output: ${(err as Error).message}`);
+  }
+  const title = (parsed as { title?: unknown }).title;
+  if (typeof title !== 'string' || title.trim() === '' || !isRawSteps(parsed)) {
+    throw new Error('could not parse titled steps from model output: shape mismatch');
+  }
+  return { title: title.trim(), steps: (parsed as RawSteps).steps };
 }

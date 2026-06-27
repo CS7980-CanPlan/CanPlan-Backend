@@ -290,6 +290,12 @@ export interface CreateTaskInput {
   coverImageS3Key?: string;
 }
 
+// AI one-shot task creation input: one free-text request (+ optional category).
+export interface CreateAiTaskInput {
+  query: string;
+  categoryId?: string;
+}
+
 /**
  * Partial edit of a Task `#META` item. Only fields that are present (non-null) are
  * changed; `ownerId` and `taskId` are immutable, and steps are edited separately.
@@ -580,6 +586,20 @@ export interface GeneratedStep {
 export interface TaskStepsResponse {
   steps: GeneratedStep[];
   model: string;
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
+// createAiTask PREVIEW response: an AI-generated title + ordered, text-only steps.
+// Nothing is persisted — no taskId/ownerId/categoryId/timestamps and no step ids or
+// citations; the caller saves it later via createTask if they keep it.
+export interface GeneratedAiTaskStep {
+  text: string;
+}
+
+export interface GeneratedAiTask {
+  title: string;
+  steps: GeneratedAiTaskStep[];
   inputTokens?: number;
   outputTokens?: number;
 }

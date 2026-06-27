@@ -272,6 +272,20 @@ type TaskStepsResponse {
   outputTokens: Int
 }
 
+# An AI-generated task PREVIEW — a clean title + ordered, text-only steps. Nothing is
+# persisted: the caller decides whether to keep it and saves it later via createTask.
+# Citations are intentionally dropped (end users have cognitive disabilities).
+type GeneratedAiTaskStep {
+  text: String!
+}
+
+type GeneratedAiTask {
+  title: String!
+  steps: [GeneratedAiTaskStep!]!
+  inputTokens: Int
+  outputTokens: Int
+}
+
 # ─── Inputs ───────────────────────────────────────────────────────────────────
 
 # A signed-in user creates only their OWN profile. Identity (userId), email, and
@@ -350,6 +364,15 @@ input CreateTaskInput {
   # Optional cover image: the pending s3Key from createTaskCoverImageUploadUrl (after
   # the client PUT the bytes). Omitted ⇒ the task has no cover image.
   coverImageS3Key: String
+}
+
+# AI one-shot task creation: the user gives one request; the AI generates a clean
+# title + steps and the task is created directly. No citations are surfaced or
+# stored (end users have cognitive disabilities). Owner is derived from the
+# Cognito identity.
+input CreateAiTaskInput {
+  query: String!          # the user's request, e.g. "wash my hair"; drives generation + title
+  categoryId: ID          # optional, as in createTask: omitted ⇒ owner's default category
 }
 
 # Partial edit of an existing task. Only fields you include are changed; omitted
@@ -650,6 +673,9 @@ type Mutation {
 
   # Create a reusable task template (and optionally its ordered steps).
   createTask(input: CreateTaskInput!): Task
+  # Generate a titled, stepped task PREVIEW from one request (no citations). Nothing is
+  # persisted — the caller saves it later via createTask if they keep it.
+  createAiTask(input: CreateAiTaskInput!): GeneratedAiTask!
   # Edit an existing task template's fields (partial update). Errors if not found.
   updateTask(input: UpdateTaskInput!): Task
   createTaskStep(input: CreateTaskStepInput!): TaskStep
