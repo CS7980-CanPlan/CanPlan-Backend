@@ -25,10 +25,12 @@ import {
   MEDIA_PREFIX,
   mediaSk,
   META_SK,
+  PROFILE_SK,
   STEP_PREFIX,
   TASK_MEDIA_CLEANUP_PREFIX,
   taskMediaCleanupSk,
   taskPk,
+  userPk,
 } from './keys';
 import { deleteS3ObjectBestEffort } from './media';
 import type { MediaAsset, Task } from './types';
@@ -119,6 +121,18 @@ export async function deleteTaskCascade(
               },
             },
             categoryCountDelta(stored.ownerId, stored.categoryId, -1, { blockIfDeleting: false }),
+            // Decrement the owner's profile task counter in the same transaction (the profile
+            // always exists at cascade time — adminDeleteUser removes it only after every task
+            // cascade). `nextTaskOrder` is never reclaimed, so order gaps are intentional.
+            {
+              Update: {
+                TableName: TABLE_NAME,
+                Key: { PK: userPk(stored.ownerId), SK: PROFILE_SK },
+                UpdateExpression: 'SET updatedAt = :now ADD taskCount :negOne',
+                ConditionExpression: 'attribute_exists(PK)',
+                ExpressionAttributeValues: { ':negOne': -1, ':now': new Date().toISOString() },
+              },
+            },
           ],
         }),
       );
