@@ -6,6 +6,7 @@ import {
   TransactWriteCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
+import { assertNoActiveAssignmentsForTask } from '../../shared/assignment';
 import { queryAllItems } from '../../shared/batch';
 import { assertCallerOwns } from '../../shared/authz';
 import { assertUsableCategory, categoryCountDelta } from '../../shared/category';
@@ -37,7 +38,6 @@ import {
   queryPage,
 } from '../../shared/pagination';
 import { NotFoundError, ValidationError } from '../../shared/response';
-import { normalizeSchedule } from '../../shared/schedule';
 import type {
   AppSyncEvent,
   AppSyncIdentity,
@@ -218,9 +218,9 @@ async function listTasksByCategory(
 /**
  * updateTask — partial edit of a Task `#META` item. Read-modify-write so the coupled
  * derived fields stay consistent: changing categoryId recomputes taskCategoryKey (so the
- * task moves buckets in taskCategoryIndex) and is validated against the task's owner; a
- * new schedule re-derives nextOccurrenceAt. Only fields present (non-null) on the input
- * change; ownerId, createdAt, and the task's steps are left untouched.
+ * task moves buckets in taskCategoryIndex) and is validated against the task's owner. Only
+ * fields present (non-null) on the input change; ownerId, createdAt, and the task's steps
+ * are left untouched. A Task is a reusable template only — it carries no schedule fields.
  */
 async function updateTask(
   identity: AppSyncIdentity | undefined,
@@ -236,8 +236,6 @@ async function updateTask(
   if (input.categoryId != null && !input.categoryId.trim()) {
     throw new ValidationError('categoryId cannot be blank; omit it to leave it unchanged');
   }
-  // Validate any schedule before the read so invalid input fails fast (no wasted read).
-  const scheduleUpdate = input.schedule != null ? normalizeSchedule(input.schedule) : undefined;
 
   const stored = await loadOwnedTask(identity, taskId);
 
@@ -255,15 +253,9 @@ async function updateTask(
   const updated: Task = { ...stored, updatedAt: new Date().toISOString() };
   if (input.title != null) updated.title = input.title.trim();
   if (input.description != null) updated.description = input.description.trim();
-  if (input.scheduleRule != null) updated.scheduleRule = input.scheduleRule.trim();
-  if (input.notificationEnabled != null) updated.notificationEnabled = input.notificationEnabled;
   if (newCategoryId != null) {
     updated.categoryId = newCategoryId;
     updated.taskCategoryKey = taskCategoryKey(stored.ownerId, newCategoryId);
-  }
-  if (scheduleUpdate) {
-    updated.schedule = scheduleUpdate.schedule;
-    updated.nextOccurrenceAt = scheduleUpdate.nextOccurrenceAt;
   }
 
   // Optimistic-concurrency guard: the write only lands if the task is STILL in the category
@@ -877,9 +869,8 @@ async function getMediaAsset(taskId: string, assetId: string): Promise<MediaAsse
  * reorderTaskSteps — atomically renumber ALL of a task's steps. The request must carry the
  * complete current step set: every existing stepId exactly once, with orders forming a
  * contiguous 1..N permutation (N = number of steps, max 99). Every step's `order` is
- * updated in one transaction (all-or-nothing); step ids, media, task contents,
- * AssignmentSteps, and historical assignments are untouched. Returns the steps sorted by
- * ascending order.
+ * updated in one transaction (all-or-nothing); step ids, media, task contents, and existing
+ * TaskInstanceStep snapshots are untouched. Returns the steps sorted by ascending order.
  */
 async function reorderTaskSteps(
   identity: AppSyncIdentity | undefined,
@@ -993,8 +984,8 @@ async function reorderTaskSteps(
  * purgeMediaAsset path. If any S3 delete fails, the operation throws a retryable error rather
  * than silently claiming success; a durable cleanup journal retains the orphaned binary key.
  *
- * Never modifies the Task, any other TaskStep, any Assignment, or any AssignmentStep —
- * historical snapshots are untouched.
+ * Never modifies the Task, any other TaskStep, or any TaskInstance/TaskInstanceStep —
+ * existing per-occurrence snapshots are untouched.
  */
 async function deleteTaskStep(
   identity: AppSyncIdentity | undefined,
@@ -1077,8 +1068,8 @@ async function deleteTaskStep(
  * deleteTask — owner-scoped delete of a Task and ALL of its owned children (the `#META`
  * item, every TaskStep, every MediaAsset + S3 binary). Enforces ownership, then delegates
  * the cascade to the shared `deleteTaskCascade` (the same path the SystemAdmin
- * `adminDeleteTask` uses without an ownership check). Historical Assignments/AssignmentSteps
- * snapshotted from this task are intentionally never deleted.
+ * `adminDeleteTask` uses without an ownership check). Rejected while an active TaskAssignment
+ * references the task; existing TaskInstance/TaskInstanceStep rows are never deleted.
  */
 async function deleteTask(
   identity: AppSyncIdentity | undefined,
@@ -1089,6 +1080,8 @@ async function deleteTask(
 
   // Existence + ownership, then the shared cascade (task already loaded, so it won't re-read).
   const stored = await loadOwnedTask(identity, id);
+  // Refuse while any ACTIVE TaskAssignment still schedules this template for a user.
+  await assertNoActiveAssignmentsForTask(id);
   // loadOwnedTask proved the task exists, so the cascade returns the deleted task (never null).
   return (await deleteTaskCascade(id, { task: stored })) as Task;
 }

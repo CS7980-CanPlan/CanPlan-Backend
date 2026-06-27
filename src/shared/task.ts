@@ -9,7 +9,6 @@ import { dynamo, TABLE_NAME } from './dynamodb';
 import { ENTITY, META_SK, mediaSk, stepSk, taskCategoryKey, taskPk } from './keys';
 import { deleteS3ObjectBestEffort, prepareCoverImageAsset } from './media';
 import { ValidationError } from './response';
-import { normalizeSchedule } from './schedule';
 import type { CreateTaskInput, MediaAsset, Task, TaskStep } from './types';
 
 /** DynamoDB permits at most 100 writes in a transaction. */
@@ -31,8 +30,6 @@ export async function persistTask(ownerId: string, input: CreateTaskInput): Prom
 
   const taskId = randomUUID();
   const now = new Date().toISOString();
-
-  const { schedule, nextOccurrenceAt } = normalizeSchedule(input.schedule);
 
   // Each nested step becomes its own TaskStep item with a 1-based `order` and a stable
   // STEP#<stepId> sort key.
@@ -67,12 +64,6 @@ export async function persistTask(ownerId: string, input: CreateTaskInput): Prom
     stepVersion: 1,
     nextStepOrder: steps.length + 1,
     description: input.description?.trim(),
-    scheduleRule: input.scheduleRule?.trim(),
-    schedule,
-    nextOccurrenceAt,
-    // Default to enabled alongside a schedule; otherwise leave whatever the client sent
-    // (undefined is dropped by the document client's removeUndefinedValues).
-    notificationEnabled: schedule ? (input.notificationEnabled ?? true) : input.notificationEnabled,
     createdAt: now,
     updatedAt: now,
   };

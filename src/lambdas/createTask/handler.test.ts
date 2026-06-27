@@ -215,54 +215,26 @@ describe('createTask handler', () => {
     await expect(handler(makeEvent({ title: 'T' }))).rejects.toThrow('no default category');
   });
 
-  it('stores valid schedule metadata, defaults enabled, and sets nextOccurrenceAt', async () => {
+  it('never stores schedule fields on a Task (a Task is a reusable template only)', async () => {
     const result = await handler(
       makeEvent({
         title: 'Take meds',
-        schedule: {
-          repeatEvery: 2,
-          repeatUnit: 'DAY',
-          firstOccurrenceAt: '2026-07-01T09:00:00Z',
-          timezone: 'America/Toronto',
-        },
-      }),
+        // Stray schedule-ish fields are ignored — a Task carries no scheduling data.
+        scheduleRule: 'FREQ=DAILY',
+        schedule: { repeatEvery: 2 },
+        nextOccurrenceAt: '2026-07-01T09:00:00Z',
+        notificationEnabled: true,
+      } as Record<string, unknown>),
     );
     const meta = writtenItems().find((i) => i.SK === '#META')!;
-    expect(meta.schedule).toEqual({
-      repeatEvery: 2,
-      repeatUnit: 'DAY',
-      firstOccurrenceAt: '2026-07-01T09:00:00Z',
-      timezone: 'America/Toronto',
-      enabled: true,
-    });
-    expect(meta.nextOccurrenceAt).toBe('2026-07-01T09:00:00Z');
-    expect(meta.notificationEnabled).toBe(true);
-    expect(result.nextOccurrenceAt).toBe('2026-07-01T09:00:00Z');
-  });
-
-  it('leaves schedule fields unset when no schedule is provided', async () => {
-    const result = await handler(makeEvent({ title: 'T' }));
-    const meta = writtenItems().find((i) => i.SK === '#META')!;
+    expect(meta.scheduleRule).toBeUndefined();
     expect(meta.schedule).toBeUndefined();
     expect(meta.nextOccurrenceAt).toBeUndefined();
-    expect(result.schedule).toBeUndefined();
-  });
-
-  it('rejects a schedule with a non-positive repeatEvery', async () => {
-    await expect(
-      handler(
-        makeEvent({
-          title: 'T',
-          schedule: {
-            repeatEvery: 0,
-            repeatUnit: 'DAY',
-            firstOccurrenceAt: '2026-07-01T09:00:00Z',
-            timezone: 'UTC',
-          },
-        }),
-      ),
-    ).rejects.toThrow('repeatEvery must be a positive integer');
-    expect(transaction()).toBeUndefined();
+    expect(meta.notificationEnabled).toBeUndefined();
+    const out = result as unknown as Record<string, unknown>;
+    expect(out.scheduleRule).toBeUndefined();
+    expect(out.schedule).toBeUndefined();
+    expect(out.nextOccurrenceAt).toBeUndefined();
   });
 
   it('rejects an unauthenticated caller (no identity sub)', async () => {

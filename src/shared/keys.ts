@@ -12,8 +12,12 @@ export const ENTITY = {
   CATEGORY: 'Category',
   TASK: 'Task',
   TASK_STEP: 'TaskStep',
-  ASSIGNMENT: 'Assignment',
-  ASSIGNMENT_STEP: 'AssignmentStep',
+  // Scheduling model: a TaskAssignment is the schedule rule for a (user, task); a
+  // TaskInstance is one concrete occurrence; a TaskInstanceStep is one immutable step
+  // snapshot under an instance. (The old Assignment/AssignmentStep entities are gone.)
+  TASK_ASSIGNMENT: 'TaskAssignment',
+  TASK_INSTANCE: 'TaskInstance',
+  TASK_INSTANCE_STEP: 'TaskInstanceStep',
   MEDIA_ASSET: 'MediaAsset',
   TASK_MEDIA_CLEANUP: 'TaskMediaCleanup',
   REPORT: 'Report',
@@ -38,6 +42,10 @@ export const ENTITY_TYPE_INDEX = 'entityTypeIndex';
 // also needs the links where the target user is the PRIMARY user. SupportLink mirrors
 // primaryUserId onto `userId`, so this GSI keys on userId (HASH) + supporterId (RANGE).
 export const PRIMARY_USER_SUPPORT_LINK_INDEX = 'primaryUserSupportLinkIndex';
+// Active TaskAssignments by their source task. Sparse: only an ACTIVE TaskAssignment row
+// carries `activeTaskAssignmentTaskId` (= its taskId); ending/deleting an assignment removes
+// it. Lets deleteTask cheaply prove no active assignment still references the task.
+export const ACTIVE_TASK_ASSIGNMENT_TASK_INDEX = 'activeTaskAssignmentTaskIndex';
 
 // ── Fixed sort-key values ─────────────────────────────────────────────────────
 export const PROFILE_SK = '#PROFILE';
@@ -46,11 +54,16 @@ export const META_SK = '#META';
 // ── Sort-key prefixes (for begins_with queries) ──────────────────────────────
 export const CATEGORY_PREFIX = 'CATEGORY#';
 export const STEP_PREFIX = 'STEP#';
-export const ASSIGN_PREFIX = 'ASSIGN#';
-// AssignmentStep snapshots. Note `ASSIGN_STEP#` does NOT begin with `ASSIGN#`
-// (the 7th char is `_`, not `#`), so a begins_with(SK, 'ASSIGN#') query for a
-// user's assignments never returns these step rows.
-export const ASSIGN_STEP_PREFIX = 'ASSIGN_STEP#';
+// TaskAssignment rows (the schedule rule for a (user, task)), under USER#<userId>.
+export const TASK_ASSIGNMENT_PREFIX = 'TASK_ASSIGNMENT#';
+// TaskInstance rows (one concrete occurrence), under USER#<userId>, date-sorted by SK.
+// Note `TASK_INSTANCE_STEP#` does NOT begin with `TASK_INSTANCE#...` in a way that collides:
+// instance SKs are `TASK_INSTANCE#<date>#...` while step SKs are `TASK_INSTANCE_STEP#<...>`,
+// so a begins_with(SK, 'TASK_INSTANCE#') query for instances never returns step rows (the
+// 14th char is `_` vs `#`).
+export const TASK_INSTANCE_PREFIX = 'TASK_INSTANCE#';
+// TaskInstanceStep snapshots, under USER#<userId>.
+export const TASK_INSTANCE_STEP_PREFIX = 'TASK_INSTANCE_STEP#';
 export const MEDIA_PREFIX = 'MEDIA#';
 // Durable journal rows used while cascading a Task's media deletion. They retain the
 // S3 key across retries even after the MediaAsset row has been removed.
@@ -100,14 +113,53 @@ export const userLinkSk = (primaryUserId: string): string => `USER#${primaryUser
  * Read paths sort by the numeric `order` attribute, never by key order.
  */
 export const stepSk = (stepId: string): string => `${STEP_PREFIX}${stepId}`;
-/** Assignment SK — keyed by the globally-unique assignmentId, never the taskId. */
-export const assignSk = (assignmentId: string): string => `${ASSIGN_PREFIX}${assignmentId}`;
-/** AssignmentStep SK — one snapshot row per TaskStep within one assignment. */
-export const assignStepSk = (assignmentId: string, stepId: string): string =>
-  `${ASSIGN_STEP_PREFIX}${assignmentId}#${STEP_PREFIX}${stepId}`;
-/** begins_with prefix to query only one assignment's step snapshots. */
-export const assignStepPrefix = (assignmentId: string): string =>
-  `${ASSIGN_STEP_PREFIX}${assignmentId}#${STEP_PREFIX}`;
+
+// ── Scheduling sort keys (TaskAssignment / TaskInstance / TaskInstanceStep) ────
+/** TaskAssignment SK — keyed by the globally-unique assignmentId, never the taskId. */
+export const taskAssignmentSk = (assignmentId: string): string =>
+  `${TASK_ASSIGNMENT_PREFIX}${assignmentId}`;
+/**
+ * TaskInstance SK — date-sorted so a date-range query uses a single BETWEEN on the SK:
+ * `TASK_INSTANCE#<scheduledDate>#<scheduledTime>#<assignmentId>`. scheduledDate is a fixed
+ * `YYYY-MM-DD` and scheduledTime a fixed `HH:mm`, so lexical order equals chronological order.
+ */
+export const taskInstanceSk = (
+  scheduledDate: string,
+  scheduledTime: string,
+  assignmentId: string,
+): string => `${TASK_INSTANCE_PREFIX}${scheduledDate}#${scheduledTime}#${assignmentId}`;
+/**
+ * Client-facing instanceId for one occurrence: `<assignmentId>#<scheduledDate>#<scheduledTime>`.
+ * assignmentId is a UUID (no `#`), so the three parts split cleanly on `#`.
+ */
+export const taskInstanceId = (
+  assignmentId: string,
+  scheduledDate: string,
+  scheduledTime: string,
+): string => `${assignmentId}#${scheduledDate}#${scheduledTime}`;
+/** Parse an instanceId back into its (assignmentId, scheduledDate, scheduledTime) parts. */
+export function parseInstanceId(
+  instanceId: string,
+): { assignmentId: string; scheduledDate: string; scheduledTime: string } | null {
+  const parts = instanceId.split('#');
+  if (parts.length !== 3) return null;
+  const [assignmentId, scheduledDate, scheduledTime] = parts;
+  if (!assignmentId || !scheduledDate || !scheduledTime) return null;
+  return { assignmentId, scheduledDate, scheduledTime };
+}
+/** TaskInstance SK derived from a composite instanceId. */
+export const taskInstanceSkFromId = (instanceId: string): string | null => {
+  const parsed = parseInstanceId(instanceId);
+  if (!parsed) return null;
+  return taskInstanceSk(parsed.scheduledDate, parsed.scheduledTime, parsed.assignmentId);
+};
+/** TaskInstanceStep SK — one immutable step snapshot under one instance. */
+export const taskInstanceStepSk = (instanceId: string, stepId: string): string =>
+  `${TASK_INSTANCE_STEP_PREFIX}${instanceId}#${STEP_PREFIX}${stepId}`;
+/** begins_with prefix to query only one instance's step snapshots. */
+export const taskInstanceStepPrefix = (instanceId: string): string =>
+  `${TASK_INSTANCE_STEP_PREFIX}${instanceId}#${STEP_PREFIX}`;
+
 /** MediaAsset SK — keyed by the unique assetId under the owning task. */
 export const mediaSk = (assetId: string): string => `${MEDIA_PREFIX}${assetId}`;
 /** Task-media cleanup journal SK — retains an S3 key until the binary is deleted. */

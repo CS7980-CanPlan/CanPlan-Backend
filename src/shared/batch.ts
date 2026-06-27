@@ -1,7 +1,7 @@
 // Bulk-delete helpers for the single table.
 //
 // Used to remove a parent item together with all of its child rows (a Task and its
-// TaskSteps, an Assignment and its AssignmentStep snapshots). DynamoDB's atomic
+// TaskSteps, or a full USER# partition). DynamoDB's atomic
 // TransactWrite is capped at 100 items, so an entity with >99 children cannot be
 // deleted in one transaction. These helpers instead collect every child key (following
 // Query pagination) and delete in BatchWriteItem chunks — non-transactional, but it

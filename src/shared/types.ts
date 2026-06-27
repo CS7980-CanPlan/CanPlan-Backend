@@ -6,15 +6,29 @@
 // ── Enums (mirror graphql/schema.graphql) ─────────────────────────────────────
 export type UserRole = 'PRIMARY_USER' | 'SUPPORT_PERSON' | 'ORG_ADMIN';
 export type SupportLinkStatus = 'PENDING' | 'ACTIVE' | 'REVOKED';
-/**
- * Assignment status as surfaced through the API. `OVERDUE` is derived at read time
- * (persisted status TO_DO + a dueDate in the past) — it is never written to storage.
- */
-export type AssignmentStatus = 'TO_DO' | 'OVERDUE' | 'COMPLETED' | 'SKIPPED';
-/** The only statuses ever persisted on an Assignment row. */
-export type PersistedAssignmentStatus = 'TO_DO' | 'COMPLETED' | 'SKIPPED';
 export type MediaType = 'IMAGE' | 'AUDIO' | 'VIDEO';
-export type RepeatUnit = 'MINUTE' | 'HOUR' | 'DAY' | 'WEEK' | 'MONTH';
+
+// ── Scheduling enums (mirror graphql/schema.graphql) ──────────────────────────
+/** How a TaskAssignment recurs: a single occurrence, or a recurrence rule. */
+export type TaskAssignmentScheduleType = 'ONE_TIME' | 'RECURRING';
+/**
+ * A TaskInstance's lifecycle status. `OVERDUE` is derived at read time (a non-terminal
+ * occurrence whose scheduledFor is in the past) — it is never persisted or settable.
+ */
+export type TaskInstanceStatus =
+  | 'TO_DO'
+  | 'IN_PROGRESS'
+  | 'OVERDUE'
+  | 'COMPLETED'
+  | 'SKIPPED'
+  | 'CANCELLED';
+/** The statuses ever persisted on a TaskInstance row (OVERDUE is derived, never stored). */
+export type PersistedTaskInstanceStatus =
+  | 'TO_DO'
+  | 'IN_PROGRESS'
+  | 'COMPLETED'
+  | 'SKIPPED'
+  | 'CANCELLED';
 
 // ── Entities ──────────────────────────────────────────────────────────────────
 export interface UserProfile {
@@ -78,15 +92,6 @@ export interface Category {
   updatedAt: string;
 }
 
-/** Recurring-schedule metadata persisted on a Task (phase 1 stores it; delivery is later). */
-export interface TaskSchedule {
-  repeatEvery: number;
-  repeatUnit: RepeatUnit;
-  firstOccurrenceAt: string;
-  timezone: string;
-  enabled: boolean;
-}
-
 export interface Task {
   taskId: string;
   ownerId: string;
@@ -113,13 +118,6 @@ export interface Task {
   stepVersion?: number;
   nextStepOrder?: number;
   description?: string;
-  scheduleRule?: string;
-  /** Recurring-schedule metadata; present only when the task was created with a schedule. */
-  schedule?: TaskSchedule;
-  /** First (next) fire time — equals schedule.firstOccurrenceAt at creation. */
-  nextOccurrenceAt?: string;
-  /** Whether reminders are enabled; defaults to true when a schedule is provided. */
-  notificationEnabled?: boolean;
   /**
    * Optional single cover image. The id of an IMAGE MediaAsset (PK=TASK#<taskId>,
    * SK=MEDIA#<assetId>); fetch a viewable URL with getMediaDownloadUrl(taskId, assetId).
@@ -147,31 +145,82 @@ export interface TaskStep {
   updatedAt?: string;
 }
 
-export interface Assignment {
+/**
+ * The schedule rule binding a Task template to a user. It carries NO status or step
+ * completion — those live on a TaskInstance / TaskInstanceStep. PK = USER#<userId>,
+ * SK = TASK_ASSIGNMENT#<assignmentId>.
+ *
+ * ONE_TIME assignments use `scheduledFor` + `timezone`; RECURRING assignments use
+ * `scheduleRule` (an RRULE) + `startDate` + `startTime` + `timezone` (+ optional `endDate`).
+ */
+export interface TaskAssignment {
   assignmentId: string;
   taskId: string;
   userId: string;
   assignedBy?: string;
-  dueDate?: string;
-  recurrence?: string;
+  scheduleType: TaskAssignmentScheduleType;
+  /** ONE_TIME: the single occurrence's ISO datetime. */
+  scheduledFor?: string;
+  /** RECURRING: an RRULE string (e.g. `FREQ=DAILY;INTERVAL=1`). */
   scheduleRule?: string;
-  /** Persisted as TO_DO/COMPLETED/SKIPPED; surfaced as AssignmentStatus (may be OVERDUE). */
-  status: AssignmentStatus;
+  /** RECURRING: inclusive first date (YYYY-MM-DD) the rule may produce occurrences on. */
+  startDate?: string;
+  /** RECURRING: inclusive last date (YYYY-MM-DD); absent ⇒ open-ended. */
+  endDate?: string;
+  /** RECURRING: wall-clock time of day each occurrence fires (HH:mm). */
+  startTime?: string;
+  /** IANA timezone the schedule is interpreted in (both ONE_TIME and RECURRING). */
+  timezone: string;
+  /** False once the assignment is ended/soft-deleted; only active rows expand to occurrences. */
+  active: boolean;
+  /** When the assignment was ended/soft-deleted (active=false). */
+  endedAt?: string;
+  /**
+   * Sparse activeTaskAssignmentTaskIndex partition key (= taskId) — present ONLY while the
+   * assignment is active, so deleteTask can prove no active assignment references the task.
+   * Removed on end/delete. Not part of the GraphQL TaskAssignment type.
+   */
+  activeTaskAssignmentTaskId?: string;
   assignedAt: string;
   createdAt: string;
   updatedAt?: string;
 }
 
 /**
- * A snapshot of one TaskStep captured into one Assignment at creation time. The
- * snapshot is immutable to template edits — later changes to the Task's steps must
- * not alter historical assignments. PK = USER#<userId>, SK = ASSIGN_STEP#<assignmentId>#STEP#<stepId>.
- *
- * Carries text/completion only — NOT media. A live Task MediaAsset can be deleted with
- * its TaskStep, so it is never copied here. Assignment-visible media, if ever needed,
- * must be a separate assignment-owned snapshot.
+ * One concrete occurrence of a scheduled TaskAssignment — created lazily (startTaskInstance,
+ * cancelTaskInstance) when a user acts on an occurrence. Stores status + lifecycle timestamps.
+ * PK = USER#<userId>, SK = TASK_INSTANCE#<scheduledDate>#<scheduledTime>#<assignmentId>;
+ * instanceId = <assignmentId>#<scheduledDate>#<scheduledTime>.
  */
-export interface AssignmentStep {
+export interface TaskInstance {
+  instanceId: string;
+  assignmentId: string;
+  taskId: string;
+  userId: string;
+  scheduledDate: string;
+  scheduledTime: string;
+  /** The occurrence's absolute ISO instant (scheduledDate + scheduledTime in `timezone`). */
+  scheduledFor: string;
+  timezone: string;
+  /** Persisted as TO_DO/IN_PROGRESS/COMPLETED/SKIPPED/CANCELLED; surfaced as TaskInstanceStatus. */
+  status: PersistedTaskInstanceStatus;
+  startedAt?: string;
+  completedAt?: string;
+  skippedAt?: string;
+  cancelledAt?: string;
+  /** True when this instance diverges from the plain schedule (e.g. a cancelled occurrence). */
+  isException?: boolean;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+/**
+ * An immutable snapshot of one TaskStep captured into one TaskInstance when the instance is
+ * started. Per-occurrence completion lives here. PK = USER#<userId>,
+ * SK = TASK_INSTANCE_STEP#<instanceId>#STEP#<stepId>.
+ */
+export interface TaskInstanceStep {
+  instanceId: string;
   assignmentId: string;
   taskId: string;
   stepId: string;
@@ -181,6 +230,26 @@ export interface AssignmentStep {
   completedAt?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * A calendar cell for getTaskInstanceViews: either a real TaskInstance overlaid on its
+ * scheduled slot, or a VIRTUAL occurrence that has no real instance yet (`isVirtual: true`,
+ * `instanceId: null`).
+ */
+export interface TaskInstanceView {
+  instanceId: string | null;
+  assignmentId: string;
+  taskId: string;
+  userId: string;
+  title: string;
+  scheduledDate: string;
+  scheduledTime: string;
+  scheduledFor: string;
+  timezone: string;
+  status: TaskInstanceStatus;
+  isVirtual: boolean;
+  isException: boolean;
 }
 
 export interface MediaAsset {
@@ -260,17 +329,9 @@ export interface CreateTaskStepNestedInput {
   description?: string;
 }
 
-/** Schedule metadata accepted at task creation. `enabled` defaults to true when stored. */
-export interface TaskScheduleInput {
-  repeatEvery: number;
-  repeatUnit: RepeatUnit;
-  firstOccurrenceAt: string;
-  timezone: string;
-  enabled?: boolean;
-}
-
 // ownerId is intentionally absent — the owner is derived from the authenticated
-// Cognito identity (event.identity.sub), never client-supplied.
+// Cognito identity (event.identity.sub), never client-supplied. A Task is a reusable
+// template only: it carries no schedule (scheduling lives on TaskAssignment).
 export interface CreateTaskInput {
   title: string;
   /**
@@ -279,10 +340,7 @@ export interface CreateTaskInput {
    */
   categoryId?: string;
   description?: string;
-  scheduleRule?: string;
   steps?: CreateTaskStepNestedInput[];
-  schedule?: TaskScheduleInput;
-  notificationEnabled?: boolean;
   /**
    * Optional cover image: the pending s3Key returned by createTaskCoverImageUploadUrl
    * (after the client PUT the bytes). Omitted ⇒ no cover image.
@@ -309,9 +367,6 @@ export interface UpdateTaskInput {
    */
   categoryId?: string;
   description?: string;
-  scheduleRule?: string;
-  schedule?: TaskScheduleInput;
-  notificationEnabled?: boolean;
   /**
    * Optional new cover image: the pending s3Key from createTaskCoverImageUploadUrl.
    * Supplied ⇒ replace the cover image (old one is cleaned up after the new one is
@@ -380,35 +435,76 @@ export interface ReorderTaskStepsInput {
   steps: ReorderTaskStepInput[];
 }
 
-export interface CreateAssignmentInput {
+// ── Scheduling inputs ─────────────────────────────────────────────────────────
+/**
+ * Create a TaskAssignment (the schedule rule). Validates the source Task exists but does
+ * NOT create any TaskInstance rows. ONE_TIME requires `scheduledFor` + `timezone`;
+ * RECURRING requires `scheduleRule` + `startDate` + `startTime` + `timezone`.
+ */
+export interface CreateTaskAssignmentInput {
   taskId: string;
   userId: string;
   assignedBy?: string;
-  dueDate?: string;
-  recurrence?: string;
+  scheduleType: TaskAssignmentScheduleType;
+  scheduledFor?: string;
   scheduleRule?: string;
+  startDate?: string;
+  endDate?: string;
+  startTime?: string;
+  timezone: string;
 }
 
-export interface UpdateAssignmentStatusInput {
+/**
+ * Materialize one occurrence: verify (assignmentId, scheduledDate, scheduledTime) is a valid
+ * occurrence of the assignment, create the TaskInstance (status IN_PROGRESS) and snapshot the
+ * current TaskSteps if it doesn't exist yet. Idempotent when the instance already exists.
+ */
+export interface StartTaskInstanceInput {
   userId: string;
   assignmentId: string;
-  /** Accepts the AssignmentStatus enum, but OVERDUE is rejected — it is a derived status. */
-  status: AssignmentStatus;
+  scheduledDate: string;
+  scheduledTime: string;
 }
 
-export interface SetAssignmentStepCompletionInput {
+/** Toggle one TaskInstanceStep's completion on an existing, non-terminal instance. */
+export interface SetTaskInstanceStepCompletionInput {
   userId: string;
-  assignmentId: string;
+  instanceId: string;
   stepId: string;
   completed: boolean;
 }
 
 /**
- * Identifies one Assignment for deletion by its composite key (userId + assignmentId).
- * Deleting an assignment also removes all of its AssignmentStep snapshots; the source
- * Task and its TaskSteps are never touched.
+ * Set a TaskInstance's status. Accepts IN_PROGRESS, COMPLETED, SKIPPED (OVERDUE is derived
+ * and rejected; CANCELLED uses cancelTaskInstance). COMPLETED requires all steps completed.
  */
-export interface DeleteAssignmentInput {
+export interface UpdateTaskInstanceStatusInput {
+  userId: string;
+  instanceId: string;
+  status: TaskInstanceStatus;
+}
+
+/** Cancel one occurrence — creates or updates a real TaskInstance (CANCELLED, isException). */
+export interface CancelTaskInstanceInput {
+  userId: string;
+  assignmentId: string;
+  scheduledDate: string;
+  scheduledTime: string;
+}
+
+/**
+ * End a TaskAssignment from `effectiveDate` onward. For RECURRING with occurrences still
+ * remaining before that date, sets `endDate` to the day before; otherwise fully ends it
+ * (active=false, endedAt set, activeTaskAssignmentTaskId removed).
+ */
+export interface EndTaskAssignmentInput {
+  userId: string;
+  assignmentId: string;
+  effectiveDate: string;
+}
+
+/** Soft-delete a TaskAssignment: active=false, endedAt=now, activeTaskAssignmentTaskId removed. */
+export interface DeleteTaskAssignmentInput {
   userId: string;
   assignmentId: string;
 }
@@ -545,15 +641,15 @@ export interface AdminDeleteUserResult {
 
 /**
  * Full read-only snapshot of everything one user owns, for the SystemAdmin user-detail
- * view: their profile, owned tasks, categories, assignments, and support links (in either
- * direction). Gathered with PK queries + GSIs (no Scan).
+ * view: their profile, owned tasks, categories, task assignments, and support links (in
+ * either direction). Gathered with PK queries + GSIs (no Scan).
  */
 export interface AdminUserData {
   userId: string;
   profile?: UserProfile | null;
   tasks: Task[];
   categories: Category[];
-  assignments: Assignment[];
+  taskAssignments: TaskAssignment[];
   supportLinks: SupportLink[];
 }
 

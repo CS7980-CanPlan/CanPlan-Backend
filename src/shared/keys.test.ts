@@ -1,8 +1,4 @@
 import {
-  ASSIGN_PREFIX,
-  assignSk,
-  assignStepPrefix,
-  assignStepSk,
   categorySk,
   DEFAULT_CATEGORY_COLOR,
   DEFAULT_CATEGORY_NAME,
@@ -10,11 +6,19 @@ import {
   isDefaultCategoryName,
   mediaSk,
   META_SK,
+  parseInstanceId,
   PROFILE_SK,
   reportPk,
   stepSk,
   supporterPk,
+  TASK_INSTANCE_PREFIX,
+  taskAssignmentSk,
   taskCategoryKey,
+  taskInstanceId,
+  taskInstanceSk,
+  taskInstanceSkFromId,
+  taskInstanceStepPrefix,
+  taskInstanceStepSk,
   taskPk,
   userLinkSk,
   userPk,
@@ -53,15 +57,42 @@ describe('sort keys', () => {
     expect(categorySk('c1')).toBe('CATEGORY#c1');
     expect(userLinkSk('u1')).toBe('USER#u1');
     expect(stepSk('s1')).toBe('STEP#s1');
-    expect(assignSk('a1')).toBe('ASSIGN#a1');
-    expect(assignStepSk('a1', 's1')).toBe('ASSIGN_STEP#a1#STEP#s1');
-    expect(assignStepPrefix('a1')).toBe('ASSIGN_STEP#a1#STEP#');
     expect(mediaSk('m1')).toBe('MEDIA#m1');
   });
+});
 
-  it('keeps AssignmentStep rows out of a begins_with(ASSIGN#) assignment query', () => {
-    // The 7th char of ASSIGN_STEP# is `_`, not `#`, so it does not match ASSIGN#.
-    expect(assignStepSk('a1', 's1').startsWith(ASSIGN_PREFIX)).toBe(false);
+describe('scheduling sort keys', () => {
+  it('build the TaskAssignment / TaskInstance / TaskInstanceStep SK formats', () => {
+    expect(taskAssignmentSk('a1')).toBe('TASK_ASSIGNMENT#a1');
+    expect(taskInstanceSk('2026-07-01', '09:00', 'a1')).toBe(
+      'TASK_INSTANCE#2026-07-01#09:00#a1',
+    );
+    expect(taskInstanceId('a1', '2026-07-01', '09:00')).toBe('a1#2026-07-01#09:00');
+    expect(taskInstanceSkFromId('a1#2026-07-01#09:00')).toBe('TASK_INSTANCE#2026-07-01#09:00#a1');
+    expect(taskInstanceStepSk('a1#2026-07-01#09:00', 's1')).toBe(
+      'TASK_INSTANCE_STEP#a1#2026-07-01#09:00#STEP#s1',
+    );
+    expect(taskInstanceStepPrefix('a1#2026-07-01#09:00')).toBe(
+      'TASK_INSTANCE_STEP#a1#2026-07-01#09:00#STEP#',
+    );
+  });
+
+  it('keeps TaskInstanceStep rows out of a begins_with(TASK_INSTANCE#) instance query', () => {
+    // Instance SKs are `TASK_INSTANCE#<date>#…`; step SKs are `TASK_INSTANCE_STEP#…`. The
+    // 14th char differs (`#` vs `_`), so a date-range instance query never returns step rows.
+    expect(taskInstanceStepSk('a1#2026-07-01#09:00', 's1').startsWith(TASK_INSTANCE_PREFIX)).toBe(
+      false,
+    );
+  });
+
+  it('parses a composite instanceId, rejecting malformed ids', () => {
+    expect(parseInstanceId('a1#2026-07-01#09:00')).toEqual({
+      assignmentId: 'a1',
+      scheduledDate: '2026-07-01',
+      scheduledTime: '09:00',
+    });
+    expect(parseInstanceId('a1#2026-07-01')).toBeNull();
+    expect(parseInstanceId('nope')).toBeNull();
   });
 });
 
@@ -79,8 +110,9 @@ describe('ENTITY discriminators', () => {
     expect(ENTITY.CATEGORY).toBe('Category');
     expect(ENTITY.TASK).toBe('Task');
     expect(ENTITY.TASK_STEP).toBe('TaskStep');
-    expect(ENTITY.ASSIGNMENT).toBe('Assignment');
-    expect(ENTITY.ASSIGNMENT_STEP).toBe('AssignmentStep');
+    expect(ENTITY.TASK_ASSIGNMENT).toBe('TaskAssignment');
+    expect(ENTITY.TASK_INSTANCE).toBe('TaskInstance');
+    expect(ENTITY.TASK_INSTANCE_STEP).toBe('TaskInstanceStep');
     expect(ENTITY.MEDIA_ASSET).toBe('MediaAsset');
     expect(ENTITY.TASK_MEDIA_CLEANUP).toBe('TaskMediaCleanup');
     expect(ENTITY.REPORT).toBe('Report');

@@ -10,7 +10,7 @@ export const dynamo = DynamoDBDocumentClient.from(rawClient, {
   marshallOptions: { removeUndefinedValues: true },
 });
 
-// Single-table store for every CanPlan entity (UserProfile, Task, Assignment, …).
+// Single-table store for every CanPlan entity (UserProfile, Task, TaskAssignment, …).
 // Keyed by composite PK/SK — see src/shared/keys.ts for the item-key conventions.
 // The name keeps the historical CanPlanTasks-<env> pattern to avoid a rename.
 export const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME ?? 'CanPlanTasks-dev';

@@ -135,7 +135,7 @@ describe('admin handler — entityTypeIndex listings', () => {
 });
 
 describe('admin handler — adminGetUserData', () => {
-  it('aggregates profile, tasks, categories, assignments, and support links (no Scan)', async () => {
+  it('aggregates profile, tasks, categories, task assignments, and support links (no Scan)', async () => {
     // GetCommand → profile; taskOwnerIndex → tasks; primaryUserSupportLinkIndex → primary-side links.
     mockSend.mockImplementation((command: { constructor: { name: string }; input?: Record<string, unknown> }) => {
       const input = command.input ?? {};
@@ -148,10 +148,10 @@ describe('admin handler — adminGetUserData', () => {
       }
       return Promise.resolve({});
     });
-    // queryAllItems(pk, prefix) drives categories / assignments / supporter-side links.
+    // queryAllItems(pk, prefix) drives categories / task assignments / supporter-side links.
     mockQueryAllItems.mockImplementation((_pk: string, prefix: string) => {
       if (prefix === 'CATEGORY#') return Promise.resolve([{ categoryId: 'c1' }, { categoryId: 'c2' }]);
-      if (prefix === 'ASSIGN#') return Promise.resolve([{ assignmentId: 'a1' }]);
+      if (prefix === 'TASK_ASSIGNMENT#') return Promise.resolve([{ assignmentId: 'a1' }]);
       if (prefix === 'USER#') return Promise.resolve([{ supporterId: 'u1', primaryUserId: 'p1' }]);
       return Promise.resolve([]);
     });
@@ -161,7 +161,7 @@ describe('admin handler — adminGetUserData', () => {
       profile: { userId: string } | null;
       tasks: unknown[];
       categories: unknown[];
-      assignments: unknown[];
+      taskAssignments: unknown[];
       supportLinks: Array<{ supporterId: string; primaryUserId: string }>;
     };
 
@@ -169,7 +169,7 @@ describe('admin handler — adminGetUserData', () => {
     expect(result.profile?.userId).toBe('u1');
     expect(result.tasks).toHaveLength(1);
     expect(result.categories).toHaveLength(2);
-    expect(result.assignments).toHaveLength(1);
+    expect(result.taskAssignments).toHaveLength(1);
     // One link as supporter (u1→p1) + one as primary (s9→u1), deduped by pair.
     expect(result.supportLinks).toHaveLength(2);
     // Never a Scan.
@@ -328,6 +328,34 @@ describe('admin handler — adminDeleteUser', () => {
       cognitoNames().indexOf('AdminDeleteUserCommand'),
     );
     expect(cognitoNames().at(-1)).toBe('AdminDeleteUserCommand');
+  });
+
+  it('deletes active TaskAssignments that reference the owner\'s tasks (even in another user\'s partition)', async () => {
+    mockFindUsername.mockResolvedValue('target@e.com');
+    // t1 is assigned to ANOTHER user; that active assignment would dangle once t1's template
+    // is cascaded, so adminDeleteUser must remove it explicitly.
+    mockSend.mockImplementation((command: { input?: Record<string, unknown> }) => {
+      const input = command.input ?? {};
+      if (input.IndexName === 'taskOwnerIndex') {
+        return Promise.resolve({ Items: [{ taskId: 't1' }, { taskId: 't2' }] });
+      }
+      if (input.IndexName === 'activeTaskAssignmentTaskIndex') {
+        const values = input.ExpressionAttributeValues as Record<string, string>;
+        return Promise.resolve(
+          values[':taskId'] === 't1'
+            ? { Items: [{ PK: 'USER#other', SK: 'TASK_ASSIGNMENT#a9' }] }
+            : { Items: [] },
+        );
+      }
+      return Promise.resolve({});
+    });
+    mockQueryAllKeys.mockResolvedValue([]);
+
+    await handler(event('adminDeleteUser', { input: { userId: 'target' } }));
+
+    // The orphaned active assignment key was batch-deleted (before/with the task cascades).
+    const batchedKeys = mockBatchDelete.mock.calls.flatMap((c) => c[0] as Array<{ SK: string }>);
+    expect(batchedKeys).toContainEqual({ PK: 'USER#other', SK: 'TASK_ASSIGNMENT#a9' });
   });
 
   it('does NOT delete the Cognito user when DynamoDB cleanup fails', async () => {

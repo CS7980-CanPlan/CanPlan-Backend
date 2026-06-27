@@ -2,7 +2,7 @@ import { type ReactNode } from 'react';
 import { ArrowLeft, FolderTree, ClipboardList, ListChecks, RefreshCw, Users as UsersIcon } from 'lucide-react';
 import { Link, useParams } from 'react-router-dom';
 import { useUserData } from '../../../api/adminHooks';
-import type { Assignment, Category, SupportLink, Task, UserProfile } from '../../../api/apiTypes';
+import type { Category, SupportLink, Task, TaskAssignment, UserProfile } from '../../../api/apiTypes';
 import { Alert } from '../../../components/ui/Alert';
 import { Button } from '../../../components/ui/Button';
 import { EmptyState } from '../../../components/ui/EmptyState';
@@ -14,7 +14,7 @@ import styles from '../admin.module.css';
 
 /**
  * Read-only detail view of a single user: their profile plus everything they own
- * (tasks, categories, assignments, support links), via the SystemAdmin adminGetUserData
+ * (tasks, categories, task assignments, support links), via the SystemAdmin adminGetUserData
  * query. Reached from the Users table "View" action at /admin/users/:userId.
  */
 export default function UserDetailPage() {
@@ -74,11 +74,11 @@ function UserDetailBody({
     profile: UserProfile | null;
     tasks: Task[];
     categories: Category[];
-    assignments: Assignment[];
+    taskAssignments: TaskAssignment[];
     supportLinks: SupportLink[];
   };
 }) {
-  const { profile, tasks, categories, assignments, supportLinks } = data;
+  const { profile, tasks, categories, taskAssignments, supportLinks } = data;
 
   return (
     <>
@@ -86,7 +86,7 @@ function UserDetailBody({
         metrics={[
           { label: 'Tasks', value: tasks.length, icon: <ListChecks size={18} /> },
           { label: 'Categories', value: categories.length, icon: <FolderTree size={18} /> },
-          { label: 'Assignments', value: assignments.length, icon: <ClipboardList size={18} /> },
+          { label: 'Assignments', value: taskAssignments.length, icon: <ClipboardList size={18} /> },
           { label: 'Support links', value: supportLinks.length, icon: <UsersIcon size={18} /> },
         ]}
       />
@@ -150,17 +150,17 @@ function UserDetailBody({
         )}
       </Section>
 
-      <Section icon={<ClipboardList size={17} />} title="Assignments" count={assignments.length}>
-        {assignments.length === 0 ? (
+      <Section icon={<ClipboardList size={17} />} title="Assignments" count={taskAssignments.length}>
+        {taskAssignments.length === 0 ? (
           <EmptyTile label="No assignments." />
         ) : (
-          <Table head={['Assignment id', 'Task id', 'Status', 'Due', 'Assigned']}>
-            {assignments.map((a) => (
+          <Table head={['Assignment id', 'Task id', 'Schedule', 'Active', 'Assigned']}>
+            {taskAssignments.map((a) => (
               <tr key={a.assignmentId}>
                 <td><IdCell id={a.assignmentId} /></td>
                 <td><IdCell id={a.taskId} /></td>
-                <td><StatusBadge status={a.status} /></td>
-                <td className={styles.cellMuted}>{formatDate(a.dueDate)}</td>
+                <td><StatusBadge status={a.scheduleType} /></td>
+                <td>{a.active ? 'Yes' : <Dash />}</td>
                 <td className={styles.cellMuted}>{formatDate(a.assignedAt)}</td>
               </tr>
             ))}

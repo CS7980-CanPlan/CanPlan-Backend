@@ -120,14 +120,19 @@ export class Api extends Construct {
       { typeName: 'Query', fieldName: 'listTasksByCategory' },
     ]);
 
-    // Assignments + per-assignment step snapshots.
+    // Scheduling — TaskAssignment (schedule rules), TaskInstance (occurrences), and
+    // TaskInstanceStep (per-occurrence step snapshots) plus the calendar feed.
     wire('AssignmentsDataSource', props.assignmentsFn, [
-      { typeName: 'Mutation', fieldName: 'createAssignment' },
-      { typeName: 'Mutation', fieldName: 'updateAssignmentStatus' },
-      { typeName: 'Mutation', fieldName: 'setAssignmentStepCompletion' },
-      { typeName: 'Mutation', fieldName: 'deleteAssignment' },
-      { typeName: 'Query', fieldName: 'listAssignmentsForUser' },
-      { typeName: 'Query', fieldName: 'listAssignmentSteps' },
+      { typeName: 'Mutation', fieldName: 'createTaskAssignment' },
+      { typeName: 'Mutation', fieldName: 'startTaskInstance' },
+      { typeName: 'Mutation', fieldName: 'setTaskInstanceStepCompletion' },
+      { typeName: 'Mutation', fieldName: 'updateTaskInstanceStatus' },
+      { typeName: 'Mutation', fieldName: 'cancelTaskInstance' },
+      { typeName: 'Mutation', fieldName: 'endTaskAssignment' },
+      { typeName: 'Mutation', fieldName: 'deleteTaskAssignment' },
+      { typeName: 'Query', fieldName: 'listTaskAssignmentsForUser' },
+      { typeName: 'Query', fieldName: 'getTaskInstanceViews' },
+      { typeName: 'Query', fieldName: 'listTaskInstanceSteps' },
     ]);
 
     // Media assets — presigned upload + download URLs, metadata registration, listing.

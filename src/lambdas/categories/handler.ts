@@ -117,7 +117,7 @@ async function listMyCategories(
 ): Promise<Connection<Category>> {
   const ownerId = requireCaller(identity);
   // SK begins_with CATEGORY# scopes the USER#<ownerId> partition to category rows
-  // (excludes #PROFILE, ASSIGN#, ASSIGN_STEP#, …).
+  // (excludes #PROFILE, TASK_ASSIGNMENT#, TASK_INSTANCE#, …).
   const result = await queryPage<Record<string, unknown>>(
     {
       TableName: TABLE_NAME,

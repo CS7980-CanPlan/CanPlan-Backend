@@ -23,18 +23,23 @@ export function RoleBadge({ role }: { role: UserRole | null | undefined }) {
 }
 
 const STATUS_TONE: Record<string, BadgeTone> = {
-  // Assignment statuses
+  // TaskAssignment schedule types
+  ONE_TIME: 'neutral',
+  RECURRING: 'info',
+  // TaskInstance statuses
   TO_DO: 'neutral',
+  IN_PROGRESS: 'info',
   OVERDUE: 'danger',
   COMPLETED: 'success',
   SKIPPED: 'warning',
+  CANCELLED: 'danger',
   // SupportLink statuses
   PENDING: 'warning',
   ACTIVE: 'success',
   REVOKED: 'danger',
 };
 
-/** Render an assignment/support-link status string as a toned badge. */
+/** Render a schedule-type / instance / support-link status string as a toned badge. */
 export function StatusBadge({ status }: { status: string | null | undefined }) {
   if (!status) return <span className={styles.cellMuted}>—</span>;
   return <Badge tone={STATUS_TONE[status] ?? 'neutral'}>{status.replace(/_/g, ' ')}</Badge>;

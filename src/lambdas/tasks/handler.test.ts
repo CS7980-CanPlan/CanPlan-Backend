@@ -911,6 +911,7 @@ describe('tasks handler — deleteTask', () => {
   it('deletes #META + decrements its category, plus all steps, media, and S3 objects', async () => {
     mockSend
       .mockResolvedValueOnce({ Item: { ...m } }) // loadOwnedTask GET #META
+      .mockResolvedValueOnce({ Count: 0 }) // active-assignment GSI guard (none)
       .mockResolvedValueOnce({ Items: [{ PK: 'TASK#t1', SK: 'STEP#s1' }, { PK: 'TASK#t1', SK: 'STEP#s2' }] }) // STEP# keys
       .mockResolvedValueOnce({
         Items: [
@@ -957,9 +958,22 @@ describe('tasks handler — deleteTask', () => {
     );
   });
 
+  it('rejects deletion while an active TaskAssignment references the task', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { ...m } }) // loadOwnedTask GET #META
+      .mockResolvedValueOnce({ Count: 2 }); // active-assignment GSI guard finds 2
+    await expect(handler(event('deleteTask', { taskId: 't1' }))).rejects.toThrow(
+      'active task assignment',
+    );
+    // Never reached the cascade (no batch writes, no #META delete).
+    expect(batchInputs()).toHaveLength(0);
+    expect(finalTx()).toBeUndefined();
+  });
+
   it('keeps the task + journal retryable when an S3 delete fails (no #META delete)', async () => {
     mockSend
       .mockResolvedValueOnce({ Item: { ...m } })
+      .mockResolvedValueOnce({ Count: 0 }) // active-assignment GSI guard (none)
       .mockResolvedValueOnce({ Items: [] }) // STEP#
       .mockResolvedValueOnce({ Items: [{ PK: 'TASK#t1', SK: 'MEDIA#m1', assetId: 'm1', s3Key: 'media/t1/m1.png' }] }) // MEDIA#
       .mockResolvedValueOnce({}) // journal
