@@ -155,8 +155,8 @@ region:
 
 | Region | Lambda functions you should expect |
 | ------ | ---------------------------------- |
-| Backend region | `canplan-createTask-<env>`, `canplan-users-<env>`, `canplan-categories-<env>`, `canplan-tasks-<env>`, `canplan-assignments-<env>`, `canplan-media-<env>`, `canplan-admin-<env>`, `canplan-generateTaskSteps-<env>`, `canplan-createAiTask-<env>`, CDK cross-region reader, sandbox S3 auto-delete helper |
-| Knowledge Base region | bucket deployment helper, CDK cross-region writer, sandbox S3 auto-delete helper |
+| Backend region | `canplan-createTask-<env>`, `canplan-users-<env>`, `canplan-categories-<env>`, `canplan-tasks-<env>`, `canplan-assignments-<env>`, `canplan-media-<env>`, `canplan-admin-<env>`, `canplan-generateTaskSteps-<env>`, `canplan-createAiTask-<env>`, CDK cross-region reader, destroyable-env S3 auto-delete helper |
+| Knowledge Base region | bucket deployment helper, CDK cross-region writer, destroyable-env S3 auto-delete helper |
 
 ## Prerequisites
 
@@ -179,6 +179,7 @@ Check `.env`:
 ```env
 CANPLAN_BACKEND_REGION=ca-central-1
 CANPLAN_KNOWLEDGE_BASE_REGION=us-east-1
+CDK_OWNER=michael
 AWS_REGION=ca-central-1
 ```
 
@@ -188,6 +189,40 @@ Load `.env` before CDK/AWS CLI commands that use those variables:
 set -a
 . ./.env
 set +a
+```
+
+## Deploy Personal Environment
+
+Personal environments are for individual testing before promoting changes to
+`dev`. They use the owner's name as the CDK environment name, so
+`CDK_OWNER=michael` deploys stacks named `canplan-backend-michael` and
+`canplan-knowledge-base-michael` with resources such as `CanPlanTasks-michael`.
+
+The personal scripts load `.env`, read `CDK_OWNER`, and pass
+`--context env=<owner> --context personal=true --context owner=<owner>` to CDK.
+Personal environments are fully destroyable: DynamoDB, S3, Cognito, and Knowledge
+Base state all use destroy/removal policies.
+
+If the account has not been bootstrapped yet, run the bootstrap command in
+[Deploy Sandbox](#deploy-sandbox) before the first personal deploy.
+
+```bash
+export AWS_PROFILE=canplan-sandbox
+
+npx ts-node scripts/build-corpus.ts
+npm run cdk:deploy:me
+```
+
+Destroy your personal environment when you no longer need it:
+
+```bash
+npm run cdk:destroy:me
+```
+
+To skip the CDK confirmation prompt:
+
+```bash
+npm run cdk:destroy:me -- --force
 ```
 
 ## Deploy Sandbox
@@ -274,6 +309,8 @@ aws bedrock-agent start-ingestion-job \
 | `npm run lint` | ESLint |
 | `npm run format` | Prettier write |
 | `npm run cdk:synth` | CDK synth; requires `data/corpus/dist` and Docker |
+| `npm run cdk:deploy:me` | Deploy both personal stacks using `CDK_OWNER` from `.env` |
+| `npm run cdk:destroy:me` | Destroy both personal stacks using `CDK_OWNER` from `.env` |
 | `npm run cdk:deploy:sandbox` | Deploy both sandbox stacks |
 | `npm run cdk:destroy:sandbox` | Destroy both sandbox stacks |
 | `npm run cdk:deploy:dev` | Deploy both dev stacks |
@@ -315,10 +352,13 @@ DYNAMODB_TABLE_NAME=CanPlanTasks-dev npx ts-node scripts/migrate-default-categor
 
 ## Environment Behavior
 
-The CDK app reads `--context env=...`; only `env=sandbox` is treated as sandbox.
+The CDK app reads `--context env=...`. `dev` and `prod` retain stateful
+resources. `sandbox` and personal deployments are destroyable. The personal
+scripts also pass `--context personal=true --context owner=<CDK_OWNER>`; unknown
+environment names without that personal flag are rejected.
 
-| Resource | Sandbox destroy | Dev/prod destroy |
-| -------- | --------------- | ---------------- |
+| Resource | Sandbox/personal destroy | Dev/prod destroy |
+| -------- | ------------------------ | ---------------- |
 | DynamoDB table (single-table) | Deleted | Retained |
 | Media S3 bucket | Emptied and deleted | Retained |
 | Cognito User Pool | Deleted | Retained |

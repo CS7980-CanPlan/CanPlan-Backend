@@ -3,10 +3,10 @@ import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import { Construct } from 'constructs';
 
 export interface DatabaseProps {
-  /** Environment name (e.g. 'sandbox', 'dev', 'prod') — namespaces the table. */
+  /** Environment name (e.g. 'sandbox', 'dev', 'prod', or a personal owner). */
   readonly envName: string;
-  /** Sandbox tears down cleanly (DESTROY); dev/prod RETAIN to protect data. */
-  readonly isSandbox: boolean;
+  /** Destroyable environments use DESTROY; dev/prod use RETAIN to protect data. */
+  readonly isDestroyable: boolean;
 }
 
 /**
@@ -22,15 +22,15 @@ export class Database extends Construct {
   constructor(scope: Construct, id: string, props: DatabaseProps) {
     super(scope, id);
 
-    const { envName, isSandbox } = props;
+    const { envName, isDestroyable } = props;
 
     this.table = new dynamodb.Table(this, 'CanPlanTable', {
       tableName: `CanPlanTasks-${envName}`,
       partitionKey: { name: 'PK', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'SK', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      // Sandbox: destroy with the stack. dev / prod: retain to prevent data loss.
-      removalPolicy: isSandbox ? cdk.RemovalPolicy.DESTROY : cdk.RemovalPolicy.RETAIN,
+      // Destroyable environments delete with the stack. dev / prod retain data.
+      removalPolicy: isDestroyable ? cdk.RemovalPolicy.DESTROY : cdk.RemovalPolicy.RETAIN,
     });
 
     // supporterIndex — all primary users managed by a given support person.

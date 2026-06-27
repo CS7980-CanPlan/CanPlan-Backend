@@ -6,20 +6,63 @@ import { KnowledgeBaseStack } from '../lib/knowledge-base-stack';
 
 const app = new cdk.App();
 
-// env context is passed via --context env=dev when running cdk deploy
-const envName = app.node.tryGetContext('env') ?? 'dev';
+const KNOWN_ENV_NAMES = new Set(['dev', 'prod', 'sandbox']);
+const PERSONAL_OWNER_PATTERN = /^[a-z](?:[a-z0-9-]{0,18}[a-z0-9])?$/;
 
-// Only the sandbox env tears down cleanly (DESTROY removal policies) so nothing
-// is left billing or blocking the next deploy. dev and prod RETAIN their data.
-const isSandbox = envName === 'sandbox';
+function contextString(name: string): string | undefined {
+  const value = app.node.tryGetContext(name);
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function contextFlag(name: string): boolean {
+  const value = app.node.tryGetContext(name);
+  return value === true || value === 'true' || value === '1';
+}
+
+function normalizeName(value: string, contextName: string): string {
+  const normalized = value.toLowerCase();
+  if (!PERSONAL_OWNER_PATTERN.test(normalized)) {
+    throw new Error(
+      `${contextName} must be 1-20 lowercase letters, numbers, or hyphens, start with a letter, and end with a letter or number.`,
+    );
+  }
+  return normalized;
+}
+
+// env context is passed via --context env=dev when running cdk deploy.
+const envName = normalizeName(contextString('env') ?? 'dev', 'env');
+const isPersonal = contextFlag('personal');
+const ownerContext = contextString('owner');
+const ownerName = ownerContext ? normalizeName(ownerContext, 'owner') : undefined;
+
+if (!KNOWN_ENV_NAMES.has(envName) && !isPersonal) {
+  throw new Error(
+    `Unknown environment "${envName}". For a personal environment, use npm run cdk:deploy:me or pass --context personal=true --context owner=${envName}.`,
+  );
+}
+
+if (isPersonal) {
+  if (!ownerName) {
+    throw new Error('Personal deployments require --context owner=<name>.');
+  }
+  if (KNOWN_ENV_NAMES.has(ownerName)) {
+    throw new Error(`Personal owner "${ownerName}" conflicts with a shared environment name.`);
+  }
+  if (ownerName !== envName) {
+    throw new Error(`Personal deployments require env (${envName}) to match owner (${ownerName}).`);
+  }
+} else if (ownerName) {
+  throw new Error('--context owner=... is only valid with --context personal=true.');
+}
+
+// Sandbox and personal environments tear down cleanly. dev and prod retain data.
+const isDestroyable = envName === 'sandbox' || isPersonal;
 
 // Same account for both stacks; the KB region is resolved once and shared with
 // the backend Lambda config so the Retrieve target cannot drift.
 const account = process.env.CDK_DEFAULT_ACCOUNT;
 const backendRegion =
-  app.node.tryGetContext('backendRegion') ??
-  process.env.CANPLAN_BACKEND_REGION ??
-  'ca-central-1';
+  app.node.tryGetContext('backendRegion') ?? process.env.CANPLAN_BACKEND_REGION ?? 'ca-central-1';
 const knowledgeBaseRegion =
   app.node.tryGetContext('knowledgeBaseRegion') ??
   app.node.tryGetContext('bedrockRegion') ??
@@ -29,6 +72,8 @@ const knowledgeBaseRegion =
 const tags = {
   Project: 'CanPlan',
   Environment: envName,
+  EnvironmentType: isPersonal ? 'personal' : envName === 'sandbox' ? 'sandbox' : 'shared',
+  ...(ownerName ? { Owner: ownerName } : {}),
 };
 
 // Knowledge Base must live in the Bedrock region (embedding-model availability +
@@ -36,7 +81,7 @@ const tags = {
 const knowledgeBaseStack = new KnowledgeBaseStack(app, `CanPlanKnowledgeBase-${envName}`, {
   stackName: `canplan-knowledge-base-${envName}`,
   envName,
-  isSandbox,
+  isDestroyable,
   env: { account, region: knowledgeBaseRegion },
   crossRegionReferences: true,
   tags,
@@ -47,7 +92,7 @@ const knowledgeBaseStack = new KnowledgeBaseStack(app, `CanPlanKnowledgeBase-${e
 new CanPlanBackendStack(app, `CanPlanBackend-${envName}`, {
   stackName: `canplan-backend-${envName}`,
   envName,
-  isSandbox,
+  isDestroyable,
   knowledgeBaseId: knowledgeBaseStack.knowledgeBaseId,
   bedrockRegion: knowledgeBaseRegion,
   env: { account, region: backendRegion },

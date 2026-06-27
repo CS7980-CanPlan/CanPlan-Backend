@@ -4,7 +4,7 @@ import { Database } from './database.construct';
 
 function synth() {
   const stack = new Stack(new App(), 'TestStack');
-  new Database(stack, 'Database', { envName: 'test', isSandbox: true });
+  new Database(stack, 'Database', { envName: 'test', isDestroyable: true });
   return Template.fromStack(stack);
 }
 

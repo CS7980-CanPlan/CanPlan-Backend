@@ -9,7 +9,7 @@ import * as path from 'path';
 
 export interface KnowledgeBaseProps {
   readonly envName: string;
-  readonly isSandbox: boolean;
+  readonly isDestroyable: boolean;
   /** Region the KB + embedding model live in (us-east-1). */
   readonly bedrockRegion: string;
 }
@@ -28,8 +28,8 @@ export class KnowledgeBase extends Construct {
   constructor(scope: Construct, id: string, props: KnowledgeBaseProps) {
     super(scope, id);
 
-    const { envName, isSandbox, bedrockRegion } = props;
-    const removalPolicy = isSandbox ? cdk.RemovalPolicy.DESTROY : cdk.RemovalPolicy.RETAIN;
+    const { envName, isDestroyable, bedrockRegion } = props;
+    const removalPolicy = isDestroyable ? cdk.RemovalPolicy.DESTROY : cdk.RemovalPolicy.RETAIN;
     const account = cdk.Stack.of(this).account;
     const embeddingModelArn = `arn:aws:bedrock:${bedrockRegion}::foundation-model/amazon.titan-embed-text-v2:0`;
     const vectorBucketName = `canplan-kb-vectors-${envName}-${account}`;
@@ -38,7 +38,7 @@ export class KnowledgeBase extends Construct {
     const corpusBucket = new s3.Bucket(this, 'CorpusBucket', {
       bucketName: `canplan-kb-corpus-${envName}-${account}`,
       removalPolicy,
-      autoDeleteObjects: isSandbox,
+      autoDeleteObjects: isDestroyable,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
     });

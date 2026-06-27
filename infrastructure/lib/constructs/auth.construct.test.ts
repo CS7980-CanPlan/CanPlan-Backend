@@ -3,8 +3,10 @@ import { Match, Template } from 'aws-cdk-lib/assertions';
 import { Auth } from './auth.construct';
 
 function synth() {
-  const stack = new Stack(new App(), 'TestStack', { env: { account: '111111111111', region: 'ca-central-1' } });
-  new Auth(stack, 'Auth', { envName: 'test', isSandbox: true });
+  const stack = new Stack(new App(), 'TestStack', {
+    env: { account: '111111111111', region: 'ca-central-1' },
+  });
+  new Auth(stack, 'Auth', { envName: 'test', isDestroyable: true });
   return Template.fromStack(stack);
 }
 
@@ -26,7 +28,10 @@ describe('Auth construct — Post Confirmation group assignment', () => {
     const template = synth();
     const policies = template.findResources('AWS::IAM::Policy');
     const stmt = Object.values(policies)
-      .flatMap((p) => p.Properties.PolicyDocument.Statement as Array<{ Action: string; Resource: unknown }>)
+      .flatMap(
+        (p) =>
+          p.Properties.PolicyDocument.Statement as Array<{ Action: string; Resource: unknown }>,
+      )
       .find((s) => s.Action === 'cognito-idp:AdminAddUserToGroup');
 
     expect(stmt).toBeDefined();
