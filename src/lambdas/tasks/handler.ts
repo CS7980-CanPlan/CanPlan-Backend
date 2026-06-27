@@ -189,10 +189,7 @@ async function listTasksByOwner(
   assertCallerOwns(identity, ownerId.trim());
 
   const all = await queryAllOwnedTasks(ownerId.trim());
-  all.sort(
-    (a, b) =>
-      orderValue(a) - orderValue(b) || (a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0),
-  );
+  all.sort((a, b) => orderValue(a) - orderValue(b) || a.taskId.localeCompare(b.taskId));
 
   const offset = decodeOffset(page.nextToken);
   if (offset < 0 || offset > all.length) throw new ValidationError('invalid nextToken');
@@ -1150,8 +1147,9 @@ async function updateTaskOrder(
       `updateTaskOrder must include all of the owner's ${current.length} task(s); received ${orderByTaskId.size}`,
     );
   }
+  const currentIds = new Set(current.map((task) => task.taskId));
   for (const id of orderByTaskId.keys()) {
-    if (!current.some((task) => task.taskId === id)) {
+    if (!currentIds.has(id)) {
       throw new NotFoundError(`task ${id} not found for owner ${ownerId}`);
     }
   }
