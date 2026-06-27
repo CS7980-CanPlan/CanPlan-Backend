@@ -31,6 +31,15 @@ export interface UserProfile {
    * explicit category fall into it.
    */
   defaultCategoryId?: string;
+  /**
+   * Internal, transactionally-maintained per-owner task counters (not exposed in GraphQL):
+   *  - `taskCount`     — number of tasks the owner currently has (≤ 50 cap, enforced on create).
+   *  - `nextTaskOrder` — the monotonic `order` value the next created task takes; advanced on
+   *                      every create and never reclaimed on delete (so order gaps are allowed).
+   * Initialized when the profile is created; backfilled for legacy profiles by the migration.
+   */
+  taskCount?: number;
+  nextTaskOrder?: number;
   createdAt: string;
   updatedAt?: string;
 }
@@ -101,6 +110,12 @@ export interface Task {
    * createTask; not part of the GraphQL Task type — clients query by ownerId/categoryId.
    */
   taskCategoryKey?: string;
+  /**
+   * Per-owner global display order (gaps allowed; never renumbered on delete). Assigned on
+   * create from the owner profile's `nextTaskOrder`; changed in bulk by updateTaskOrder.
+   * Absent only on un-migrated legacy rows.
+   */
+  order?: number;
   /**
    * Internal step bookkeeping for concurrency-safe step management (not exposed in GraphQL):
    *  - `stepCount`     — number of TaskSteps under this task (≤ 99).
@@ -378,6 +393,22 @@ export interface ReorderTaskStepInput {
 export interface ReorderTaskStepsInput {
   taskId: string;
   steps: ReorderTaskStepInput[];
+}
+
+/** One task's target position in a whole-owner reorder. */
+export interface TaskOrderInput {
+  taskId: string;
+  order: number;
+}
+
+/**
+ * Atomically reorder ALL of the caller's tasks. `tasks` must be the complete current set:
+ * every owned taskId exactly once, with positive, mutually-unique orders (gaps allowed).
+ * Applied in a single DynamoDB transaction (all-or-nothing); only the `order` attribute
+ * changes. The owner is derived from the Cognito identity, never the input.
+ */
+export interface UpdateTaskOrderInput {
+  tasks: TaskOrderInput[];
 }
 
 export interface CreateAssignmentInput {
