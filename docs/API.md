@@ -839,6 +839,41 @@ Knowledge Base + RAG. Unchanged from before.
 
 ---
 
+### `createAiTask` — mutation
+
+Generates a clean **title + ordered steps** for one free-text request over the same
+Bedrock Knowledge Base + RAG, and returns them directly as a **preview**. It **persists
+nothing** — no `Task`, `TaskStep`, category count, or `MediaAsset` is written, and no
+`categoryId` is resolved. The caller decides whether to keep the result and saves it
+later via [`createTask`](#createtask--mutation). Citations are intentionally dropped
+(end users have cognitive disabilities). Owner is derived from the Cognito identity.
+
+**Input — `CreateAiTaskInput`**: `query: String!` (the free-text request; empty/whitespace
+is rejected with `VALIDATION`). `categoryId` is accepted by the input type but **ignored**
+— nothing is saved, so no category is resolved.
+
+**Returns — `GeneratedAiTask!`**: `title: String!`, `steps: [GeneratedAiTaskStep!]!`
+(each `{ text }` — **text only**, no step ids and no citations), plus `inputTokens`,
+`outputTokens`. No database-created fields (`taskId`, `ownerId`, `categoryId`,
+`createdAt`, `updatedAt`) are returned.
+
+> A generation failure (e.g. no relevant KB guidance) throws before anything is
+> returned and nothing is ever written. Because it persists nothing, the result is a
+> throwaway preview: re-running the same `query` may yield different wording.
+
+```graphql
+mutation CreateAiTask($input: CreateAiTaskInput!) {
+  createAiTask(input: $input) {
+    title
+    steps { text }
+    inputTokens
+    outputTokens
+  }
+}
+```
+
+---
+
 ## Error handling
 
 GraphQL does **not** use HTTP status codes for field-level problems. A request that

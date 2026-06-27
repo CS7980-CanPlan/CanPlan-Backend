@@ -526,6 +526,20 @@ export interface TaskStepsResponse {
   outputTokens?: number;
 }
 
+// createAiTask PREVIEW response: an AI-generated title + ordered, text-only steps.
+// Nothing is persisted — no taskId/ownerId/categoryId/timestamps and no step ids or
+// citations; the caller saves it later via createTask if they keep it.
+export interface GeneratedAiTaskStep {
+  text: string;
+}
+
+export interface GeneratedAiTask {
+  title: string;
+  steps: GeneratedAiTaskStep[];
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
 // A passage returned by KB.Retrieve, normalized for prompt-building + citation resolution
 export interface RetrievedPassage {
   chunkId: string;

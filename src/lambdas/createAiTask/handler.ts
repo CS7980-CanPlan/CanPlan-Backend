@@ -1,16 +1,17 @@
 import { generateTitledSteps } from '../../shared/stepsService';
-import { persistTask } from '../../shared/task';
 import { UnauthorizedError, ValidationError } from '../../shared/response';
-import type { AppSyncEvent, CreateAiTaskInput, Task } from '../../shared/types';
+import type { AppSyncEvent, CreateAiTaskInput, GeneratedAiTask } from '../../shared/types';
 
 /**
- * createAiTask — one-shot AI task creation. The caller gives a single free-text request;
- * the AI (over the Bedrock KB) generates a clean title + ordered steps, and the task is
- * created and saved under the authenticated caller. Citations are dropped (end users have
- * cognitive disabilities). Any generation failure throws before any write, so a failed
- * generation never creates a task.
+ * createAiTask — one-shot AI task PREVIEW. The caller gives a single free-text request;
+ * the AI (over the Bedrock KB) generates a clean title + ordered steps, which are returned
+ * directly to the frontend. Nothing is persisted: no task, steps, category, or media are
+ * written, so no categoryId is resolved. Citations are dropped (end users have cognitive
+ * disabilities). The caller saves the preview later via createTask if they keep it.
  */
-export const handler = async (event: AppSyncEvent<{ input: CreateAiTaskInput }>): Promise<Task> => {
+export const handler = async (
+  event: AppSyncEvent<{ input: CreateAiTaskInput }>,
+): Promise<GeneratedAiTask> => {
   const ownerId = event.identity?.sub?.trim();
   if (!ownerId) throw new UnauthorizedError('Unauthorized: an authenticated user is required');
 
@@ -18,27 +19,27 @@ export const handler = async (event: AppSyncEvent<{ input: CreateAiTaskInput }>)
   const query = input?.query?.trim();
   if (!query) throw new ValidationError('query is required and cannot be empty');
 
-  // Generate first; a failure here throws before persistTask is called → no task is written.
+  // A generation failure throws here; nothing is ever written.
   const { title, steps, usage } = await generateTitledSteps(query);
 
-  // Drop citations: persist text-only nested steps under the AI-generated title.
-  const task = await persistTask(ownerId, {
+  // Drop citations: return text-only steps under the AI-generated title.
+  const preview: GeneratedAiTask = {
     title,
-    categoryId: input.categoryId,
     steps: steps.map((s) => ({ text: s.text })),
-  });
+    inputTokens: usage?.inputTokens,
+    outputTokens: usage?.outputTokens,
+  };
 
   console.log(
     JSON.stringify({
       event: 'createAiTask',
       ownerId,
       query,
-      taskId: task.taskId,
-      stepCount: steps.length,
+      stepCount: preview.steps.length,
       inputTokens: usage?.inputTokens,
       outputTokens: usage?.outputTokens,
     }),
   );
 
-  return task;
+  return preview;
 };

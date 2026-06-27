@@ -156,14 +156,13 @@ export class Functions extends Construct {
       }),
     );
 
-    // ── createAiTask (Bedrock KB + RAG, then persist) ────────────────────────────
+    // ── createAiTask (Bedrock KB + RAG; returns a preview, persists nothing) ─────
     this.createAiTaskFn = new NodejsFunction(this, 'CreateAiTaskFunction', {
       functionName: `canplan-createAiTask-${envName}`,
       entry: path.join(__dirname, '../../../src/lambdas/createAiTask/handler.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_20_X,
       environment: {
-        DYNAMODB_TABLE_NAME: table.tableName,
         BEDROCK_REGION: bedrockRegion,
         BEDROCK_MODEL_ID: bedrockModelId,
         BEDROCK_MAX_TOKENS: '1024',
@@ -176,8 +175,7 @@ export class Functions extends Construct {
       memorySize: 256,
     });
 
-    // DynamoDB read/write — same grant pattern as createTaskFn.
-    table.grantReadWriteData(this.createAiTaskFn);
+    // No DynamoDB grant — createAiTask only generates a preview and never persists.
 
     // Converse (Sonnet) — same cross-region inference-profile grant as generateTaskSteps.
     this.createAiTaskFn.addToRolePolicy(

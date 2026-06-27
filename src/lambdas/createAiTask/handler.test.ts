@@ -1,12 +1,12 @@
 import { handler } from './handler';
 import { generateTitledSteps } from '../../shared/stepsService';
-import { persistTask } from '../../shared/task';
+import * as taskModule from '../../shared/task';
 
 jest.mock('../../shared/stepsService', () => ({ generateTitledSteps: jest.fn() }));
 jest.mock('../../shared/task', () => ({ persistTask: jest.fn() }));
 
 const mockGenerate = generateTitledSteps as jest.Mock;
-const mockPersist = persistTask as jest.Mock;
+const mockPersist = taskModule.persistTask as jest.Mock;
 
 function makeEvent(input: Record<string, unknown>, sub: string | null = 'owner-1') {
   return { arguments: { input }, identity: sub ? { sub } : undefined } as unknown as Parameters<typeof handler>[0];
@@ -21,38 +21,28 @@ beforeEach(() => {
     ],
     usage: { inputTokens: 5, outputTokens: 9 },
   });
-  mockPersist.mockImplementation(async (ownerId, input) => ({
-    taskId: 'task-1',
-    ownerId,
-    title: input.title,
-    categoryId: input.categoryId ?? 'default-cat',
-    createdAt: '2026-06-25T00:00:00.000Z',
-    steps: input.steps.map((s: { text: string }, i: number) => ({
-      stepId: `s${i}`, taskId: 'task-1', order: i + 1, text: s.text, mediaAssets: [],
-      createdAt: '2026-06-25T00:00:00.000Z',
-    })),
-  }));
 });
 
 afterEach(() => jest.clearAllMocks());
 
 describe('createAiTask handler', () => {
-  it('generates a titled task and persists it under the caller, dropping citations', async () => {
+  it('returns the generated title and text-only steps without persisting anything', async () => {
     const result = await handler(makeEvent({ query: 'wash my hands' }));
     expect(mockGenerate).toHaveBeenCalledWith('wash my hands');
-    // persistTask called with owner from identity, AI title, and text-only steps (no citations)
-    expect(mockPersist).toHaveBeenCalledWith('owner-1', {
+    // Returns the AI title and text-only steps (citations dropped, no step/task ids).
+    expect(result).toEqual({
       title: 'Wash your hands',
-      categoryId: undefined,
       steps: [{ text: 'Wet your hands.' }, { text: 'Use soap.' }],
+      inputTokens: 5,
+      outputTokens: 9,
     });
-    expect(result.title).toBe('Wash your hands');
-    expect(result.steps).toHaveLength(2);
+    // Nothing is written to the database.
+    expect(mockPersist).not.toHaveBeenCalled();
   });
 
-  it('passes a supplied categoryId through to persistTask', async () => {
+  it('does not persist even when a categoryId is supplied', async () => {
     await handler(makeEvent({ query: 'wash my hands', categoryId: 'cat-9' }));
-    expect(mockPersist).toHaveBeenCalledWith('owner-1', expect.objectContaining({ categoryId: 'cat-9' }));
+    expect(mockPersist).not.toHaveBeenCalled();
   });
 
   it('throws UnauthorizedError when there is no identity', async () => {
@@ -67,7 +57,7 @@ describe('createAiTask handler', () => {
     expect(mockPersist).not.toHaveBeenCalled();
   });
 
-  it('does not persist when generation fails', async () => {
+  it('fails without writing anything when generation fails', async () => {
     mockGenerate.mockRejectedValue(new Error('no relevant guidance found for this task'));
     await expect(handler(makeEvent({ query: 'gibberish' }))).rejects.toThrow('no relevant guidance');
     expect(mockPersist).not.toHaveBeenCalled();

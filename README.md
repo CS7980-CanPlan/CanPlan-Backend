@@ -25,20 +25,20 @@ AssignmentStep, MediaAsset, Report. The item-key conventions live in
 | `createMediaUploadUrl`, `createTaskCoverImageUploadUrl`, `createMediaAsset`, `deleteMediaAsset`, `getMediaDownloadUrl`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB + S3 media bucket (presigned upload/download, cover images, cascade delete) |
 | `listAllUsers`, `listAllTasks` | Query | `canplan-admin-<env>` Lambda + DynamoDB `entityTypeIndex` (SystemAdmin only, paginated) |
 | `generateTaskSteps` | Mutation | `canplan-generateTaskSteps-<env>` Lambda + Bedrock KB RAG |
-| `createAiTask` | Mutation | `canplan-createAiTask-<env>` Lambda + Bedrock KB RAG + DynamoDB (generate + persist in one call) |
+| `createAiTask` | Mutation | `canplan-createAiTask-<env>` Lambda + Bedrock KB RAG (generate a title + steps preview; persists nothing) |
 
 Domain Lambdas back several fields each, routing on the resolved GraphQL field
 (`event.info.fieldName`). AI usage is through two mutations. `generateTaskSteps`
 retrieves relevant corpus passages from the Knowledge Base, then calls Bedrock
 Converse to generate cited task steps (it returns the steps; it does not save a
 task). `createAiTask` takes a single free-text `query`, generates a clean title
-plus ordered steps over the same Knowledge Base, and creates and saves the Task
-under the caller in one call; it does not surface or store citations. It reuses
-the same KB/Bedrock generation as `generateTaskSteps` (via `src/shared/stepsService.ts`)
-and the same persistence as `createTask` (via `src/shared/task.ts`). Any generation
-failure throws before any write, so a failed generation never creates a task. A
-caregiver review/approval flow over the cited sources is a separate future project,
-not part of this mutation.
+plus ordered steps over the same Knowledge Base, and returns them directly to the
+frontend as a `GeneratedAiTask` preview; it persists nothing (no task, steps,
+category, or media are written, and no `categoryId` is resolved) and does not
+surface or store citations. The caller saves the preview later via `createTask` if
+they keep it. It reuses the same KB/Bedrock generation as `generateTaskSteps` (via
+`src/shared/stepsService.ts`). A caregiver review/approval flow over the cited
+sources is a separate future project, not part of this mutation.
 
 Default authorization is Cognito User Pool — frontend clients send a signed-in
 user's JWT. A few fields carry auth directives; see [Authentication](#authentication).
@@ -325,9 +325,9 @@ src/lambdas/createTask/handler.ts              createTask resolver (Task + steps
 src/lambdas/{users,categories,tasks,assignments,media}/handler.ts   Domain resolvers (routed by fieldName)
 src/lambdas/admin/handler.ts                   SystemAdmin list-all-by-entityType resolvers
 src/lambdas/generateTaskSteps/handler.ts       KB Retrieve -> Converse resolver
-src/lambdas/createAiTask/handler.ts            createAiTask resolver (generate titled steps -> persist)
+src/lambdas/createAiTask/handler.ts            createAiTask resolver (generate titled steps -> preview, no persist)
 src/shared/stepsService.ts                     KB Retrieve + Converse orchestration (generate steps / titled steps)
-src/shared/task.ts                             persistTask: Task + steps transaction (shared by createTask/createAiTask)
+src/shared/task.ts                             persistTask: Task + steps transaction (used by createTask)
 src/shared/keys.ts                             Single-table PK/SK + entityType conventions
 src/shared/category.ts                         Task↔Category lookup/validation + taskCount deltas
 src/shared/authz.ts                            Owner-scoped authorization helpers
