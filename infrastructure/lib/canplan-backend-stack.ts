@@ -8,14 +8,13 @@ import { Functions } from './constructs/functions.construct';
 import { Storage } from './constructs/storage.construct';
 
 export interface CanPlanBackendStackProps extends cdk.StackProps {
-  /** Environment name (e.g. 'sandbox', 'dev', 'prod') — used to namespace resources. */
+  /** Environment name (e.g. 'sandbox', 'dev', 'prod', or a personal owner). */
   readonly envName: string;
   /**
-   * When true, all resources tear down cleanly with `cdk destroy` — no retained
-   * tables or buckets left behind to incur cost or block the next deploy on a
-   * name collision. Set for sandbox only; leave false (RETAIN) for dev / prod.
+   * When true, stateful resources tear down cleanly with `cdk destroy`, leaving
+   * no retained tables or buckets behind.
    */
-  readonly isSandbox: boolean;
+  readonly isDestroyable: boolean;
   /** Bedrock KB id from the Bedrock-region KnowledgeBase stack (cross-region ref). */
   readonly knowledgeBaseId: string;
   /** Region for KB Retrieve + Converse. Must match the KnowledgeBase stack region. */
@@ -30,14 +29,14 @@ export class CanPlanBackendStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: CanPlanBackendStackProps) {
     super(scope, id, props);
 
-    const { envName, isSandbox, knowledgeBaseId, bedrockRegion } = props;
+    const { envName, isDestroyable, knowledgeBaseId, bedrockRegion } = props;
 
     // Data + storage
-    const database = new Database(this, 'Database', { envName, isSandbox });
-    const storage = new Storage(this, 'Storage', { envName, isSandbox });
+    const database = new Database(this, 'Database', { envName, isDestroyable });
+    const storage = new Storage(this, 'Storage', { envName, isDestroyable });
 
     // Authentication — Cognito user pool, client, and role groups
-    const auth = new Auth(this, 'Auth', { envName, isSandbox });
+    const auth = new Auth(this, 'Auth', { envName, isDestroyable });
 
     // AI config (Bedrock model selection)
     const ai = new Ai(this, 'Ai', { bedrockRegion });

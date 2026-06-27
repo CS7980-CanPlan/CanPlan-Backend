@@ -8,6 +8,8 @@
     "lint": "eslint 'src/**/*.ts' 'infrastructure/**/*.ts' 'scripts/**/*.ts'",
     "format": "prettier --write 'src/**/*.ts' 'infrastructure/**/*.ts' 'scripts/**/*.ts'",
     "cdk:synth": "cdk synth",
+    "cdk:deploy:me": "ts-node scripts/cdk-personal.ts deploy",
+    "cdk:destroy:me": "ts-node scripts/cdk-personal.ts destroy",
     "cdk:deploy:dev": "cdk deploy --all --context env=dev",
     "cdk:destroy:dev": "cdk destroy --all --context env=dev",
     "cdk:deploy:sandbox": "cdk deploy --all --context env=sandbox",

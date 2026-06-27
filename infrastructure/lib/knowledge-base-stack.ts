@@ -3,14 +3,13 @@ import { Construct } from 'constructs';
 import { KnowledgeBase } from './constructs/knowledge-base.construct';
 
 export interface KnowledgeBaseStackProps extends cdk.StackProps {
-  /** Environment name (e.g. 'sandbox', 'dev', 'prod') — used to namespace resources. */
+  /** Environment name (e.g. 'sandbox', 'dev', 'prod', or a personal owner). */
   readonly envName: string;
   /**
-   * When true, all resources tear down cleanly with `cdk destroy` — no retained
-   * buckets left behind to incur cost or block the next deploy on a name
-   * collision. Set for sandbox only; leave false (RETAIN) for dev / prod.
+   * When true, stateful resources tear down cleanly with `cdk destroy`, leaving
+   * no retained buckets behind.
    */
-  readonly isSandbox: boolean;
+  readonly isDestroyable: boolean;
 }
 
 /**
@@ -29,13 +28,13 @@ export class KnowledgeBaseStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: KnowledgeBaseStackProps) {
     super(scope, id, props);
 
-    const { envName, isSandbox } = props;
+    const { envName, isDestroyable } = props;
 
     // Corpus bucket + Bedrock KB (S3 Vectors store). bedrockRegion = this stack's
     // own region so the embedding-model ARN stays self-consistent.
     const knowledgeBase = new KnowledgeBase(this, 'KnowledgeBase', {
       envName,
-      isSandbox,
+      isDestroyable,
       bedrockRegion: this.region,
     });
 

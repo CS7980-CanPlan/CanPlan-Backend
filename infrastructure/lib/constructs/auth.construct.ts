@@ -8,10 +8,10 @@ import { Construct } from 'constructs';
 import * as path from 'path';
 
 export interface AuthProps {
-  /** Environment name (e.g. 'sandbox', 'dev', 'prod') — namespaces the pool. */
+  /** Environment name (e.g. 'sandbox', 'dev', 'prod', or a personal owner). */
   readonly envName: string;
-  /** Sandbox tears down cleanly (DESTROY); dev/prod RETAIN to protect users. */
-  readonly isSandbox: boolean;
+  /** Destroyable environments use DESTROY; dev/prod use RETAIN to protect users. */
+  readonly isDestroyable: boolean;
 }
 
 /** Role groups seeded in the user pool — authorization rules come in a later milestone. */
@@ -30,7 +30,7 @@ export class Auth extends Construct {
   constructor(scope: Construct, id: string, props: AuthProps) {
     super(scope, id);
 
-    const { envName, isSandbox } = props;
+    const { envName, isDestroyable } = props;
 
     this.userPool = new cognito.UserPool(this, 'CanPlanUserPool', {
       userPoolName: `CanPlan-${envName}-UserPool`,
@@ -51,8 +51,8 @@ export class Auth extends Construct {
         requireDigits: true,
         requireSymbols: false,
       },
-      // Sandbox: destroy with the stack. dev / prod: retain to protect user accounts.
-      removalPolicy: isSandbox ? cdk.RemovalPolicy.DESTROY : cdk.RemovalPolicy.RETAIN,
+      // Destroyable environments delete with the stack. dev / prod retain users.
+      removalPolicy: isDestroyable ? cdk.RemovalPolicy.DESTROY : cdk.RemovalPolicy.RETAIN,
     });
 
     // Frontend client (mobile app + web portal). Public clients can't keep a

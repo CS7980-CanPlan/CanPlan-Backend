@@ -5,8 +5,8 @@ import { Construct } from 'constructs';
 export interface StorageProps {
   /** Environment name — keeps the bucket unique per environment in an account. */
   readonly envName: string;
-  /** Sandbox empties + deletes on teardown; dev/prod RETAIN. */
-  readonly isSandbox: boolean;
+  /** Destroyable environments empty + delete on teardown; dev/prod RETAIN. */
+  readonly isDestroyable: boolean;
 }
 
 /** S3 storage for CanPlan (media uploads, future use). */
@@ -16,7 +16,7 @@ export class Storage extends Construct {
   constructor(scope: Construct, id: string, props: StorageProps) {
     super(scope, id);
 
-    const { envName, isSandbox } = props;
+    const { envName, isDestroyable } = props;
     const { account, region } = cdk.Stack.of(this);
 
     this.mediaBucket = new s3.Bucket(this, 'CanPlanMediaBucket', {
@@ -45,9 +45,9 @@ export class Storage extends Construct {
           expiration: cdk.Duration.days(1),
         },
       ],
-      // Sandbox: empty + delete on teardown. dev / prod: retain.
-      removalPolicy: isSandbox ? cdk.RemovalPolicy.DESTROY : cdk.RemovalPolicy.RETAIN,
-      autoDeleteObjects: isSandbox,
+      // Destroyable environments empty + delete on teardown. dev / prod retain.
+      removalPolicy: isDestroyable ? cdk.RemovalPolicy.DESTROY : cdk.RemovalPolicy.RETAIN,
+      autoDeleteObjects: isDestroyable,
     });
   }
 }
