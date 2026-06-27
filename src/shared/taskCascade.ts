@@ -25,10 +25,12 @@ import {
   MEDIA_PREFIX,
   mediaSk,
   META_SK,
+  PROFILE_SK,
   STEP_PREFIX,
   TASK_MEDIA_CLEANUP_PREFIX,
   taskMediaCleanupSk,
   taskPk,
+  userPk,
 } from './keys';
 import { deleteS3ObjectBestEffort } from './media';
 import type { MediaAsset, Task } from './types';
@@ -119,6 +121,11 @@ export async function deleteTaskCascade(
               },
             },
             categoryCountDelta(stored.ownerId, stored.categoryId, -1, { blockIfDeleting: false }),
+            // Decrement the owner's durable taskCount in the same transaction so the cap
+            // counter never drifts. nextTaskOrder is intentionally NOT reclaimed — a deleted
+            // task simply leaves an order gap. (The owner's profile always exists at cascade
+            // time: full-user deletion cascades tasks before removing the profile.)
+            ownerTaskCountDelta(stored.ownerId, -1),
           ],
         }),
       );
@@ -148,6 +155,25 @@ export async function deleteTaskCascade(
   delete out.entityType;
   delete out.taskCategoryKey;
   return out as unknown as Task;
+}
+
+/**
+ * A TransactWriteItem `Update` that adjusts an owner's durable `taskCount` by `delta`,
+ * mirroring `categoryCountDelta` — included in the same transaction as a task create/delete so
+ * the per-owner cap counter can never drift. Existence-only condition (no `> 0` guard) so a
+ * delete is never blocked; `if_not_exists` tolerates a not-yet-backfilled profile.
+ */
+function ownerTaskCountDelta(ownerId: string, delta: 1 | -1) {
+  return {
+    Update: {
+      TableName: TABLE_NAME,
+      Key: { PK: userPk(ownerId), SK: PROFILE_SK },
+      UpdateExpression:
+        'SET taskCount = if_not_exists(taskCount, :zero) + :delta, updatedAt = :now',
+      ConditionExpression: 'attribute_exists(PK)',
+      ExpressionAttributeValues: { ':delta': delta, ':zero': 0, ':now': new Date().toISOString() },
+    },
+  };
 }
 
 /** Durable S3-cleanup row written before a Task's MediaAsset metadata can disappear. */

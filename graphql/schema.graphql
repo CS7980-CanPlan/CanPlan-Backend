@@ -116,6 +116,11 @@ type Task {
   # The real Category this task belongs to. Always set — a task created without an
   # explicit category is filed under its owner's default category.
   categoryId: ID!
+  # Owner-defined display position across ALL of the owner's tasks (per-owner, not
+  # per-category). Assigned at creation (appended after the current last task) and changed
+  # in bulk via updateTaskOrder; listTasksByOwner returns tasks sorted by it. Gaps are
+  # allowed — deleting a task never renumbers the rest.
+  order: Int
   description: String
   scheduleRule: String
   # Recurring-schedule metadata; null unless the task was created with a schedule.
@@ -458,6 +463,20 @@ input DeleteTaskStepInput {
   stepId: ID!
 }
 
+# One task's target position in a whole-owner task reorder.
+input TaskOrderInput {
+  taskId: ID!
+  order: Int!
+}
+
+# Reorder ALL of the caller's tasks at once. `tasks` must be the complete current set of the
+# caller's tasks: every one of the owner's taskIds exactly once, with unique positive `order`
+# values (gaps allowed — they need not be a contiguous 1..N run). Applied in one DynamoDB
+# transaction (all-or-nothing); only each task's `order` attribute changes.
+input UpdateTaskOrderInput {
+  tasks: [TaskOrderInput!]!
+}
+
 # createAssignment always persists status TO_DO; status is not client-supplied.
 input CreateAssignmentInput {
   taskId: ID!
@@ -689,6 +708,9 @@ type Mutation {
   # Returns the steps sorted by ascending order. Step ids, media, and assignments are
   # untouched.
   reorderTaskSteps(input: ReorderTaskStepsInput!): [TaskStep!]!
+  # Reorder ALL of the caller's tasks at once (must supply the complete current set, each
+  # with a unique position). Returns the tasks sorted by ascending order.
+  updateTaskOrder(input: UpdateTaskOrderInput!): [Task!]!
   # Delete a task template and all of its TaskSteps. Historical Assignments and
   # AssignmentSteps snapshotted from it are NOT deleted. Returns the deleted Task.
   deleteTask(taskId: ID!): Task

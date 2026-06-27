@@ -797,6 +797,113 @@ describe('tasks handler — reorderTaskSteps', () => {
   });
 });
 
+describe('tasks handler — updateTaskOrder', () => {
+  const ownerTask = (taskId: string, order: number, createdAt = 'c') => ({
+    PK: `TASK#${taskId}`,
+    SK: '#META',
+    entityType: 'Task',
+    taskId,
+    ownerId: OWNER,
+    title: taskId,
+    categoryId: 'cat-1',
+    order,
+    createdAt,
+  });
+  /** taskOwnerIndex query → the owner's current tasks; every other send → {}. */
+  const stub = (tasks: Array<Record<string, unknown>>) =>
+    mockSend.mockImplementation((cmd: { constructor: { name: string } }) =>
+      Promise.resolve(cmd.constructor.name === 'QueryCommand' ? { Items: tasks } : {}),
+    );
+
+  it("renumbers all of the owner's tasks in one ownership-guarded transaction, returned sorted", async () => {
+    stub([ownerTask('t1', 1), ownerTask('t2', 2)]);
+    const result = (await handler(
+      event('updateTaskOrder', {
+        input: { tasks: [{ taskId: 't1', order: 2 }, { taskId: 't2', order: 1 }] },
+      }),
+    )) as Task[];
+
+    expect(result.map((t) => t.taskId)).toEqual(['t2', 't1']); // sorted by new order
+    expect(result.map((t) => t.order)).toEqual([1, 2]);
+    const tx = calls().find((c) => c.input.TransactItems)!.input.TransactItems as Array<{
+      Update: {
+        UpdateExpression: string;
+        ConditionExpression: string;
+        ExpressionAttributeNames: Record<string, string>;
+        ExpressionAttributeValues: Record<string, unknown>;
+      };
+    }>;
+    expect(tx).toHaveLength(2);
+    for (const { Update } of tx) {
+      expect(Update.UpdateExpression).toBe('SET #order = :order, #updatedAt = :now');
+      expect(Update.ConditionExpression).toContain('ownerId = :owner');
+      expect(Update.ExpressionAttributeValues[':owner']).toBe(OWNER);
+      expect(Update.ExpressionAttributeNames['#order']).toBe('order');
+    }
+  });
+
+  it('rejects a request that omits a task or names a foreign/unknown task', async () => {
+    stub([ownerTask('t1', 1), ownerTask('t2', 2)]);
+    await expect(
+      handler(event('updateTaskOrder', { input: { tasks: [{ taskId: 't1', order: 1 }] } })),
+    ).rejects.toThrow("must include all of the owner's 2 task(s)");
+    await expect(
+      handler(
+        event('updateTaskOrder', {
+          input: { tasks: [{ taskId: 't1', order: 1 }, { taskId: 'tX', order: 2 }] },
+        }),
+      ),
+    ).rejects.toThrow('task tX not found for this owner');
+  });
+
+  it('rejects duplicate orders, duplicate taskIds, and non-positive orders before any IO', async () => {
+    await expect(
+      handler(
+        event('updateTaskOrder', {
+          input: { tasks: [{ taskId: 't1', order: 1 }, { taskId: 't2', order: 1 }] },
+        }),
+      ),
+    ).rejects.toThrow('order 1 appears more than once');
+    await expect(
+      handler(
+        event('updateTaskOrder', {
+          input: { tasks: [{ taskId: 't1', order: 1 }, { taskId: 't1', order: 2 }] },
+        }),
+      ),
+    ).rejects.toThrow('taskId t1 appears more than once');
+    await expect(
+      handler(event('updateTaskOrder', { input: { tasks: [{ taskId: 't1', order: 0 }] } })),
+    ).rejects.toThrow('must be a positive integer');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('requires authentication, a non-empty list, and at most 50 tasks before any IO', async () => {
+    await expect(
+      handler(event('updateTaskOrder', { input: { tasks: [] } })),
+    ).rejects.toThrow('tasks is required');
+    const many = Array.from({ length: 51 }, (_, i) => ({ taskId: `t${i}`, order: i + 1 }));
+    await expect(
+      handler(event('updateTaskOrder', { input: { tasks: many } })),
+    ).rejects.toThrow('at most 50 tasks');
+    await expect(
+      handler(event('updateTaskOrder', { input: { tasks: [{ taskId: 't1', order: 1 }] } }, null)),
+    ).rejects.toThrow('authenticated user is required');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('maps a transaction cancellation to a retryable concurrency error', async () => {
+    mockSend.mockImplementation((cmd: { constructor: { name: string }; input: { TransactItems?: unknown } }) => {
+      if (cmd.constructor.name === 'QueryCommand') return Promise.resolve({ Items: [ownerTask('t1', 1)] });
+      if (cmd.input.TransactItems)
+        return Promise.reject(Object.assign(new Error('canceled'), { name: 'TransactionCanceledException' }));
+      return Promise.resolve({});
+    });
+    await expect(
+      handler(event('updateTaskOrder', { input: { tasks: [{ taskId: 't1', order: 1 }] } })),
+    ).rejects.toThrow('changed concurrently');
+  });
+});
+
 describe('tasks handler — deleteTaskStep', () => {
   const standaloneStepDelete = () =>
     calls().find((c) => c.constructor.name === 'DeleteCommand' && c.input.Key?.SK?.startsWith('STEP#'))?.input;

@@ -23,6 +23,12 @@
  *      that lack them (from the task's real step rows), enabling concurrency-safe appends.
  *   6. TaskStep keys — rewrite order-based sort keys (STEP#001, …) to stable STEP#<stepId>
  *      keys, preserving every field (text, description, media ref, timestamps, order).
+ *   7. Task order + owner counters — give every Task a per-owner `order` (assigned by
+ *      createdAt order, after any order an owner's tasks already have) and backfill each
+ *      profile's owner-level task counters (`taskCount` = the owner's live task count,
+ *      `nextTaskOrder` = max assigned order + 1) so createTask/updateTaskOrder work on legacy
+ *      data. Idempotent: tasks that already have an `order` and profiles that already have
+ *      `nextTaskOrder` are left untouched.
  *
  * Enumerates rows via `entityTypeIndex` (no table Scan). Reports counts + per-row failures.
  *
@@ -95,6 +101,10 @@ export interface MigrationReport {
   taskCountsBackfilled: number;
   /** Tasks given missing step metadata (stepCount/stepVersion/nextStepOrder). */
   stepMetaBackfilled: number;
+  /** Tasks given a missing per-owner `order` (assigned by createdAt order). */
+  taskOrdersBackfilled: number;
+  /** Profiles given missing owner-level task counters (taskCount/nextTaskOrder). */
+  profileTaskCountersBackfilled: number;
   stepsScanned: number;
   stepsRekeyed: number;
   failures: string[];
@@ -114,6 +124,8 @@ function emptyReport(): MigrationReport {
     statusStripped: 0,
     taskCountsBackfilled: 0,
     stepMetaBackfilled: 0,
+    taskOrdersBackfilled: 0,
+    profileTaskCountersBackfilled: 0,
     stepsScanned: 0,
     stepsRekeyed: 0,
     failures: [],
@@ -172,6 +184,8 @@ export async function runMigration(opts: {
   const defaultsToCreate = new Map<string, string>(); // ownerId → new default categoryId
   const pointerRepairs: Array<{ userId: string; defaultCategoryId: string }> = [];
   const duplicateDemotions: Array<{ ownerId: string; categoryId: string; newName: string }> = [];
+  // Profiles + their current owner-level task counters (for the taskCount/nextTaskOrder backfill).
+  const profileRows: Array<{ userId: string; hasTaskCounter: boolean }> = [];
 
   for await (const profile of byEntityType(ENTITY.USER_PROFILE)) {
     report.profilesScanned++;
@@ -180,6 +194,8 @@ export async function runMigration(opts: {
       report.failures.push(`profile ${profile.PK}/${profile.SK} has no userId`);
       continue;
     }
+    // nextTaskOrder is the authoritative "already migrated" marker (taskCount alone could be 0).
+    profileRows.push({ userId, hasTaskCounter: typeof profile.nextTaskOrder === 'number' });
     const cats = categoriesByOwner.get(userId) ?? [];
     // Deterministic order so the surviving default is reproducible (lowest categoryId).
     const canonicalDefaults = cats
@@ -257,6 +273,11 @@ export async function runMigration(opts: {
   }> = [];
   // Every task seen, plus whether it already has step metadata (for the backfill pass).
   const taskRows: Array<{ taskId: string; sk: string; hasStepMeta: boolean }> = [];
+  // Per-owner task placement, for the `order` + owner-counter backfill.
+  const ownerTasks = new Map<
+    string,
+    Array<{ taskId: string; sk: string; createdAt: string; order?: number }>
+  >();
 
   for await (const task of byEntityType(ENTITY.TASK)) {
     report.tasksScanned++;
@@ -273,6 +294,12 @@ export async function runMigration(opts: {
         typeof task.stepVersion === 'number' &&
         typeof task.stepCount === 'number' &&
         typeof task.nextStepOrder === 'number',
+    });
+    (ownerTasks.get(ownerId) ?? ownerTasks.set(ownerId, []).get(ownerId)!).push({
+      taskId,
+      sk: task.SK,
+      createdAt: (task.createdAt as string | undefined) ?? '',
+      order: typeof task.order === 'number' ? task.order : undefined,
     });
     const hasStatus = task.status !== undefined;
     const categoryId = (task.categoryId as string | undefined)?.trim();
@@ -365,6 +392,46 @@ export async function runMigration(opts: {
     );
   }
 
+  // ── 7. Plan per-owner task `order` + owner-level task-counter backfill ───────────────────
+  const orderBackfills: Array<{ taskId: string; sk: string; order: number }> = [];
+  const ownerNextOrder = new Map<string, number>(); // ownerId → nextTaskOrder after backfill
+  const ownerTaskCount = new Map<string, number>(); // ownerId → live task count
+  for (const [ownerId, tasks] of ownerTasks) {
+    ownerTaskCount.set(ownerId, tasks.length);
+    // Assign new orders AFTER the highest order any of this owner's tasks already have, so a
+    // partial prior run never collides; createdAt (taskId tiebreak) makes it deterministic.
+    let maxOrder = 0;
+    for (const t of tasks) if (typeof t.order === 'number') maxOrder = Math.max(maxOrder, t.order);
+    const lacking = tasks
+      .filter((t) => typeof t.order !== 'number')
+      .sort((a, b) =>
+        a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.taskId < b.taskId ? -1 : 1,
+      );
+    let next = maxOrder + 1;
+    for (const t of lacking) {
+      orderBackfills.push({ taskId: t.taskId, sk: t.sk, order: next });
+      report.taskOrdersBackfilled++;
+      log(`${apply ? 'BACKFILL' : 'would backfill'} order for task ${t.taskId} (owner ${ownerId}) → ${next}`);
+      next++;
+    }
+    ownerNextOrder.set(ownerId, next); // = maxOrder + lacking.length + 1
+  }
+
+  // Profiles missing owner-level counters → set taskCount + nextTaskOrder (an owner with no
+  // tasks gets 0 / 1). Idempotent: only profiles without nextTaskOrder are touched.
+  const profileCounterBackfills: Array<{ userId: string; taskCount: number; nextTaskOrder: number }> = [];
+  for (const p of profileRows) {
+    if (p.hasTaskCounter) continue;
+    const taskCount = ownerTaskCount.get(p.userId) ?? 0;
+    const nextTaskOrder = ownerNextOrder.get(p.userId) ?? 1;
+    profileCounterBackfills.push({ userId: p.userId, taskCount, nextTaskOrder });
+    report.profileTaskCountersBackfilled++;
+    log(
+      `${apply ? 'BACKFILL' : 'would backfill'} owner counters for profile ${p.userId}: ` +
+        `taskCount=${taskCount}, nextTaskOrder=${nextTaskOrder}`,
+    );
+  }
+
   if (apply) {
     await applyDefaultCreates();
     await applyDuplicateDemotions();
@@ -372,6 +439,8 @@ export async function runMigration(opts: {
     await applyTaskUpdates();
     await applyCountBackfills();
     await applyStepMetadataBackfills();
+    await applyTaskOrderBackfills();
+    await applyProfileCounterBackfills();
     await applyStepRekeys();
   }
 
@@ -534,6 +603,49 @@ export async function runMigration(opts: {
     }
   }
 
+  async function applyTaskOrderBackfills(): Promise<void> {
+    const now = new Date().toISOString();
+    for (const { taskId, sk, order } of orderBackfills) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: table,
+            Key: { PK: taskPk(taskId), SK: sk },
+            UpdateExpression: 'SET #order = :order, updatedAt = :now',
+            // Idempotent: only set when still absent (a concurrent run / re-run is a no-op).
+            ConditionExpression: 'attribute_exists(PK) AND attribute_not_exists(#order)',
+            ExpressionAttributeNames: { '#order': 'order' },
+            ExpressionAttributeValues: { ':order': order, ':now': now },
+          }),
+        );
+      } catch (err) {
+        if ((err as { name?: string }).name === 'ConditionalCheckFailedException') continue; // already set
+        report.failures.push(`task ${taskId}: order backfill failed: ${String(err)}`);
+      }
+    }
+  }
+
+  async function applyProfileCounterBackfills(): Promise<void> {
+    const now = new Date().toISOString();
+    for (const { userId, taskCount, nextTaskOrder } of profileCounterBackfills) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: table,
+            Key: { PK: userPk(userId), SK: PROFILE_SK },
+            UpdateExpression: 'SET taskCount = :c, nextTaskOrder = :n, updatedAt = :now',
+            // Idempotent: only set when still absent (a concurrent run / re-run is a no-op).
+            ConditionExpression: 'attribute_exists(PK) AND attribute_not_exists(nextTaskOrder)',
+            ExpressionAttributeValues: { ':c': taskCount, ':n': nextTaskOrder, ':now': now },
+          }),
+        );
+      } catch (err) {
+        if ((err as { name?: string }).name === 'ConditionalCheckFailedException') continue; // already set
+        report.failures.push(`profile ${userId}: owner-counter backfill failed: ${String(err)}`);
+      }
+    }
+  }
+
   async function applyStepRekeys(): Promise<void> {
     for (const { pk, oldSk, item } of stepRekeys) {
       try {
@@ -564,6 +676,8 @@ export async function runMigration(opts: {
     log(`Legacy status stripped:  ${report.statusStripped} ${apply ? 'stripped' : 'to strip'}`);
     log(`taskCount backfilled:    ${report.taskCountsBackfilled} ${apply ? 'updated' : 'to update'}`);
     log(`Step metadata backfilled:${report.stepMetaBackfilled} ${apply ? 'set' : 'to set'}`);
+    log(`Task orders backfilled:  ${report.taskOrdersBackfilled} ${apply ? 'set' : 'to set'}`);
+    log(`Profile counters set:    ${report.profileTaskCountersBackfilled} ${apply ? 'set' : 'to set'}`);
     log(`Steps scanned:           ${report.stepsScanned}`);
     log(`Steps rekeyed:           ${report.stepsRekeyed} ${apply ? 'rekeyed' : 'to rekey'}`);
     log(`Failures:                ${report.failures.length}`);

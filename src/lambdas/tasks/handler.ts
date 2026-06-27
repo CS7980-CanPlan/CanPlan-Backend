@@ -7,7 +7,7 @@ import {
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { queryAllItems } from '../../shared/batch';
-import { assertCallerOwns } from '../../shared/authz';
+import { assertCallerOwns, requireCaller } from '../../shared/authz';
 import { assertUsableCategory, categoryCountDelta } from '../../shared/category';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import {
@@ -38,6 +38,7 @@ import {
 } from '../../shared/pagination';
 import { NotFoundError, ValidationError } from '../../shared/response';
 import { normalizeSchedule } from '../../shared/schedule';
+import { MAX_TASKS_PER_OWNER } from '../../shared/task';
 import type {
   AppSyncEvent,
   AppSyncIdentity,
@@ -51,6 +52,7 @@ import type {
   Task,
   TaskStep,
   UpdateTaskInput,
+  UpdateTaskOrderInput,
   UpdateTaskStepInput,
 } from '../../shared/types';
 
@@ -71,7 +73,7 @@ const MAX_STEPS_PER_TASK = 99;
  */
 export const handler = async (
   event: AppSyncEvent<Record<string, unknown>>,
-): Promise<Task | TaskStep | TaskStep[] | Connection<Task> | Connection<TaskStep> | null> => {
+): Promise<Task | Task[] | TaskStep | TaskStep[] | Connection<Task> | Connection<TaskStep> | null> => {
   const { arguments: args, identity } = event;
   switch (event.info?.fieldName) {
     case 'getTask':
@@ -97,6 +99,8 @@ export const handler = async (
       return deleteTaskStep(identity, args.input as DeleteTaskStepInput);
     case 'reorderTaskSteps':
       return reorderTaskSteps(identity, args.input as ReorderTaskStepsInput);
+    case 'updateTaskOrder':
+      return updateTaskOrder(identity, args.input as UpdateTaskOrderInput);
     case 'deleteTask':
       return deleteTask(identity, args.taskId as string);
     default:
@@ -167,25 +171,71 @@ function decodeOffset(token?: string): number {
   return offset;
 }
 
+/**
+ * listTasksByOwner — return an owner's tasks in ascending `order` (their owner-defined
+ * position), with order preserved ACROSS pages. `order` is a plain attribute (the GSI is
+ * keyed on createdAt), so DynamoDB key order is irrelevant; an owner holds at most 50 tasks,
+ * so we read the whole (small) set, sort by `order` (createdAt then taskId as stable
+ * tiebreakers), then paginate in application code. `nextToken` is an opaque base64 offset
+ * into that sorted list — NOT a DynamoDB key — and is null on the last page. (Mirrors
+ * listTaskSteps.)
+ */
 async function listTasksByOwner(
   identity: AppSyncIdentity | undefined,
   ownerId: string,
   page: PageArgs,
 ): Promise<Connection<Task>> {
   if (!ownerId?.trim()) throw new ValidationError('ownerId is required');
-  assertCallerOwns(identity, ownerId.trim());
-  // taskOwnerIndex is keyed on ownerId/createdAt. MediaAsset items also carry an
-  // ownerId, so filter to Task #META rows by entityType.
-  return queryPage<Task>(
-    {
-      TableName: TABLE_NAME,
-      IndexName: TASK_OWNER_INDEX,
-      KeyConditionExpression: 'ownerId = :owner',
-      FilterExpression: 'entityType = :task',
-      ExpressionAttributeValues: { ':owner': ownerId.trim(), ':task': ENTITY.TASK },
-    },
-    page,
-  );
+  const owner = ownerId.trim();
+  assertCallerOwns(identity, owner);
+
+  const all = await queryAllOwnerTasks(owner);
+  all.sort(byTaskOrder);
+
+  const offset = decodeOffset(page.nextToken);
+  if (offset < 0 || offset > all.length) throw new ValidationError('invalid nextToken');
+  const limit = typeof page.limit === 'number' && page.limit > 0 ? page.limit : all.length;
+  const slice = all.slice(offset, offset + limit);
+  const nextOffset = offset + slice.length;
+  const nextToken = nextOffset < all.length ? encodeNextToken({ offset: nextOffset }) : null;
+  return { items: slice, nextToken };
+}
+
+/**
+ * Collect ALL of an owner's Task #META rows via taskOwnerIndex (keyed on ownerId/createdAt),
+ * following pagination. MediaAsset items also carry an ownerId, so filter to Task rows by
+ * entityType. An owner has at most 50 tasks, so reading the whole set is cheap.
+ */
+async function queryAllOwnerTasks(ownerId: string): Promise<Task[]> {
+  const all: Task[] = [];
+  let nextToken: string | undefined;
+  do {
+    const result: Connection<Task> = await queryPage<Task>(
+      {
+        TableName: TABLE_NAME,
+        IndexName: TASK_OWNER_INDEX,
+        KeyConditionExpression: 'ownerId = :owner',
+        FilterExpression: 'entityType = :task',
+        ExpressionAttributeValues: { ':owner': ownerId, ':task': ENTITY.TASK },
+      },
+      { nextToken },
+    );
+    all.push(...result.items);
+    nextToken = result.nextToken ?? undefined;
+  } while (nextToken);
+  return all;
+}
+
+/**
+ * Sort by ascending `order`, with createdAt then taskId as stable tiebreakers. A task that
+ * predates the order backfill (no `order`) sorts last, deterministically.
+ */
+function byTaskOrder(a: Task, b: Task): number {
+  const ao = a.order ?? Number.MAX_SAFE_INTEGER;
+  const bo = b.order ?? Number.MAX_SAFE_INTEGER;
+  if (ao !== bo) return ao - bo;
+  if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
+  return a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0;
 }
 
 async function listTasksByCategory(
@@ -983,6 +1033,92 @@ async function reorderTaskSteps(
     .map((step) => ({ ...step, order: orderByStepId.get(step.stepId)!, updatedAt: now }))
     .sort((a, b) => a.order - b.order)
     .map((step) => withStepMedia(step, mediaForStep(currentMedia, step.stepId)));
+}
+
+/**
+ * updateTaskOrder — atomically renumber ALL of the caller's tasks. The request must carry the
+ * complete current task set: every one of the owner's taskIds exactly once, with unique
+ * positive `order` values (gaps allowed — unlike reorderTaskSteps, orders need not be a
+ * contiguous 1..N run, because deletes leave gaps and we never renumber on delete). Every
+ * task's `order` is updated in one transaction (all-or-nothing); task contents, steps, and
+ * assignments are untouched. The owner is taken from the Cognito identity, never the input.
+ * Returns the tasks sorted by ascending order.
+ */
+async function updateTaskOrder(
+  identity: AppSyncIdentity | undefined,
+  input: UpdateTaskOrderInput,
+): Promise<Task[]> {
+  const ownerId = requireCaller(identity);
+  const tasks = input?.tasks;
+  if (!Array.isArray(tasks) || tasks.length === 0) {
+    throw new ValidationError('tasks is required and must list the complete current task set');
+  }
+  if (tasks.length > MAX_TASKS_PER_OWNER) {
+    throw new ValidationError(`an owner may have at most ${MAX_TASKS_PER_OWNER} tasks`);
+  }
+
+  const orderByTaskId = new Map<string, number>();
+  const seenOrders = new Set<number>();
+  for (const t of tasks) {
+    const id = t?.taskId?.trim();
+    if (!id) throw new ValidationError('each entry requires a taskId');
+    if (orderByTaskId.has(id)) throw new ValidationError(`taskId ${id} appears more than once`);
+    if (!Number.isInteger(t.order) || t.order < 1) {
+      throw new ValidationError(`order for task ${id} must be a positive integer`);
+    }
+    if (seenOrders.has(t.order)) throw new ValidationError(`order ${t.order} appears more than once`);
+    orderByTaskId.set(id, t.order);
+    seenOrders.add(t.order);
+  }
+
+  // The request must match the owner's actual tasks exactly (no missing/extra/foreign tasks).
+  const current = await queryAllOwnerTasks(ownerId);
+  if (current.length !== orderByTaskId.size) {
+    throw new ValidationError(
+      `updateTaskOrder must include all of the owner's ${current.length} task(s); received ${orderByTaskId.size}`,
+    );
+  }
+  const currentIds = new Set(current.map((task) => task.taskId));
+  for (const id of orderByTaskId.keys()) {
+    if (!currentIds.has(id)) {
+      throw new NotFoundError(`task ${id} not found for this owner`);
+    }
+  }
+
+  const now = new Date().toISOString();
+  // One atomic transaction updates every task's `order` in place (stable TASK#<taskId>/#META
+  // keys, so no key rewrite). Each Update is conditioned on the task existing AND still owned
+  // by the caller (defense in depth). `order` is a DynamoDB reserved word — alias it.
+  const updates = current.map((task) => ({
+    Update: {
+      TableName: TABLE_NAME,
+      Key: { PK: taskPk(task.taskId), SK: META_SK },
+      UpdateExpression: 'SET #order = :order, #updatedAt = :now',
+      ConditionExpression: 'attribute_exists(PK) AND ownerId = :owner',
+      ExpressionAttributeNames: { '#order': 'order', '#updatedAt': 'updatedAt' },
+      ExpressionAttributeValues: {
+        ':order': orderByTaskId.get(task.taskId),
+        ':owner': ownerId,
+        ':now': now,
+      },
+    },
+  }));
+  try {
+    // N updates ≤ 50 ≤ the 100-item transaction limit.
+    await dynamo.send(new TransactWriteCommand({ TransactItems: updates }));
+  } catch (err) {
+    if ((err as { name?: string }).name === 'TransactionCanceledException') {
+      throw new ValidationError(
+        "updateTaskOrder: the owner's tasks changed concurrently (a task was added or removed); " +
+          'reload the tasks and retry',
+      );
+    }
+    throw err;
+  }
+
+  return current
+    .map((task) => ({ ...task, order: orderByTaskId.get(task.taskId)!, updatedAt: now }))
+    .sort(byTaskOrder);
 }
 
 /**

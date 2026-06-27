@@ -100,16 +100,23 @@ async function createMyUserProfile(
 
   const existing = await getProfile(userId);
 
-  // Profile already has a default — validate it, then overwrite only the editable fields.
+  // Profile already has a default — validate it, then overwrite only the editable fields
+  // (carrying the existing task counters through untouched).
   if (existing?.defaultCategoryId) {
     await assertValidDefaultCategory(userId, existing.defaultCategoryId);
-    return putProfile(userId, editable, existing.defaultCategoryId, existing.createdAt);
+    return putProfile(userId, editable, existing.defaultCategoryId, existing.createdAt, existing);
   }
 
   // No valid default yet → create the default category alongside the profile, atomically.
   const defaultCategoryId = randomUUID();
   const now = new Date().toISOString();
-  const profile = buildProfile(userId, editable, defaultCategoryId, existing?.createdAt ?? now, now);
+  // A brand-new profile starts with zero tasks and the first order at 1; a legacy profile
+  // that merely lacks a default keeps whatever counters it already has (the migration
+  // backfills any that are still missing).
+  const counters: ProfileCounters = existing
+    ? { taskCount: existing.taskCount, nextTaskOrder: existing.nextTaskOrder }
+    : { taskCount: 0, nextTaskOrder: 1 };
+  const profile = buildProfile(userId, editable, defaultCategoryId, existing?.createdAt ?? now, now, counters);
 
   // Profile write: create-only when there is no profile yet; otherwise (a legacy profile
   // missing its default) set the default on the existing row, guarded so it's set once.
@@ -182,7 +189,7 @@ async function createMyUserProfile(
     const reread = await getProfile(userId);
     if (!reread?.defaultCategoryId) throw err;
     await assertValidDefaultCategory(userId, reread.defaultCategoryId);
-    return putProfile(userId, editable, reread.defaultCategoryId, reread.createdAt);
+    return putProfile(userId, editable, reread.defaultCategoryId, reread.createdAt, reread);
   }
 }
 
@@ -200,24 +207,41 @@ type EditableProfile = Pick<
   'role' | 'displayName' | 'email' | 'organizationId' | 'accessibilitySettings'
 >;
 
+/** Owner-level task counters carried through a profile rewrite (never reset by an edit). */
+type ProfileCounters = Pick<UserProfile, 'taskCount' | 'nextTaskOrder'>;
+
 function buildProfile(
   userId: string,
   editable: EditableProfile,
   defaultCategoryId: string,
   createdAt: string,
   updatedAt: string,
+  counters: ProfileCounters = {},
 ): UserProfile {
-  return { userId, ...editable, defaultCategoryId, createdAt, updatedAt };
+  return {
+    userId,
+    ...editable,
+    defaultCategoryId,
+    taskCount: counters.taskCount,
+    nextTaskOrder: counters.nextTaskOrder,
+    createdAt,
+    updatedAt,
+  };
 }
 
-/** Overwrite the editable profile fields, preserving the existing default + createdAt. */
+/**
+ * Overwrite the editable profile fields, preserving the existing default + createdAt AND the
+ * owner's task counters (taskCount/nextTaskOrder) — a profile rewrite must never reset them,
+ * or createTask would reuse `order` values and miscount the cap.
+ */
 async function putProfile(
   userId: string,
   editable: EditableProfile,
   defaultCategoryId: string,
   createdAt: string,
+  counters: ProfileCounters = {},
 ): Promise<UserProfile> {
-  const profile = buildProfile(userId, editable, defaultCategoryId, createdAt, new Date().toISOString());
+  const profile = buildProfile(userId, editable, defaultCategoryId, createdAt, new Date().toISOString(), counters);
   await dynamo.send(
     new PutCommand({
       TableName: TABLE_NAME,

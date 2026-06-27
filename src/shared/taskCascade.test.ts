@@ -86,6 +86,9 @@ describe('deleteTaskCascade', () => {
     expect(tx.TransactItems[0].Delete.Key).toEqual({ PK: 'TASK#t1', SK: '#META' });
     expect(tx.TransactItems[1].Update.Key.SK).toBe('CATEGORY#cat-1');
     expect(tx.TransactItems[1].Update.ExpressionAttributeValues[':delta']).toBe(-1);
+    // …and the owner's profile taskCount is decremented in the same transaction.
+    expect(tx.TransactItems[2].Update.Key).toEqual({ PK: 'USER#o1', SK: '#PROFILE' });
+    expect(tx.TransactItems[2].Update.ExpressionAttributeValues[':delta']).toBe(-1);
   });
 
   it('throws and never deletes #META when an S3 delete fails', async () => {

@@ -36,12 +36,17 @@ const run = (client: never, apply: boolean) => runMigration({ client, table: 'T'
 beforeAll(() => jest.spyOn(console, 'log').mockImplementation(() => undefined));
 afterAll(() => (console.log as jest.Mock).mockRestore());
 
-const profile = (userId: string, defaultCategoryId?: string): Row => ({
+const profile = (
+  userId: string,
+  defaultCategoryId?: string,
+  extra: Record<string, unknown> = {},
+): Row => ({
   PK: `USER#${userId}`,
   SK: '#PROFILE',
   entityType: 'UserProfile',
   userId,
   ...(defaultCategoryId ? { defaultCategoryId } : {}),
+  ...extra,
 });
 const category = (ownerId: string, categoryId: string, extra: Record<string, unknown> = {}): Row => ({
   PK: `USER#${ownerId}`,
@@ -241,12 +246,12 @@ describe('migration — exactly one default', () => {
 
   it('is idempotent after repair (one default, demoted extra renamed) — no further changes', async () => {
     const { client, writes } = mockClient({
-      profiles: [profile('u5', 'd5a')],
+      profiles: [profile('u5', 'd5a', { taskCount: 1, nextTaskOrder: 2 })],
       categories: [
         defaultCategory('u5', 'd5a', 0), // surviving default, no tasks
         category('u5', 'd5b', { isDefault: false, name: 'Recovered Category d5b', taskCount: 1 }),
       ],
-      tasks: [task('t5', 'u5', { categoryId: 'd5b', stepCount: 0, stepVersion: 1, nextStepOrder: 1 })],
+      tasks: [task('t5', 'u5', { categoryId: 'd5b', order: 1, stepCount: 0, stepVersion: 1, nextStepOrder: 1 })],
     });
     const report = await run(client, true);
     expect(report.duplicateDefaults).toBe(0);
@@ -283,11 +288,68 @@ describe('migration — step metadata backfill', () => {
   });
 });
 
+describe('migration — task order + owner counters backfill', () => {
+  it('assigns order by createdAt and backfills the profile counters', async () => {
+    const { client, writes } = mockClient({
+      profiles: [profile('u', 'd')], // no taskCount/nextTaskOrder yet
+      categories: [defaultCategory('u', 'd', 2)],
+      tasks: [
+        task('ta', 'u', { categoryId: 'd', createdAt: '2026-01-02', stepCount: 0, stepVersion: 1, nextStepOrder: 1 }),
+        task('tb', 'u', { categoryId: 'd', createdAt: '2026-01-01', stepCount: 0, stepVersion: 1, nextStepOrder: 1 }),
+      ],
+    });
+    const report = await run(client, true);
+    expect(report.taskOrdersBackfilled).toBe(2);
+    expect(report.profileTaskCountersBackfilled).toBe(1);
+
+    const orderWrites = writes.filter(
+      (w) => String(w.input.UpdateExpression).includes('#order') && (w.input.Key as { SK: string }).SK === '#META',
+    );
+    const orderByTask = Object.fromEntries(
+      orderWrites.map((w) => [
+        (w.input.Key as { PK: string }).PK,
+        (w.input.ExpressionAttributeValues as Record<string, number>)[':order'],
+      ]),
+    );
+    // Earliest createdAt (tb) gets order 1, then ta gets 2.
+    expect(orderByTask['TASK#tb']).toBe(1);
+    expect(orderByTask['TASK#ta']).toBe(2);
+
+    const counter = writes.find(
+      (w) =>
+        (w.input.Key as { SK: string }).SK === '#PROFILE' &&
+        String(w.input.UpdateExpression).includes('nextTaskOrder'),
+    )!;
+    const vals = counter.input.ExpressionAttributeValues as Record<string, number>;
+    expect(vals[':c']).toBe(2); // taskCount = live task count
+    expect(vals[':n']).toBe(3); // nextTaskOrder = max assigned order + 1
+  });
+
+  it('assigns new orders after the highest existing order (no collision) and skips backfilled tasks', async () => {
+    const { client, writes } = mockClient({
+      profiles: [profile('u', 'd', { taskCount: 1, nextTaskOrder: 6 })], // already has counters
+      categories: [defaultCategory('u', 'd', 2)],
+      tasks: [
+        task('ta', 'u', { categoryId: 'd', order: 5, createdAt: '2026-01-01', stepCount: 0, stepVersion: 1, nextStepOrder: 1 }),
+        task('tb', 'u', { categoryId: 'd', createdAt: '2026-01-02', stepCount: 0, stepVersion: 1, nextStepOrder: 1 }),
+      ],
+    });
+    const report = await run(client, true);
+    // Only tb lacks an order; it is placed after the existing max (5) → 6.
+    expect(report.taskOrdersBackfilled).toBe(1);
+    expect(report.profileTaskCountersBackfilled).toBe(0); // profile already has counters
+    const orderWrite = writes.find(
+      (w) => (w.input.Key as { PK: string }).PK === 'TASK#tb' && String(w.input.UpdateExpression).includes('#order'),
+    )!;
+    expect((orderWrite.input.ExpressionAttributeValues as Record<string, number>)[':order']).toBe(6);
+  });
+});
+
 describe('migration — idempotency', () => {
   const currentData = () => ({
-    profiles: [profile('u', 'd')],
+    profiles: [profile('u', 'd', { taskCount: 1, nextTaskOrder: 2 })],
     categories: [defaultCategory('u', 'd', 1)],
-    tasks: [task('t', 'u', { categoryId: 'd', stepCount: 1, stepVersion: 1, nextStepOrder: 2 })],
+    tasks: [task('t', 'u', { categoryId: 'd', order: 1, stepCount: 1, stepVersion: 1, nextStepOrder: 2 })],
     steps: [
       { PK: 'TASK#t', SK: stepSk('s'), entityType: 'TaskStep', stepId: 's', taskId: 't', order: 1 },
     ],

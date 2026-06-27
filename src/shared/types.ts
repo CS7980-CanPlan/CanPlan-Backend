@@ -31,6 +31,17 @@ export interface UserProfile {
    * explicit category fall into it.
    */
   defaultCategoryId?: string;
+  /**
+   * Internal owner-level task bookkeeping (not exposed in GraphQL), the per-owner twin of a
+   * Task's step metadata:
+   *  - `taskCount`     — number of Tasks the owner currently has (≤ 50); enforces the cap.
+   *  - `nextTaskOrder` — the `order` the next created Task receives (monotonic; never reused,
+   *                      so deleting a task leaves an order gap rather than reclaiming it).
+   * Maintained transactionally with each create/delete; backfilled for legacy profiles by the
+   * migration.
+   */
+  taskCount?: number;
+  nextTaskOrder?: number;
   createdAt: string;
   updatedAt?: string;
 }
@@ -101,6 +112,13 @@ export interface Task {
    * createTask; not part of the GraphQL Task type — clients query by ownerId/categoryId.
    */
   taskCategoryKey?: string;
+  /**
+   * Owner-defined display position across ALL of the owner's tasks (per-owner, not
+   * per-category). Assigned at creation (the owner's `nextTaskOrder`) and changed in bulk by
+   * updateTaskOrder; listTasksByOwner sorts on it. Gaps are allowed. Backfilled for legacy
+   * rows by the migration.
+   */
+  order?: number;
   /**
    * Internal step bookkeeping for concurrency-safe step management (not exposed in GraphQL):
    *  - `stepCount`     — number of TaskSteps under this task (≤ 99).
@@ -378,6 +396,21 @@ export interface ReorderTaskStepInput {
 export interface ReorderTaskStepsInput {
   taskId: string;
   steps: ReorderTaskStepInput[];
+}
+
+/** One task's target position in a whole-owner task reorder. */
+export interface TaskOrderInput {
+  taskId: string;
+  order: number;
+}
+
+/**
+ * Reorder ALL of the caller's tasks at once. `tasks` must be the complete current set: every
+ * one of the owner's taskIds exactly once, with unique positive `order` values (gaps allowed).
+ * Applied in one DynamoDB transaction (all-or-nothing); only each task's `order` changes.
+ */
+export interface UpdateTaskOrderInput {
+  tasks: TaskOrderInput[];
 }
 
 export interface CreateAssignmentInput {

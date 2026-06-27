@@ -87,6 +87,9 @@ describe('users handler — UserProfile', () => {
     // The profile stores the generated default category id.
     expect(profile.defaultCategoryId).toBe(category.categoryId);
     expect((result as { defaultCategoryId?: string }).defaultCategoryId).toBe(category.categoryId);
+    // A brand-new profile starts with zero tasks and the first task order at 1.
+    expect(profile.taskCount).toBe(0);
+    expect(profile.nextTaskOrder).toBe(1);
     // The category Put is guarded so a retry never writes a second default.
     const catPut = mockSend.mock.calls[1][0].input.TransactItems.find(
       (t: { Put: { Item: Record<string, unknown> } }) =>
@@ -97,7 +100,9 @@ describe('users handler — UserProfile', () => {
 
   it('createUserProfile re-call preserves the existing (validated) defaultCategoryId and creates no second category', async () => {
     mockSend
-      .mockResolvedValueOnce({ Item: { userId: 'sub-1', defaultCategoryId: 'existing-def', createdAt: 'orig' } }) // GET profile
+      .mockResolvedValueOnce({
+        Item: { userId: 'sub-1', defaultCategoryId: 'existing-def', createdAt: 'orig', taskCount: 4, nextTaskOrder: 5 },
+      }) // GET profile (with task counters)
       .mockResolvedValueOnce({
         Item: { categoryId: 'existing-def', ownerId: 'sub-1', isDefault: true, name: 'No Category' },
       }); // GET default category (validation)
@@ -109,6 +114,9 @@ describe('users handler — UserProfile', () => {
     expect(write.input.TransactItems).toBeUndefined();
     expect(write.input.Item.defaultCategoryId).toBe('existing-def');
     expect(write.input.Item.createdAt).toBe('orig');
+    // A re-call must NOT reset the owner's task counters (else createTask reuses orders).
+    expect(write.input.Item.taskCount).toBe(4);
+    expect(write.input.Item.nextTaskOrder).toBe(5);
     expect((result as { defaultCategoryId?: string }).defaultCategoryId).toBe('existing-def');
     // No TransactWrite anywhere → no duplicate default category.
     expect(mockSend.mock.calls.some((c) => c[0].input.TransactItems)).toBe(false);
