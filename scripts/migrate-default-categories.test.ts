@@ -36,12 +36,17 @@ const run = (client: never, apply: boolean) => runMigration({ client, table: 'T'
 beforeAll(() => jest.spyOn(console, 'log').mockImplementation(() => undefined));
 afterAll(() => (console.log as jest.Mock).mockRestore());
 
-const profile = (userId: string, defaultCategoryId?: string): Row => ({
+const profile = (
+  userId: string,
+  defaultCategoryId?: string,
+  extra: Record<string, unknown> = {},
+): Row => ({
   PK: `USER#${userId}`,
   SK: '#PROFILE',
   entityType: 'UserProfile',
   userId,
   ...(defaultCategoryId ? { defaultCategoryId } : {}),
+  ...extra,
 });
 const category = (ownerId: string, categoryId: string, extra: Record<string, unknown> = {}): Row => ({
   PK: `USER#${ownerId}`,
@@ -241,12 +246,14 @@ describe('migration — exactly one default', () => {
 
   it('is idempotent after repair (one default, demoted extra renamed) — no further changes', async () => {
     const { client, writes } = mockClient({
-      profiles: [profile('u5', 'd5a')],
+      profiles: [profile('u5', 'd5a', { taskCount: 1, nextTaskOrder: 2 })],
       categories: [
         defaultCategory('u5', 'd5a', 0), // surviving default, no tasks
         category('u5', 'd5b', { isDefault: false, name: 'Recovered Category d5b', taskCount: 1 }),
       ],
-      tasks: [task('t5', 'u5', { categoryId: 'd5b', stepCount: 0, stepVersion: 1, nextStepOrder: 1 })],
+      tasks: [
+        task('t5', 'u5', { categoryId: 'd5b', order: 1, stepCount: 0, stepVersion: 1, nextStepOrder: 1 }),
+      ],
     });
     const report = await run(client, true);
     expect(report.duplicateDefaults).toBe(0);
@@ -283,11 +290,50 @@ describe('migration — step metadata backfill', () => {
   });
 });
 
+describe('migration — task order + profile counter backfill', () => {
+  it('numbers legacy tasks by createdAt and backfills the owner profile counters', async () => {
+    const { client, writes } = mockClient({
+      profiles: [profile('u', 'd')], // legacy profile: no task counters
+      categories: [defaultCategory('u', 'd', 2)],
+      tasks: [
+        task('t2', 'u', { categoryId: 'd', createdAt: '2026-02-01', stepCount: 0, stepVersion: 1, nextStepOrder: 1 }),
+        task('t1', 'u', { categoryId: 'd', createdAt: '2026-01-01', stepCount: 0, stepVersion: 1, nextStepOrder: 1 }),
+      ],
+    });
+    const report = await run(client, true);
+    expect(report.taskOrdersBackfilled).toBe(2);
+    expect(report.profileCountersBackfilled).toBe(1);
+
+    const orderOf = (taskId: string) =>
+      writes.find(
+        (w) =>
+          w.name === 'UpdateCommand' &&
+          (w.input.Key as { PK: string }).PK === `TASK#${taskId}` &&
+          String(w.input.UpdateExpression).includes('#order'),
+      )!;
+    // Earlier createdAt is numbered first.
+    expect((orderOf('t1').input.ExpressionAttributeValues as Record<string, unknown>)[':o']).toBe(1);
+    expect((orderOf('t2').input.ExpressionAttributeValues as Record<string, unknown>)[':o']).toBe(2);
+
+    const counters = writes.find(
+      (w) =>
+        w.name === 'UpdateCommand' &&
+        (w.input.Key as { SK: string }).SK === '#PROFILE' &&
+        String(w.input.UpdateExpression).includes('nextTaskOrder'),
+    )!;
+    const cv = counters.input.ExpressionAttributeValues as Record<string, unknown>;
+    expect(cv[':c']).toBe(2); // taskCount = number of tasks
+    expect(cv[':n']).toBe(3); // nextTaskOrder = maxOrder + 1
+  });
+});
+
 describe('migration — idempotency', () => {
   const currentData = () => ({
-    profiles: [profile('u', 'd')],
+    profiles: [profile('u', 'd', { taskCount: 1, nextTaskOrder: 2 })],
     categories: [defaultCategory('u', 'd', 1)],
-    tasks: [task('t', 'u', { categoryId: 'd', stepCount: 1, stepVersion: 1, nextStepOrder: 2 })],
+    tasks: [
+      task('t', 'u', { categoryId: 'd', order: 1, stepCount: 1, stepVersion: 1, nextStepOrder: 2 }),
+    ],
     steps: [
       { PK: 'TASK#t', SK: stepSk('s'), entityType: 'TaskStep', stepId: 's', taskId: 't', order: 1 },
     ],
@@ -299,6 +345,7 @@ describe('migration — idempotency', () => {
     expect(dry.defaultsCreated + dry.defaultsRepaired + dry.tasksReparented).toBe(0);
     expect(dry.statusStripped + dry.taskCountsBackfilled + dry.stepsRekeyed).toBe(0);
     expect(dry.duplicatesRepaired + dry.stepMetaBackfilled).toBe(0);
+    expect(dry.taskOrdersBackfilled + dry.profileCountersBackfilled).toBe(0);
 
     const { client: client2, writes: writes2 } = mockClient(currentData());
     await run(client2, true);
