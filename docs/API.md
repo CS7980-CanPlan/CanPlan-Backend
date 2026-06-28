@@ -1,6 +1,6 @@
 # CanPlan 2.0 — Frontend API Reference
 
-_Last updated: 2026-06-22. Version: phase 1 (pre-authorization)._
+_Last updated: 2026-06-27. Version: phase 1 (pre-authorization)._
 
 > ## 🚨 Breaking change — categories, default category, Task status, TaskStep keys
 >
@@ -795,9 +795,10 @@ and re-checked in the resolver. A non-SystemAdmin caller gets an authorization e
 |---|---|
 | `listAllUsers(limit, nextToken)` | `UserProfileConnection` |
 | `listAllTasks(limit, nextToken)` | `TaskConnection` |
+| `adminGetUserData(userId!)` | `AdminUserData!` — full read-only snapshot of one user; see below |
 
-Both take an optional `limit` (page size) and `nextToken`, and return
-`{ items, nextToken }`. `nextToken` is an **opaque, base64-encoded** cursor — pass
+`listAllUsers`/`listAllTasks` take an optional `limit` (page size) and `nextToken`, and
+return `{ items, nextToken }`. `nextToken` is an **opaque, base64-encoded** cursor — pass
 the value you got back to fetch the next page; it's `null` on the last page.
 
 ```graphql
@@ -821,6 +822,39 @@ do {
 
 `listAllTasks` returns Task `#META` items only (TaskStep items have
 `entityType = "TaskStep"`, so they don't appear here).
+
+> **`adminGetUserData(userId)` is a one-shot, unpaginated snapshot** of everything one
+> user owns — built for the admin user-detail view. It returns a single `AdminUserData`,
+> **not** a connection: there is no `limit`/`nextToken`, and the backend internally pages
+> through each list to completion. All reads are **PK queries + GSIs (no Scan)**, fired in
+> parallel:
+>
+> | Field | Type | Source |
+> |---|---|---|
+> | `userId` | `ID!` | echoes the (trimmed) input id |
+> | `profile` | `UserProfile` | the user's `#PROFILE` row · `null` if none exists |
+> | `tasks` | `[Task!]!` | the user's owned task templates via `taskOwnerIndex` — Task `#META` items only, **no nested `steps`** (same projection as `listAllTasks`) |
+> | `categories` | `[Category!]!` | every `CATEGORY#…` row in the user's partition (incl. their default) |
+> | `assignments` | `[Assignment!]!` | every `ASSIGN#…` row in the user's partition |
+> | `supportLinks` | `[SupportLink!]!` | links in **both** directions — where the user is the supporter and where they are the primary user — deduped by the `(supporterId, primaryUserId)` pair |
+>
+> `userId` is the app-level id (= Cognito `sub`); a blank id is a `VALIDATION` error. Lists
+> come back **empty (`[]`), not `null`**, when the user owns nothing in that bucket. Like
+> the other admin APIs it is gated to the `SystemAdmin` group at both the AppSync edge and
+> in the resolver.
+>
+> ```graphql
+> query AdminGetUserData($userId: ID!) {
+>   adminGetUserData(userId: $userId) {
+>     userId
+>     profile { userId displayName email role }
+>     tasks { taskId title categoryId createdAt }
+>     categories { categoryId name isDefault }
+>     assignments { assignmentId taskId status dueDate }
+>     supportLinks { supporterId primaryUserId status }
+>   }
+> }
+> ```
 
 ---
 
