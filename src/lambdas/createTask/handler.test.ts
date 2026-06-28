@@ -199,6 +199,58 @@ describe('createTask handler', () => {
     expect(countUpdate.Update.ExpressionAttributeValues[':delta']).toBe(1);
   });
 
+  /** Stub a profile that already carries the per-owner task counters. */
+  function stubProfileWithCounters(taskCount: number, nextTaskOrder: number) {
+    mockSend.mockImplementation((cmd: { constructor: { name: string }; input: { Key?: { SK?: string } } }) => {
+      if (cmd.constructor.name === 'GetCommand') {
+        const sk = cmd.input.Key?.SK ?? '';
+        if (sk === '#PROFILE')
+          return Promise.resolve({
+            Item: { userId: 'sup-1', defaultCategoryId: 'def-1', taskCount, nextTaskOrder },
+          });
+        if (sk.startsWith('CATEGORY#'))
+          return Promise.resolve({
+            Item: { categoryId: 'def-1', ownerId: 'sup-1', isDefault: true, name: 'No Category', taskCount: 0 },
+          });
+      }
+      return Promise.resolve({});
+    });
+  }
+
+  it('assigns order from the profile counter and advances it in the create transaction', async () => {
+    stubProfileWithCounters(3, 7);
+    const result = await handler(makeEvent({ title: 'T' }));
+    const meta = writtenItems().find((i) => i.SK === '#META')!;
+    expect(meta.order).toBe(7);
+    expect(result.order).toBe(7);
+    const profileUpdate = transaction().input.TransactItems.find(
+      (t: { Update?: { Key?: { SK?: string } } }) => t.Update?.Key?.SK === '#PROFILE',
+    );
+    expect(profileUpdate.Update.UpdateExpression).toContain('ADD taskCount :one, nextTaskOrder :one');
+    expect(profileUpdate.Update.ConditionExpression).toContain('taskCount < :max');
+    expect(profileUpdate.Update.ExpressionAttributeValues[':reserved']).toBe(7);
+    expect(profileUpdate.Update.ExpressionAttributeValues[':max']).toBe(50);
+  });
+
+  it('rejects creating a task past the 50-per-owner cap', async () => {
+    stubProfileWithCounters(50, 51);
+    await expect(handler(makeEvent({ title: 'T' }))).rejects.toThrow('at most 50 tasks');
+    expect(transaction()).toBeUndefined();
+  });
+
+  it('initializes counters and assigns order 1 when the profile has none (legacy)', async () => {
+    // Default stub returns a profile without counters.
+    const result = await handler(makeEvent({ title: 'T' }));
+    const meta = writtenItems().find((i) => i.SK === '#META')!;
+    expect(meta.order).toBe(1);
+    expect(result.order).toBe(1);
+    const profileUpdate = transaction().input.TransactItems.find(
+      (t: { Update?: { Key?: { SK?: string } } }) => t.Update?.Key?.SK === '#PROFILE',
+    );
+    expect(profileUpdate.Update.ConditionExpression).toContain('attribute_not_exists(taskCount)');
+    expect(profileUpdate.Update.ExpressionAttributeValues[':two']).toBe(2);
+  });
+
   it('rejects a missing/foreign category, and a category being deleted', async () => {
     stubDb({ category: null }); // CATEGORY# GET → not found
     await expect(handler(makeEvent({ title: 'T', categoryId: 'nope' }))).rejects.toThrow(
@@ -254,10 +306,10 @@ describe('createTask handler', () => {
   });
 
   it.each([
-    { coverImageS3Key: undefined, stepCount: 99, maxSteps: 98 },
-    { coverImageS3Key: 'media/pending/task-cover/u.png', stepCount: 98, maxSteps: 97 },
+    { coverImageS3Key: undefined, stepCount: 98, maxSteps: 97 },
+    { coverImageS3Key: 'media/pending/task-cover/u.png', stepCount: 97, maxSteps: 96 },
   ])(
-    'rejects $stepCount steps when the limit is $maxSteps (task + category check + cover)',
+    'rejects $stepCount steps when the limit is $maxSteps (task + category + profile check + cover)',
     async ({ coverImageS3Key, stepCount, maxSteps }) => {
       const steps = Array.from({ length: stepCount }, (_, i) => ({ text: `Step ${i + 1}` }));
       await expect(handler(makeEvent({ title: 'T', steps, coverImageS3Key }))).rejects.toThrow(

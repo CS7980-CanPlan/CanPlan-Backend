@@ -175,6 +175,144 @@ describe('tasks handler — reads + authorization', () => {
       handler(event('listTasksByCategory', { ownerId: 'someone-else', categoryId: 'c' }, OWNER)),
     ).rejects.toThrow('does not own this resource');
   });
+
+  it('listTasksByOwner returns tasks sorted by ascending order', async () => {
+    mockSend.mockResolvedValueOnce({
+      Items: [
+        meta({ taskId: 'b', PK: 'TASK#b', order: 3 }),
+        meta({ taskId: 'a', PK: 'TASK#a', order: 1 }),
+        meta({ taskId: 'c', PK: 'TASK#c', order: 2 }),
+      ],
+    });
+    const result = (await handler(event('listTasksByOwner', { ownerId: OWNER }))) as Connection<Task>;
+    expect(result.items.map((t) => t.order)).toEqual([1, 2, 3]);
+    expect(result.items.map((t) => t.taskId)).toEqual(['a', 'c', 'b']);
+  });
+
+  it('listTasksByOwner paginates the sorted set with an opaque offset token', async () => {
+    mockSend.mockResolvedValue({
+      Items: [
+        meta({ taskId: 'a', PK: 'TASK#a', order: 1 }),
+        meta({ taskId: 'b', PK: 'TASK#b', order: 2 }),
+        meta({ taskId: 'c', PK: 'TASK#c', order: 3 }),
+      ],
+    });
+    const page1 = (await handler(
+      event('listTasksByOwner', { ownerId: OWNER, limit: 2 }),
+    )) as Connection<Task>;
+    expect(page1.items.map((t) => t.order)).toEqual([1, 2]);
+    expect(page1.nextToken).not.toBeNull();
+    const page2 = (await handler(
+      event('listTasksByOwner', { ownerId: OWNER, limit: 2, nextToken: page1.nextToken! }),
+    )) as Connection<Task>;
+    expect(page2.items.map((t) => t.order)).toEqual([3]);
+    expect(page2.nextToken).toBeNull();
+  });
+});
+
+describe('tasks handler — updateTaskOrder', () => {
+  const ownedTasks = () => ({
+    Items: [
+      meta({ taskId: 'a', PK: 'TASK#a', order: 1 }),
+      meta({ taskId: 'b', PK: 'TASK#b', order: 2 }),
+      meta({ taskId: 'c', PK: 'TASK#c', order: 3 }),
+    ],
+  });
+  const onlyQueryReturns = () =>
+    mockSend.mockImplementation((cmd: { constructor: { name: string } }) =>
+      Promise.resolve(cmd.constructor.name === 'QueryCommand' ? ownedTasks() : {}),
+    );
+
+  it('reorders the full set (owner from identity) and returns the tasks sorted ascending', async () => {
+    onlyQueryReturns();
+    const result = (await handler(
+      event('updateTaskOrder', {
+        input: {
+          tasks: [
+            { taskId: 'a', order: 3 },
+            { taskId: 'b', order: 2 },
+            { taskId: 'c', order: 1 },
+          ],
+        },
+      }),
+    )) as Task[];
+    expect(result.map((t) => [t.taskId, t.order])).toEqual([
+      ['c', 1],
+      ['b', 2],
+      ['a', 3],
+    ]);
+    const tx = calls().find((c) => c.input.TransactItems)!;
+    expect(tx.input.TransactItems).toHaveLength(3);
+    for (const item of tx.input.TransactItems as Array<{
+      Update: {
+        ConditionExpression: string;
+        ExpressionAttributeNames: Record<string, string>;
+        ExpressionAttributeValues: Record<string, unknown>;
+      };
+    }>) {
+      expect(item.Update.ConditionExpression).toContain('ownerId = :owner');
+      expect(item.Update.ExpressionAttributeValues[':owner']).toBe(OWNER);
+      expect(item.Update.ExpressionAttributeNames['#order']).toBe('order');
+    }
+  });
+
+  it('rejects an incomplete task set (must list every owned task)', async () => {
+    onlyQueryReturns();
+    await expect(
+      handler(
+        event('updateTaskOrder', {
+          input: {
+            tasks: [
+              { taskId: 'a', order: 1 },
+              { taskId: 'b', order: 2 },
+            ],
+          },
+        }),
+      ),
+    ).rejects.toThrow('must include all');
+  });
+
+  it('rejects a taskId not owned by the caller', async () => {
+    onlyQueryReturns();
+    await expect(
+      handler(
+        event('updateTaskOrder', {
+          input: {
+            tasks: [
+              { taskId: 'a', order: 1 },
+              { taskId: 'b', order: 2 },
+              { taskId: 'x', order: 3 },
+            ],
+          },
+        }),
+      ),
+    ).rejects.toThrow('task x not found for owner');
+  });
+
+  it('rejects duplicate orders and non-positive orders before any read', async () => {
+    await expect(
+      handler(
+        event('updateTaskOrder', {
+          input: {
+            tasks: [
+              { taskId: 'a', order: 1 },
+              { taskId: 'b', order: 1 },
+            ],
+          },
+        }),
+      ),
+    ).rejects.toThrow('appears more than once');
+    await expect(
+      handler(event('updateTaskOrder', { input: { tasks: [{ taskId: 'a', order: 0 }] } })),
+    ).rejects.toThrow('positive integer');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unauthenticated caller', async () => {
+    await expect(
+      handler(event('updateTaskOrder', { input: { tasks: [{ taskId: 'a', order: 1 }] } }, null)),
+    ).rejects.toThrow('authenticated user is required');
+  });
 });
 
 describe('tasks handler — updateTask', () => {

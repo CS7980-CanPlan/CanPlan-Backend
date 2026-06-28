@@ -1,6 +1,6 @@
 # CanPlan 2.0 — Frontend API Reference
 
-_Last updated: 2026-06-22. Version: phase 1 (pre-authorization)._
+_Last updated: 2026-06-28. Version: phase 1 (pre-authorization)._
 
 > ## 🚨 Breaking change — categories, default category, Task status, TaskStep keys
 >
@@ -267,7 +267,7 @@ schedule** — scheduling a task for a user is a separate operation, see `create
 | `title` | `String!` | ✅ | Non-empty after trimming |
 | `categoryId` | `ID` | — | Optional; omitted/null ⇒ the owner's default category. A **blank string is rejected**. A supplied id must be a real, owned, non-deleting Category (see below) |
 | `description` | `String` | — | Optional |
-| `steps` | `[CreateTaskStepNestedInput!]` | — | Ordered; each becomes a `STEP#<stepId>` item; max **98**, or max **97** when `coverImageS3Key` is supplied |
+| `steps` | `[CreateTaskStepNestedInput!]` | — | Ordered; each becomes a `STEP#<stepId>` item; max **97**, or max **96** when `coverImageS3Key` is supplied |
 | `coverImageS3Key` | `String` | — | Optional cover image (pending key from `createTaskCoverImageUploadUrl`) |
 
 > **No `ownerId`.** The owner is the caller's Cognito `sub`; a client-supplied `ownerId`
@@ -290,8 +290,19 @@ pointer and referenced Category: correct owner, exact `No Category` name, `isDef
 and no deletion in progress. A bad legacy row fails with a migration-required validation error.
 
 **Step limit & the 100-item transaction.** A create is one DynamoDB transaction carrying
-the Task, one row per step, a category condition-check, and (optionally) the cover-image
-row — capped at 100 items. So a task may have at most **98** steps (97 with a cover image).
+the Task, one row per step, a category condition-check, the owner's profile-counter update
+(see _Ordering_ below), and (optionally) the cover-image row — capped at 100 items. So a
+task may have at most **97** steps (96 with a cover image).
+
+**Ordering & the per-owner task cap.** Every task gets a per-owner display **`order`**
+(`Task.order`, an `Int`), assigned automatically on create from a monotonic counter on the
+owner's profile (`nextTaskOrder`) — you do **not** pass `order` to `createTask`. The same
+transaction increments the owner's `taskCount`, which **caps an owner at 50 tasks**: a 51st
+`createTask` is rejected with `VALIDATION` (`an owner may have at most 50 tasks`). Orders are
+per-owner and may have **gaps** — `deleteTask` decrements `taskCount` but never reclaims or
+renumbers orders, and gaps are harmless. Reorder the whole set with
+[`updateTaskOrder`](#tasks--steps); `listTasksByOwner` returns tasks sorted by ascending
+`order` (un-ordered legacy rows last). `Task.order` is `null` only on un-migrated legacy rows.
 
 **No schedule on a Task.** A `Task` is a reusable template only and stores no scheduling
 fields (`scheduleRule`, `schedule`, `nextOccurrenceAt`, `notificationEnabled` were all
@@ -307,6 +318,7 @@ mutation CreateTask($input: CreateTaskInput!) {
     ownerId
     title
     categoryId
+    order
     createdAt
     steps { stepId order text description }
   }
@@ -467,13 +479,14 @@ client-supplied id)
 |---|---|---|
 | `getTask` | `taskId!` | `Task` · `null` if not found · `steps` is `null` here (use `listTaskSteps`) · owner-only |
 | `listTaskSteps` | `taskId!, limit, nextToken` | `TaskStepConnection!` — steps sorted by ascending `order`, order preserved across pages; owner-only; see below |
-| `listTasksByOwner` | `ownerId!, limit, nextToken` | `TaskConnection!` — `ownerId` must be the caller |
+| `listTasksByOwner` | `ownerId!, limit, nextToken` | `TaskConnection!` — tasks sorted by ascending per-owner `order` (un-ordered legacy rows last), order preserved across pages; `ownerId` must be the caller |
 | `listTasksByCategory` | `ownerId!, categoryId!, limit, nextToken` | `TaskConnection!` — tasks in one real category; **`categoryId` is required** and is validated (owned + exists + not deleting → `NOT_FOUND`/`VALIDATION`, never a silent empty result); `ownerId` must be the caller |
 | `updateTask` | `input: { taskId!, title, categoryId, description, coverImageS3Key }` | `Task` — **partial edit**; owner-only; see below |
 | `createTaskStep` | `input: { taskId!, order!, text!, description, media }` | `TaskStep` — **appends** one step at the end, optionally with initial type-specific media (owner-only); see below |
 | `updateTaskStep` | `input: { taskId!, stepId!, text, description, media }` | `TaskStep` — **partial edit** of one step and its type-specific media slots; see below |
 | `deleteTaskStep` | `input: { taskId!, stepId! }` | `TaskStep` — the deleted step; also deletes all its media assets; see below |
 | `reorderTaskSteps` | `input: { taskId!, steps: [{ stepId!, order! }] }` | `[TaskStep!]!` — atomically renumbers all steps; see below |
+| `updateTaskOrder` | `input: { tasks: [{ taskId!, order! }] }` | `[Task!]!` — atomically reorders **all of the caller's tasks** in one transaction; see below |
 | `deleteTask` | `taskId!` | `Task` — the deleted template (minus internal fields); cascades to all its steps + media; see below |
 
 > **`updateTask` is a partial edit.** Only the fields you include change; omitted
@@ -524,6 +537,37 @@ client-supplied id)
 >   { "stepId": "step-c", "order": 1 },
 >   { "stepId": "step-a", "order": 2 },
 >   { "stepId": "step-b", "order": 3 }
+> ] } }
+> ```
+
+> **`updateTaskOrder` atomically reorders all of the caller's tasks.** This sets the
+> per-owner `Task.order` across the owner's whole task list (the task-level analogue of
+> `reorderTaskSteps`, which orders steps *within* one task). The owner is taken from the
+> Cognito identity — there is **no `ownerId` in the input**. Supply the **complete current
+> set** of your tasks as `[{ taskId, order }]` (not a partial patch):
+>
+> - Every `order` must be a **positive integer** and **unique** across the list; values
+>   **need not be contiguous `1..N`** — gaps are allowed (the client decides the spacing).
+> - The list must match your tasks **exactly**: each owned `taskId` appears **once**, with no
+>   missing or extra task. A wrong count is a `VALIDATION` error; an unknown/foreign `taskId`
+>   is `NOT_FOUND`. The cap is the same 50 tasks per owner.
+>
+> All tasks' `order` attributes are updated in **one DynamoDB transaction** (all-or-nothing);
+> task ids, steps, media, categories, and task assignments/instances are **never** touched. If the
+> owner's task set changed concurrently (a task was added/removed between your read and this
+> call), the transaction is canceled and you get a retryable `VALIDATION` error — reload your
+> tasks and retry. Returns the tasks sorted by ascending `order`.
+>
+> ```graphql
+> mutation UpdateTaskOrder($input: UpdateTaskOrderInput!) {
+>   updateTaskOrder(input: $input) { taskId title order updatedAt }
+> }
+> ```
+> ```json
+> { "input": { "tasks": [
+>   { "taskId": "task-c", "order": 1 },
+>   { "taskId": "task-a", "order": 2 },
+>   { "taskId": "task-b", "order": 3 }
 > ] } }
 > ```
 
@@ -793,9 +837,10 @@ and re-checked in the resolver. A non-SystemAdmin caller gets an authorization e
 |---|---|
 | `listAllUsers(limit, nextToken)` | `UserProfileConnection` |
 | `listAllTasks(limit, nextToken)` | `TaskConnection` |
+| `adminGetUserData(userId!)` | `AdminUserData!` — full read-only snapshot of one user; see below |
 
-Both take an optional `limit` (page size) and `nextToken`, and return
-`{ items, nextToken }`. `nextToken` is an **opaque, base64-encoded** cursor — pass
+`listAllUsers`/`listAllTasks` take an optional `limit` (page size) and `nextToken`, and
+return `{ items, nextToken }`. `nextToken` is an **opaque, base64-encoded** cursor — pass
 the value you got back to fetch the next page; it's `null` on the last page.
 
 ```graphql
@@ -819,6 +864,39 @@ do {
 
 `listAllTasks` returns Task `#META` items only (TaskStep items have
 `entityType = "TaskStep"`, so they don't appear here).
+
+> **`adminGetUserData(userId)` is a one-shot, unpaginated snapshot** of everything one
+> user owns — built for the admin user-detail view. It returns a single `AdminUserData`,
+> **not** a connection: there is no `limit`/`nextToken`, and the backend internally pages
+> through each list to completion. All reads are **PK queries + GSIs (no Scan)**, fired in
+> parallel:
+>
+> | Field | Type | Source |
+> |---|---|---|
+> | `userId` | `ID!` | echoes the (trimmed) input id |
+> | `profile` | `UserProfile` | the user's `#PROFILE` row · `null` if none exists |
+> | `tasks` | `[Task!]!` | the user's owned task templates via `taskOwnerIndex` — Task `#META` items only, **no nested `steps`** (same projection as `listAllTasks`) |
+> | `categories` | `[Category!]!` | every `CATEGORY#…` row in the user's partition (incl. their default) |
+> | `taskAssignments` | `[TaskAssignment!]!` | every `TASK_ASSIGNMENT#…` row in the user's partition (active + ended schedule rules) |
+> | `supportLinks` | `[SupportLink!]!` | links in **both** directions — where the user is the supporter and where they are the primary user — deduped by the `(supporterId, primaryUserId)` pair |
+>
+> `userId` is the app-level id (= Cognito `sub`); a blank id is a `VALIDATION` error. Lists
+> come back **empty (`[]`), not `null`**, when the user owns nothing in that bucket. Like
+> the other admin APIs it is gated to the `SystemAdmin` group at both the AppSync edge and
+> in the resolver.
+>
+> ```graphql
+> query AdminGetUserData($userId: ID!) {
+>   adminGetUserData(userId: $userId) {
+>     userId
+>     profile { userId displayName email role }
+>     tasks { taskId title categoryId order createdAt }
+>     categories { categoryId name isDefault }
+>     taskAssignments { assignmentId taskId scheduleType scheduledFor active }
+>     supportLinks { supporterId primaryUserId status }
+>   }
+> }
+> ```
 
 ---
 
@@ -1010,8 +1088,8 @@ Planned but not implemented — don't build against them:
   (`deleteTask`), task steps (`deleteTaskStep`), task assignments (`deleteTaskAssignment`,
   soft delete), and media assets (`deleteMediaAsset`). **Update** exists for categories
   (`updateCategory`), tasks (`updateTask`), task steps (`updateTaskStep`), task-step ordering
-  (`reorderTaskSteps`), and task-instance status (`updateTaskInstanceStatus`); other entities
-  have no update yet.
+  (`reorderTaskSteps`), whole-owner task ordering (`updateTaskOrder`), and task-instance
+  status (`updateTaskInstanceStatus`); other entities have no update yet.
 - **Report generation** — the `Report` type exists in the schema, but no query or
   mutation is exposed for it yet.
 - **Streaming AI responses** — `generateTaskSteps` is request/response only.

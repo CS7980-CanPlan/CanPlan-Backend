@@ -107,6 +107,10 @@ type Task {
   # The real Category this task belongs to. Always set — a task created without an
   # explicit category is filed under its owner's default category.
   categoryId: ID!
+  # Per-owner global display order across all of the owner's tasks (gaps allowed; never
+  # renumbered on delete). Assigned on create from the owner's monotonic counter; change the
+  # whole set with updateTaskOrder. Null only on un-migrated legacy rows.
+  order: Int
   description: String
   # Optional single cover image — the id of an IMAGE MediaAsset under this task. Null
   # when the task has no cover. Fetch a viewable URL via getMediaDownloadUrl(taskId,
@@ -469,6 +473,20 @@ input ReorderTaskStepsInput {
   steps: [ReorderTaskStepInput!]!
 }
 
+# One task's target position in a whole-owner reorder.
+input TaskOrderInput {
+  taskId: ID!
+  order: Int!
+}
+
+# Atomically reorder ALL of the caller's tasks. `tasks` must be the complete current set:
+# every owned taskId exactly once, with positive, mutually-unique `order` values (gaps
+# allowed — not required to be contiguous 1..N). Applied in one DynamoDB transaction
+# (all-or-nothing); only the `order` attribute changes. The owner is the Cognito identity.
+input UpdateTaskOrderInput {
+  tasks: [TaskOrderInput!]!
+}
+
 # Identifies one TaskStep for deletion. Deleting it also deletes every media asset attached
 # to the step (metadata rows + S3 objects), if any. Assets are never shared between steps or
 # the cover. Assignments/AssignmentSteps are never touched.
@@ -751,6 +769,10 @@ type Mutation {
   # Returns the steps sorted by ascending order. Step ids, media, and assignments are
   # untouched.
   reorderTaskSteps(input: ReorderTaskStepsInput!): [TaskStep!]!
+  # Atomically reorder ALL of the caller's tasks (must supply the complete current set with
+  # positive, unique orders). Returns the tasks sorted by ascending order. The owner is taken
+  # from the Cognito identity, never the input.
+  updateTaskOrder(input: UpdateTaskOrderInput!): [Task!]!
   # Delete a task template and all of its TaskSteps. REJECTED while any active TaskAssignment
   # still references it (end/delete those first). TaskInstance/TaskInstanceStep snapshots under
   # USER# partitions are not touched. Returns the deleted Task.

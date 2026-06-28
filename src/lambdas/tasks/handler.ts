@@ -7,10 +7,11 @@ import {
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { assertNoActiveAssignmentsForTask } from '../../shared/assignment';
-import { queryAllItems } from '../../shared/batch';
-import { assertCallerOwns } from '../../shared/authz';
+import { queryAll, queryAllItems } from '../../shared/batch';
+import { assertCallerOwns, requireCaller } from '../../shared/authz';
 import { assertUsableCategory, categoryCountDelta } from '../../shared/category';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
+import { MAX_TASKS_PER_OWNER } from '../../shared/task';
 import {
   ENTITY,
   MEDIA_PREFIX,
@@ -51,6 +52,7 @@ import type {
   Task,
   TaskStep,
   UpdateTaskInput,
+  UpdateTaskOrderInput,
   UpdateTaskStepInput,
 } from '../../shared/types';
 
@@ -71,7 +73,9 @@ const MAX_STEPS_PER_TASK = 99;
  */
 export const handler = async (
   event: AppSyncEvent<Record<string, unknown>>,
-): Promise<Task | TaskStep | TaskStep[] | Connection<Task> | Connection<TaskStep> | null> => {
+): Promise<
+  Task | Task[] | TaskStep | TaskStep[] | Connection<Task> | Connection<TaskStep> | null
+> => {
   const { arguments: args, identity } = event;
   switch (event.info?.fieldName) {
     case 'getTask':
@@ -97,6 +101,8 @@ export const handler = async (
       return deleteTaskStep(identity, args.input as DeleteTaskStepInput);
     case 'reorderTaskSteps':
       return reorderTaskSteps(identity, args.input as ReorderTaskStepsInput);
+    case 'updateTaskOrder':
+      return updateTaskOrder(identity, args.input as UpdateTaskOrderInput);
     case 'deleteTask':
       return deleteTask(identity, args.taskId as string);
     default:
@@ -167,6 +173,13 @@ function decodeOffset(token?: string): number {
   return offset;
 }
 
+/**
+ * listTasksByOwner — return an owner's tasks in ascending per-owner `order`, with order
+ * preserved ACROSS pages. An owner holds at most 50 tasks, so we read the whole (small) set
+ * and sort it by `order` (taskId as a stable tiebreaker, un-ordered legacy rows last), then
+ * paginate in application code — mirroring listTaskSteps. `nextToken` is an opaque app-level
+ * offset, NOT a DynamoDB key, and is null on the last page.
+ */
 async function listTasksByOwner(
   identity: AppSyncIdentity | undefined,
   ownerId: string,
@@ -174,18 +187,40 @@ async function listTasksByOwner(
 ): Promise<Connection<Task>> {
   if (!ownerId?.trim()) throw new ValidationError('ownerId is required');
   assertCallerOwns(identity, ownerId.trim());
-  // taskOwnerIndex is keyed on ownerId/createdAt. MediaAsset items also carry an
-  // ownerId, so filter to Task #META rows by entityType.
-  return queryPage<Task>(
-    {
-      TableName: TABLE_NAME,
-      IndexName: TASK_OWNER_INDEX,
-      KeyConditionExpression: 'ownerId = :owner',
-      FilterExpression: 'entityType = :task',
-      ExpressionAttributeValues: { ':owner': ownerId.trim(), ':task': ENTITY.TASK },
-    },
-    page,
+
+  const all = await queryAllOwnedTasks(ownerId.trim());
+  all.sort(
+    (a, b) =>
+      orderValue(a) - orderValue(b) || (a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0),
   );
+
+  const offset = decodeOffset(page.nextToken);
+  if (offset < 0 || offset > all.length) throw new ValidationError('invalid nextToken');
+  const limit = typeof page.limit === 'number' && page.limit > 0 ? page.limit : all.length;
+  const slice = all.slice(offset, offset + limit);
+  const nextOffset = offset + slice.length;
+  const nextToken = nextOffset < all.length ? encodeNextToken({ offset: nextOffset }) : null;
+  return { items: slice, nextToken };
+}
+
+/** Sort key for a task's order; un-ordered legacy rows sort last (after every ordered task). */
+function orderValue(task: Task): number {
+  return typeof task.order === 'number' ? task.order : Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * All of an owner's Task #META rows (≤ 50), via taskOwnerIndex, fully paginated. The index is
+ * keyed on ownerId and projects every attribute; MediaAsset items also carry an ownerId, so
+ * filter to Task rows by entityType.
+ */
+async function queryAllOwnedTasks(ownerId: string): Promise<Task[]> {
+  return queryAll<Task>({
+    TableName: TABLE_NAME,
+    IndexName: TASK_OWNER_INDEX,
+    KeyConditionExpression: 'ownerId = :owner',
+    FilterExpression: 'entityType = :task',
+    ExpressionAttributeValues: { ':owner': ownerId, ':task': ENTITY.TASK },
+  });
 }
 
 async function listTasksByCategory(
@@ -1062,6 +1097,89 @@ async function deleteTaskStep(
   }
 
   return withStepMedia(step, stepMedia);
+}
+
+/**
+ * updateTaskOrder — atomically reorder ALL of the caller's tasks. The request must carry the
+ * owner's COMPLETE current task set: every owned taskId exactly once, with positive,
+ * mutually-unique `order` values (gaps allowed; NOT required to be contiguous 1..N — that is
+ * the one relaxation from reorderTaskSteps). Every task's `order` is updated in one transaction
+ * (all-or-nothing), each guarded on the task still being owned by the caller. The owner is the
+ * authenticated identity — never the input. Returns the tasks sorted by ascending order.
+ */
+async function updateTaskOrder(
+  identity: AppSyncIdentity | undefined,
+  input: UpdateTaskOrderInput,
+): Promise<Task[]> {
+  const ownerId = requireCaller(identity);
+  const tasks = input?.tasks;
+  if (!Array.isArray(tasks) || tasks.length === 0) {
+    throw new ValidationError('tasks is required and must list the complete current task set');
+  }
+  if (tasks.length > MAX_TASKS_PER_OWNER) {
+    throw new ValidationError(`an owner may have at most ${MAX_TASKS_PER_OWNER} tasks`);
+  }
+
+  const orderByTaskId = new Map<string, number>();
+  const seenOrders = new Set<number>();
+  for (const t of tasks) {
+    const id = t?.taskId?.trim();
+    if (!id) throw new ValidationError('each task requires a taskId');
+    if (orderByTaskId.has(id)) throw new ValidationError(`taskId ${id} appears more than once`);
+    if (!Number.isInteger(t.order) || t.order < 1) {
+      throw new ValidationError(`order for task ${id} must be a positive integer`);
+    }
+    if (seenOrders.has(t.order)) throw new ValidationError(`order ${t.order} appears more than once`);
+    orderByTaskId.set(id, t.order);
+    seenOrders.add(t.order);
+  }
+
+  // The request must match the owner's actual tasks exactly (no missing/extra task).
+  const current = await queryAllOwnedTasks(ownerId);
+  if (current.length !== orderByTaskId.size) {
+    throw new ValidationError(
+      `updateTaskOrder must include all of the owner's ${current.length} task(s); received ${orderByTaskId.size}`,
+    );
+  }
+  for (const id of orderByTaskId.keys()) {
+    if (!current.some((task) => task.taskId === id)) {
+      throw new NotFoundError(`task ${id} not found for owner ${ownerId}`);
+    }
+  }
+
+  const now = new Date().toISOString();
+  // One atomic transaction sets every task's `order` in place (stable TASK#<id>/#META keys, so
+  // no key rewrite), each guarded on the row still being owned by the caller. `order` is a
+  // DynamoDB reserved word — alias it. current.length ≤ 50 ≤ the 100-item transaction limit.
+  const updates = current.map((task) => ({
+    Update: {
+      TableName: TABLE_NAME,
+      Key: { PK: taskPk(task.taskId), SK: META_SK },
+      UpdateExpression: 'SET #order = :order, updatedAt = :now',
+      ConditionExpression: 'attribute_exists(PK) AND ownerId = :owner',
+      ExpressionAttributeNames: { '#order': 'order' },
+      ExpressionAttributeValues: {
+        ':order': orderByTaskId.get(task.taskId),
+        ':owner': ownerId,
+        ':now': now,
+      },
+    },
+  }));
+  try {
+    await dynamo.send(new TransactWriteCommand({ TransactItems: updates }));
+  } catch (err) {
+    if ((err as { name?: string }).name === 'TransactionCanceledException') {
+      throw new ValidationError(
+        "updateTaskOrder: the owner's tasks changed concurrently (a task was added or removed); " +
+          'reload the tasks and retry',
+      );
+    }
+    throw err;
+  }
+
+  return current
+    .map((task) => ({ ...task, order: orderByTaskId.get(task.taskId)!, updatedAt: now }))
+    .sort((a, b) => a.order - b.order);
 }
 
 /**

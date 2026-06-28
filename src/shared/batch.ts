@@ -49,26 +49,35 @@ export async function queryAllKeys(pk: string, skPrefix?: string): Promise<ItemK
 }
 
 /**
+ * Run an arbitrary Query, following pagination so the result is complete regardless of row
+ * count. The caller supplies the full QueryCommand input (table, key condition, any
+ * index/filter/projection); `ExclusiveStartKey` is threaded here. Use this for queries that
+ * `queryAllItems` can't express — a GSI lookup, a FilterExpression, etc.
+ */
+export async function queryAll<T>(
+  input: ConstructorParameters<typeof QueryCommand>[0],
+): Promise<T[]> {
+  const items: T[] = [];
+  let startKey: Record<string, unknown> | undefined;
+  do {
+    const result = await dynamo.send(new QueryCommand({ ...input, ExclusiveStartKey: startKey }));
+    items.push(...((result.Items as T[]) ?? []));
+    startKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+  } while (startKey);
+  return items;
+}
+
+/**
  * Collect every full item under `pk` whose SK begins with `skPrefix`, following Query
  * pagination. Unlike `queryAllKeys` this returns the whole row (e.g. so a cascade delete
  * can read each MediaAsset's `s3Key`), at the cost of reading every attribute.
  */
 export async function queryAllItems<T>(pk: string, skPrefix: string): Promise<T[]> {
-  const items: T[] = [];
-  let startKey: Record<string, unknown> | undefined;
-  do {
-    const result = await dynamo.send(
-      new QueryCommand({
-        TableName: TABLE_NAME,
-        KeyConditionExpression: 'PK = :pk AND begins_with(SK, :prefix)',
-        ExpressionAttributeValues: { ':pk': pk, ':prefix': skPrefix },
-        ExclusiveStartKey: startKey,
-      }),
-    );
-    items.push(...((result.Items as T[]) ?? []));
-    startKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
-  } while (startKey);
-  return items;
+  return queryAll<T>({
+    TableName: TABLE_NAME,
+    KeyConditionExpression: 'PK = :pk AND begins_with(SK, :prefix)',
+    ExpressionAttributeValues: { ':pk': pk, ':prefix': skPrefix },
+  });
 }
 
 /**
