@@ -11,6 +11,16 @@ function synth() {
 }
 
 describe('Auth construct — Post Confirmation group assignment', () => {
+  it('creates a public frontend client with USER_PASSWORD_AUTH and SRP enabled', () => {
+    synth().hasResourceProperties('AWS::Cognito::UserPoolClient', {
+      GenerateSecret: false,
+      ExplicitAuthFlows: Match.arrayWith([
+        'ALLOW_USER_PASSWORD_AUTH',
+        'ALLOW_USER_SRP_AUTH',
+      ]),
+    });
+  });
+
   it('grants only cognito-idp:AdminAddUserToGroup', () => {
     synth().hasResourceProperties('AWS::IAM::Policy', {
       PolicyDocument: {
