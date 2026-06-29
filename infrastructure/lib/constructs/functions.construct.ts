@@ -189,6 +189,9 @@ export class Functions extends Construct {
     // Standalone Rerank (stage 2). bedrock:Rerank is NOT a model-scoped action —
     // it only authorizes against "*" (per AWS reranking permissions docs); only
     // bedrock:InvokeModel is scoped to the Cohere reranker in the Bedrock region.
+    // NOTE: this ARN is hardcoded to cohere.rerank-v3-5:0 and must be kept in sync
+    // with the RERANK_MODEL_ID env var below — overriding that env without updating
+    // this ARN denies InvokeModel at runtime (us-east-1 has no other reranker today).
     this.generateTaskStepsFn.addToRolePolicy(
       new iam.PolicyStatement({ actions: ['bedrock:Rerank'], resources: ['*'] }),
     );
@@ -254,6 +257,9 @@ export class Functions extends Construct {
     // Standalone Rerank (stage 2). bedrock:Rerank is NOT a model-scoped action —
     // it only authorizes against "*" (per AWS reranking permissions docs); only
     // bedrock:InvokeModel is scoped to the Cohere reranker in the Bedrock region.
+    // NOTE: this ARN is hardcoded to cohere.rerank-v3-5:0 and must be kept in sync
+    // with the RERANK_MODEL_ID env var below — overriding that env without updating
+    // this ARN denies InvokeModel at runtime (us-east-1 has no other reranker today).
     this.createAiTaskFn.addToRolePolicy(
       new iam.PolicyStatement({ actions: ['bedrock:Rerank'], resources: ['*'] }),
     );
