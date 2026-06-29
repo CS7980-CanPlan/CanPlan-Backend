@@ -1,6 +1,15 @@
 import { RetrieveCommand } from '@aws-sdk/client-bedrock-agent-runtime';
 import { ConverseCommand } from '@aws-sdk/client-bedrock-runtime';
-import { kb, KNOWLEDGE_BASE_ID, RERANK_COARSE_K } from './kb';
+import {
+  kb,
+  KNOWLEDGE_BASE_ID,
+  RERANK_COARSE_K,
+  RERANK_SCORE_FLOOR,
+  RERANK_REL_RATIO,
+  RERANK_MIN_RESULTS,
+  RERANK_MAX_RESULTS,
+} from './kb';
+import { rerankPassages, selectPassages } from './rerank';
 import { bedrock, BEDROCK_MODEL_ID, BEDROCK_MAX_TOKENS } from './bedrock';
 import {
   SYSTEM_PROMPT,
@@ -17,7 +26,10 @@ interface Usage {
   outputTokens?: number;
 }
 
-/** Retrieve top-K passages over the WHOLE corpus (unscoped — see spec rationale). */
+/**
+ * Two-stage retrieval: coarse vector recall over the whole corpus, then a Cohere
+ * rerank, then a dynamic relevance threshold. Throws when nothing clears the floor.
+ */
 async function retrievePassages(query: string): Promise<RetrievedPassage[]> {
   const retrieval = await kb.send(
     new RetrieveCommand({
@@ -28,12 +40,23 @@ async function retrievePassages(query: string): Promise<RetrievedPassage[]> {
       },
     }),
   );
-  const passages: RetrievedPassage[] = (retrieval.retrievalResults ?? []).map((r) => ({
+  const candidates: RetrievedPassage[] = (retrieval.retrievalResults ?? []).map((r) => ({
     chunkId: String(r.metadata?.chunk_id ?? ''),
     text: r.content?.text ?? '',
     title: String(r.metadata?.title ?? ''),
     url: r.metadata?.url ? String(r.metadata.url) : undefined,
   }));
+  if (candidates.length === 0) {
+    throw new Error('no relevant guidance found for this task');
+  }
+
+  const scored = await rerankPassages(query, candidates);
+  const passages = selectPassages(scored, {
+    floor: RERANK_SCORE_FLOOR,
+    ratio: RERANK_REL_RATIO,
+    min: RERANK_MIN_RESULTS,
+    max: RERANK_MAX_RESULTS,
+  });
   if (passages.length === 0) {
     throw new Error('no relevant guidance found for this task');
   }

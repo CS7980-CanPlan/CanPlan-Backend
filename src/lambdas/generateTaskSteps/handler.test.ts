@@ -6,6 +6,11 @@ jest.mock('../../shared/kb', () => ({
   kb: { send: jest.fn() },
   KNOWLEDGE_BASE_ID: 'kb-test-123',
   RERANK_COARSE_K: 25,
+  RERANK_MODEL_ARN: 'arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0',
+  RERANK_SCORE_FLOOR: 0.3,
+  RERANK_REL_RATIO: 0.5,
+  RERANK_MIN_RESULTS: 2,
+  RERANK_MAX_RESULTS: 5,
 }));
 
 jest.mock('../../shared/bedrock', () => ({
@@ -32,6 +37,10 @@ function retrieveResult() {
   };
 }
 
+function rerankResult() {
+  return { results: [{ index: 0, relevanceScore: 0.9 }] };
+}
+
 function converseResult(text: string) {
   return {
     output: { message: { role: 'assistant', content: [{ text }] } },
@@ -42,7 +51,11 @@ function converseResult(text: string) {
 const goodSteps = '{"steps":[{"text":"Wet your hands.","citations":["hlbc-85-handwash-steps"]}]}';
 
 beforeEach(() => {
-  mockKbSend.mockResolvedValue(retrieveResult());
+  mockKbSend.mockImplementation((command) =>
+    Promise.resolve(
+      command.constructor.name === 'RerankCommand' ? rerankResult() : retrieveResult(),
+    ),
+  );
   mockBedrockSend.mockResolvedValue(converseResult(goodSteps));
 });
 
