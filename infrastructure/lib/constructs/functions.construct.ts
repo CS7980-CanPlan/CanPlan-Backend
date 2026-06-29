@@ -186,10 +186,15 @@ export class Functions extends Construct {
         ],
       }),
     );
-    // Standalone Rerank (stage 2) — scoped to the Cohere reranker in the Bedrock region.
+    // Standalone Rerank (stage 2). bedrock:Rerank is NOT a model-scoped action —
+    // it only authorizes against "*" (per AWS reranking permissions docs); only
+    // bedrock:InvokeModel is scoped to the Cohere reranker in the Bedrock region.
+    this.generateTaskStepsFn.addToRolePolicy(
+      new iam.PolicyStatement({ actions: ['bedrock:Rerank'], resources: ['*'] }),
+    );
     this.generateTaskStepsFn.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ['bedrock:Rerank', 'bedrock:InvokeModel'],
+        actions: ['bedrock:InvokeModel'],
         resources: [
           `arn:aws:bedrock:${bedrockRegion}::foundation-model/cohere.rerank-v3-5:0`,
         ],
@@ -246,10 +251,15 @@ export class Functions extends Construct {
         ],
       }),
     );
-    // Standalone Rerank (stage 2) — scoped to the Cohere reranker in the Bedrock region.
+    // Standalone Rerank (stage 2). bedrock:Rerank is NOT a model-scoped action —
+    // it only authorizes against "*" (per AWS reranking permissions docs); only
+    // bedrock:InvokeModel is scoped to the Cohere reranker in the Bedrock region.
+    this.createAiTaskFn.addToRolePolicy(
+      new iam.PolicyStatement({ actions: ['bedrock:Rerank'], resources: ['*'] }),
+    );
     this.createAiTaskFn.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ['bedrock:Rerank', 'bedrock:InvokeModel'],
+        actions: ['bedrock:InvokeModel'],
         resources: [
           `arn:aws:bedrock:${bedrockRegion}::foundation-model/cohere.rerank-v3-5:0`,
         ],
