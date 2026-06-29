@@ -5,7 +5,7 @@ import { bedrock } from '../../shared/bedrock';
 jest.mock('../../shared/kb', () => ({
   kb: { send: jest.fn() },
   KNOWLEDGE_BASE_ID: 'kb-test-123',
-  RETRIEVAL_TOP_K: 4,
+  RERANK_COARSE_K: 25,
 }));
 
 jest.mock('../../shared/bedrock', () => ({
@@ -73,7 +73,7 @@ describe('generateTaskSteps handler', () => {
     const cmd = mockKbSend.mock.calls[0][0];
     expect(cmd.input.knowledgeBaseId).toBe('kb-test-123');
     expect(cmd.input.retrievalQuery.text).toBe('wash my hands');
-    expect(cmd.input.retrievalConfiguration.vectorSearchConfiguration.numberOfResults).toBe(4);
+    expect(cmd.input.retrievalConfiguration.vectorSearchConfiguration.numberOfResults).toBe(25);
   });
 
   it('drops citations whose chunk_id is not in the retrieved set', async () => {

@@ -1,6 +1,6 @@
 import { RetrieveCommand } from '@aws-sdk/client-bedrock-agent-runtime';
 import { ConverseCommand } from '@aws-sdk/client-bedrock-runtime';
-import { kb, KNOWLEDGE_BASE_ID, RETRIEVAL_TOP_K } from './kb';
+import { kb, KNOWLEDGE_BASE_ID, RERANK_COARSE_K } from './kb';
 import { bedrock, BEDROCK_MODEL_ID, BEDROCK_MAX_TOKENS } from './bedrock';
 import {
   SYSTEM_PROMPT,
@@ -24,7 +24,7 @@ async function retrievePassages(query: string): Promise<RetrievedPassage[]> {
       knowledgeBaseId: KNOWLEDGE_BASE_ID,
       retrievalQuery: { text: query },
       retrievalConfiguration: {
-        vectorSearchConfiguration: { numberOfResults: RETRIEVAL_TOP_K },
+        vectorSearchConfiguration: { numberOfResults: RERANK_COARSE_K },
       },
     }),
   );
