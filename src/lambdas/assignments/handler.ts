@@ -431,7 +431,9 @@ async function updateTaskInstanceStatus(input: UpdateTaskInstanceStatusInput): P
 
 /**
  * Cancel one occurrence. Creates (or overwrites) a real TaskInstance with status CANCELLED and
- * isException true, so the cancelled occurrence stops surfacing as an open virtual slot.
+ * isException true, so the cancelled occurrence stops surfacing as an open virtual slot. A
+ * terminal instance (COMPLETED/SKIPPED/CANCELLED) is frozen and cannot be cancelled — that would
+ * clobber a finished occurrence and leave stale lifecycle timestamps behind.
  */
 async function cancelTaskInstance(input: CancelTaskInstanceInput): Promise<TaskInstance> {
   const { userId, assignmentId, scheduledDate, scheduledTime } = parseOccurrenceCoords(input);
@@ -444,19 +446,31 @@ async function cancelTaskInstance(input: CancelTaskInstanceInput): Promise<TaskI
     );
   }
 
+  // A virtual occurrence (no row yet) is cancellable; an existing non-terminal one is too, but a
+  // terminal instance must not be flipped to CANCELLED.
+  const existing = await getInstance(userId, scheduledDate, scheduledTime, assignmentId);
+  if (existing) {
+    const current = existing.status as PersistedTaskInstanceStatus;
+    if (TERMINAL_STATUSES.includes(current)) {
+      throw new ValidationError(`cannot cancel a ${current} instance`);
+    }
+  }
+
   const instanceId = taskInstanceId(assignmentId, scheduledDate, scheduledTime);
   const now = new Date().toISOString();
   const result = await dynamo.send(
     new UpdateCommand({
       TableName: TABLE_NAME,
       Key: { PK: userPk(userId), SK: taskInstanceSk(scheduledDate, scheduledTime, assignmentId) },
-      // Upsert: create the exception row if it doesn't exist, or flip an existing one to CANCELLED.
+      // Upsert: create the exception row if it doesn't exist, or flip a non-terminal one to
+      // CANCELLED. REMOVE clears any startedAt/completedAt/skippedAt so no stale lifecycle
+      // timestamp survives the transition.
       UpdateExpression:
         'SET #status = :cancelled, isException = :true, cancelledAt = :now, updatedAt = :now, ' +
         'entityType = :entityType, instanceId = :instanceId, assignmentId = :assignmentId, ' +
         'taskId = :taskId, userId = :userId, scheduledDate = :scheduledDate, ' +
         'scheduledTime = :scheduledTime, scheduledFor = :scheduledFor, #tz = :timezone, ' +
-        'createdAt = if_not_exists(createdAt, :now)',
+        'createdAt = if_not_exists(createdAt, :now) REMOVE completedAt, skippedAt',
       ExpressionAttributeNames: { '#status': 'status', '#tz': 'timezone' },
       ExpressionAttributeValues: {
         ':cancelled': 'CANCELLED',
@@ -507,12 +521,16 @@ async function endTaskAssignment(input: EndTaskAssignmentInput): Promise<TaskAss
 
   let update;
   if (keepActive) {
+    // Only ever shorten or preserve the window — never extend it. If an earlier endDate already
+    // exists, keep it; a later effectiveDate must not push the schedule out.
+    const cappedEndDate =
+      assignment.endDate && assignment.endDate < newEndDate ? assignment.endDate : newEndDate;
     // Trim the window but leave the assignment active (and its task-deletion marker in place).
     update = new UpdateCommand({
       TableName: TABLE_NAME,
       Key: { PK: userPk(userId), SK: taskAssignmentSk(assignmentId) },
       UpdateExpression: 'SET endDate = :endDate, updatedAt = :now',
-      ExpressionAttributeValues: { ':endDate': newEndDate, ':now': now },
+      ExpressionAttributeValues: { ':endDate': cappedEndDate, ':now': now },
       ConditionExpression: 'attribute_exists(PK)',
       ReturnValues: 'ALL_NEW',
     });

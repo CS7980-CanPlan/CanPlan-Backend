@@ -58,6 +58,28 @@ describe('normalizeSchedule', () => {
     ).toThrow('endDate cannot be before startDate');
   });
 
+  it('rejects an incomplete RRULE with no FREQ', () => {
+    expect(() =>
+      normalizeSchedule({ scheduleType: 'RECURRING', scheduleRule: 'INTERVAL=2', startDate: '2099-03-01', startTime: '09:00', timezone: 'UTC' }),
+    ).toThrow('must specify a FREQ');
+  });
+
+  it('rejects pathologically high frequencies (SECONDLY/MINUTELY/HOURLY)', () => {
+    const make = (freq: string) =>
+      normalizeSchedule({ scheduleType: 'RECURRING', scheduleRule: `FREQ=${freq}`, startDate: '2099-03-01', startTime: '09:00', timezone: 'UTC' });
+    expect(() => make('SECONDLY')).toThrow('FREQ must be DAILY, WEEKLY, MONTHLY, or YEARLY');
+    expect(() => make('MINUTELY')).toThrow('FREQ must be DAILY, WEEKLY, MONTHLY, or YEARLY');
+    expect(() => make('HOURLY')).toThrow('FREQ must be DAILY, WEEKLY, MONTHLY, or YEARLY');
+  });
+
+  it('accepts the calendar-scale frequencies (DAILY/WEEKLY/MONTHLY/YEARLY)', () => {
+    const make = (freq: string) =>
+      normalizeSchedule({ scheduleType: 'RECURRING', scheduleRule: `FREQ=${freq}`, startDate: '2099-03-01', startTime: '09:00', timezone: 'UTC' });
+    for (const freq of ['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY']) {
+      expect(make(freq).scheduleRule).toBe(`FREQ=${freq}`);
+    }
+  });
+
   it('rejects an out-of-range startTime (right shape, impossible time)', () => {
     const make = (startTime: string) =>
       normalizeSchedule({ scheduleType: 'RECURRING', scheduleRule: 'FREQ=DAILY', startDate: '2099-03-01', startTime, timezone: 'UTC' });
@@ -101,6 +123,17 @@ describe('expandOccurrences', () => {
     // The absolute UTC offset shifts by an hour across the boundary.
     expect(occ[0].scheduledFor.endsWith('-05:00')).toBe(true); // EST before
     expect(occ[2].scheduledFor.endsWith('-04:00')).toBe(true); // EDT after
+  });
+
+  it('returns no occurrences for legacy bad stored RRULE instead of throwing', () => {
+    // Stored rows can predate validation: malformed, missing FREQ, or a forbidden frequency.
+    const malformed = recurring({ scheduleRule: 'NONSENSE!!' });
+    const noFreq = recurring({ scheduleRule: 'INTERVAL=2' });
+    const secondly = recurring({ scheduleRule: 'FREQ=SECONDLY' });
+    expect(() => expandOccurrences(malformed, '2099-03-01', '2099-03-03')).not.toThrow();
+    expect(expandOccurrences(malformed, '2099-03-01', '2099-03-03')).toEqual([]);
+    expect(expandOccurrences(noFreq, '2099-03-01', '2099-03-03')).toEqual([]);
+    expect(expandOccurrences(secondly, '2099-03-01', '2099-03-03')).toEqual([]);
   });
 
   it('expands a ONE_TIME assignment only when in window', () => {

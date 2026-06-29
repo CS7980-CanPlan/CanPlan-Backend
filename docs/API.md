@@ -697,12 +697,12 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 
 | Operation | Input | Returns |
 |---|---|---|
-| `createTaskAssignment` | `input: { taskId!, userId!, assignedBy, scheduleType!, scheduledFor, scheduleRule, startDate, endDate, startTime, timezone! }` | `TaskAssignment!` · validates the `Task` exists and the schedule, then writes **one** row — **no** `TaskInstance`s. `ONE_TIME` requires `scheduledFor` + `timezone`; `RECURRING` requires `scheduleRule` (an RRULE) + `startDate` + `startTime` + `timezone` (`endDate` optional). An active assignment carries the sparse `activeTaskAssignmentTaskId` marker. |
+| `createTaskAssignment` | `input: { taskId!, userId!, assignedBy, scheduleType!, scheduledFor, scheduleRule, startDate, endDate, startTime, timezone! }` | `TaskAssignment!` · validates the `Task` exists and the schedule, then writes **one** row — **no** `TaskInstance`s. `ONE_TIME` requires `scheduledFor` + `timezone`; `RECURRING` requires `scheduleRule` (an RRULE) + `startDate` + `startTime` + `timezone` (`endDate` optional). The RRULE must carry a `FREQ` of `DAILY`/`WEEKLY`/`MONTHLY`/`YEARLY` — incomplete rules and `HOURLY`/`MINUTELY`/`SECONDLY` are rejected. An active assignment carries the sparse `activeTaskAssignmentTaskId` marker. |
 | `startTaskInstance` | `input: { userId!, assignmentId!, scheduledDate!, scheduledTime! }` | `TaskInstance!` · verifies the occurrence is valid for the assignment; if no instance exists, creates it (`IN_PROGRESS`, `startedAt` set) and snapshots the current `TaskStep`s into `TaskInstanceStep` rows **atomically**. **Idempotent** — an existing instance is returned untouched (steps are never re-snapshotted). |
 | `setTaskInstanceStepCompletion` | `input: { userId!, instanceId!, stepId!, completed! }` | `TaskInstanceStep!` · toggles one step. Sets/clears `completedAt`. Rejected on a **terminal** (`COMPLETED`/`SKIPPED`/`CANCELLED`) instance; 404s if the instance or step doesn't exist. |
 | `updateTaskInstanceStatus` | `input: { userId!, instanceId!, status! }` | `TaskInstance!` · `status` accepts `IN_PROGRESS`/`COMPLETED`/`SKIPPED` (`OVERDUE` is rejected — derived; `CANCELLED` uses `cancelTaskInstance`). `COMPLETED` is rejected while any step is incomplete (a zero-step instance may be completed). |
-| `cancelTaskInstance` | `input: { userId!, assignmentId!, scheduledDate!, scheduledTime! }` | `TaskInstance!` · creates or updates a real `TaskInstance` with status `CANCELLED` and `isException: true`, so the occurrence stops surfacing as an open virtual slot. |
-| `endTaskAssignment` | `input: { userId!, assignmentId!, effectiveDate! }` | `TaskAssignment!` · for a `RECURRING` assignment with days remaining, caps `endDate` to the day before `effectiveDate` (stays active); otherwise fully ends it (`active: false`, `endedAt` set, marker removed). |
+| `cancelTaskInstance` | `input: { userId!, assignmentId!, scheduledDate!, scheduledTime! }` | `TaskInstance!` · creates or updates a real `TaskInstance` with status `CANCELLED` and `isException: true`, so the occurrence stops surfacing as an open virtual slot. Rejected on a **terminal** (`COMPLETED`/`SKIPPED`/`CANCELLED`) instance — a finished occurrence can't be cancelled. |
+| `endTaskAssignment` | `input: { userId!, assignmentId!, effectiveDate! }` | `TaskAssignment!` · for a `RECURRING` assignment with days remaining, caps `endDate` to the day before `effectiveDate` — taking the **earlier** of that and any existing `endDate`, so it only ever shortens the window (stays active); otherwise fully ends it (`active: false`, `endedAt` set, marker removed). |
 | `deleteTaskAssignment` | `input: { userId!, assignmentId! }` | `TaskAssignment!` · **soft delete** — `active: false`, `endedAt` set, `activeTaskAssignmentTaskId` removed (unblocking `deleteTask`). 404s if missing. |
 | `listTaskAssignmentsForUser` | `userId!, limit, nextToken` | `TaskAssignmentConnection!` · a user's schedule rules (active + ended). |
 | `getTaskInstanceViews` | `userId!, startDate!, endDate!` | `TaskInstanceViewConnection!` · the calendar feed (both dates `YYYY-MM-DD`, **max 370-day** span). See below. |
@@ -1189,4 +1189,6 @@ model: `TaskAssignment` (schedule rule), `TaskInstance` (one occurrence with sta
 **Recurrence**
 
 - `RECURRING` assignments use an RRULE (`scheduleRule`) expanded with `rrule` + `luxon`
-  (timezone-correct across DST). `getTaskInstanceViews` caps its date range at **370 days**.
+  (timezone-correct across DST). The RRULE must carry a `FREQ` of `DAILY`/`WEEKLY`/`MONTHLY`/
+  `YEARLY` (`HOURLY`/`MINUTELY`/`SECONDLY` and a missing `FREQ` are rejected).
+  `getTaskInstanceViews` caps its date range at **370 days**.

@@ -18,6 +18,18 @@ import type { TaskAssignment, TaskAssignmentScheduleType } from './types';
 /** Hard cap on how wide a getTaskInstanceViews date range may be (keeps expansion bounded). */
 export const MAX_RANGE_DAYS = 370;
 
+/**
+ * The only RRULE frequencies we allow — calendar-scale recurrences. HOURLY/MINUTELY/SECONDLY
+ * are rejected because they explode expansion (e.g. SECONDLY over a year is ~31M occurrences)
+ * and have no meaningful place in a task schedule.
+ */
+const ALLOWED_FREQS: ReadonlySet<number> = new Set([
+  RRule.YEARLY,
+  RRule.MONTHLY,
+  RRule.WEEKLY,
+  RRule.DAILY,
+]);
+
 /** One expanded occurrence of an assignment (a calendar slot, no status). */
 export interface Occurrence {
   scheduledDate: string; // YYYY-MM-DD (in the assignment timezone)
@@ -112,12 +124,7 @@ export function normalizeSchedule(input: {
     if (!isValidDate(endDate)) throw new ValidationError('endDate must be a valid YYYY-MM-DD date');
     if (endDate < startDate) throw new ValidationError('endDate cannot be before startDate');
   }
-  // Validate the RRULE parses (rrule throws on malformed input).
-  try {
-    RRule.parseString(stripRrulePrefix(scheduleRule));
-  } catch {
-    throw new ValidationError(`scheduleRule is not a valid RRULE: "${scheduleRule}"`);
-  }
+  validateRrule(scheduleRule);
   return {
     scheduleType,
     timezone,
@@ -131,6 +138,31 @@ export function normalizeSchedule(input: {
 /** Drop a leading `RRULE:` so both `RRULE:FREQ=…` and `FREQ=…` parse. */
 function stripRrulePrefix(rule: string): string {
   return rule.replace(/^RRULE:/i, '');
+}
+
+/**
+ * Validate an RRULE for persistence: it must parse, construct into a real RRule, carry a FREQ,
+ * and that FREQ must be one of DAILY/WEEKLY/MONTHLY/YEARLY. Parsing alone is too permissive —
+ * it accepts incomplete rules (no FREQ) and pathological frequencies (SECONDLY/MINUTELY/HOURLY)
+ * that would later blow up calendar expansion. Throws ValidationError on any of those.
+ */
+function validateRrule(rule: string): void {
+  let options;
+  try {
+    options = RRule.parseString(stripRrulePrefix(rule));
+    // Construct the rule too — surfaces validation errors parseString alone does not.
+    new RRule(options);
+  } catch {
+    throw new ValidationError(`scheduleRule is not a valid RRULE: "${rule}"`);
+  }
+  if (options.freq == null) {
+    throw new ValidationError(`scheduleRule must specify a FREQ: "${rule}"`);
+  }
+  if (!ALLOWED_FREQS.has(options.freq)) {
+    throw new ValidationError(
+      `scheduleRule FREQ must be DAILY, WEEKLY, MONTHLY, or YEARLY: "${rule}"`,
+    );
+  }
 }
 
 /**
@@ -178,14 +210,17 @@ export function expandOccurrences(
   const cap = endDate && endDate < rangeEnd ? endDate : rangeEnd;
   if (effStart > cap) return [];
 
-  let options: Partial<ReturnType<typeof RRule.parseString>>;
+  // Parse AND construct inside the guard: legacy bad stored data (malformed, missing/forbidden
+  // FREQ) must yield no occurrences for this assignment rather than 500 the whole calendar feed.
+  let rule: RRule;
   try {
-    options = RRule.parseString(stripRrulePrefix(scheduleRule));
+    const options = RRule.parseString(stripRrulePrefix(scheduleRule));
+    if (options.freq == null || !ALLOWED_FREQS.has(options.freq)) return [];
+    options.dtstart = floatingUtc(startDate, startTime);
+    rule = new RRule(options);
   } catch {
     return [];
   }
-  options.dtstart = floatingUtc(startDate, startTime);
-  const rule = new RRule(options);
 
   // rrule works on naive UTC wall-clock; bound the window by the same convention.
   const after = floatingUtc(effStart, '00:00');

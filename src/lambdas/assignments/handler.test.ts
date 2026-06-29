@@ -355,16 +355,45 @@ describe('updateTaskInstanceStatus', () => {
 
 // ── cancelTaskInstance ────────────────────────────────────────────────────────
 describe('cancelTaskInstance', () => {
+  const cancelArgs = { userId: 'u1', assignmentId: 'a1', scheduledDate: '2099-07-02', scheduledTime: '09:00' };
+
   it('writes a CANCELLED exception for a virtual occurrence (upsert)', async () => {
     db.assignment = RECURRING;
+    db.instance = undefined; // no real row yet — a virtual slot
     const result = (await handler(
-      event('cancelTaskInstance', { input: { userId: 'u1', assignmentId: 'a1', scheduledDate: '2099-07-02', scheduledTime: '09:00' } }),
+      event('cancelTaskInstance', { input: cancelArgs }),
     )) as TaskInstance;
     const update = byCommand('UpdateCommand')[0];
     expect(update.Key.SK).toBe('TASK_INSTANCE#2099-07-02#09:00#a1');
     expect(update.ExpressionAttributeValues[':cancelled']).toBe('CANCELLED');
     expect(update.ExpressionAttributeValues[':true']).toBe(true);
     expect(update.UpdateExpression).toContain('if_not_exists(createdAt');
+    // No stale lifecycle timestamp survives the transition.
+    expect(update.UpdateExpression).toContain('REMOVE completedAt, skippedAt');
+    expect(result.status).toBe('CANCELLED');
+    expect(result.isException).toBe(true);
+  });
+
+  it('rejects cancelling a terminal (COMPLETED) instance and issues no write', async () => {
+    db.assignment = RECURRING;
+    db.instance = {
+      instanceId: 'a1#2099-07-02#09:00', status: 'COMPLETED',
+      scheduledDate: '2099-07-02', scheduledTime: '09:00', completedAt: 'earlier',
+    };
+    await expect(handler(event('cancelTaskInstance', { input: cancelArgs }))).rejects.toThrow(
+      'cannot cancel a COMPLETED instance',
+    );
+    expect(byCommand('UpdateCommand')).toHaveLength(0);
+  });
+
+  it('cancels an existing IN_PROGRESS instance (non-terminal)', async () => {
+    db.assignment = RECURRING;
+    db.instance = {
+      instanceId: 'a1#2099-07-02#09:00', status: 'IN_PROGRESS',
+      scheduledDate: '2099-07-02', scheduledTime: '09:00', startedAt: 'earlier',
+    };
+    const result = (await handler(event('cancelTaskInstance', { input: cancelArgs }))) as TaskInstance;
+    expect(byCommand('UpdateCommand')).toHaveLength(1);
     expect(result.status).toBe('CANCELLED');
     expect(result.isException).toBe(true);
   });
@@ -389,6 +418,22 @@ describe('end / delete assignment prevents future virtual instances', () => {
     const update = byCommand('UpdateCommand')[0];
     expect(update.ExpressionAttributeValues[':endDate']).toBe('2099-07-09'); // day before
     expect(update.UpdateExpression).not.toContain('active = :false');
+  });
+
+  it('endTaskAssignment preserves an existing endDate earlier than the computed one (never extends)', async () => {
+    db.assignment = { ...RECURRING, endDate: '2099-07-05' };
+    await handler(event('endTaskAssignment', { input: { userId: 'u1', assignmentId: 'a1', effectiveDate: '2099-07-10' } }));
+    const update = byCommand('UpdateCommand')[0];
+    // newEndDate would be 2099-07-09, but the earlier 2099-07-05 wins — the window is not pushed out.
+    expect(update.ExpressionAttributeValues[':endDate']).toBe('2099-07-05');
+    expect(update.UpdateExpression).not.toContain('active = :false');
+  });
+
+  it('endTaskAssignment shortens an existing endDate later than the computed one', async () => {
+    db.assignment = { ...RECURRING, endDate: '2099-07-20' };
+    await handler(event('endTaskAssignment', { input: { userId: 'u1', assignmentId: 'a1', effectiveDate: '2099-07-10' } }));
+    const update = byCommand('UpdateCommand')[0];
+    expect(update.ExpressionAttributeValues[':endDate']).toBe('2099-07-09'); // shortened to day before
   });
 
   it('deleteTaskAssignment soft-deletes (active=false, endedAt, GSI marker removed)', async () => {

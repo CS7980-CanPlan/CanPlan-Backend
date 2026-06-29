@@ -147,7 +147,8 @@ type TaskAssignment {
   scheduleType: TaskAssignmentScheduleType!
   # ONE_TIME: the single occurrence's ISO datetime.
   scheduledFor: String
-  # RECURRING: an RRULE string (e.g. "FREQ=DAILY;INTERVAL=1").
+  # RECURRING: an RRULE string (e.g. "FREQ=DAILY;INTERVAL=1"). FREQ is required and must be
+  # DAILY, WEEKLY, MONTHLY, or YEARLY.
   scheduleRule: String
   # RECURRING: inclusive first/last calendar dates (YYYY-MM-DD); endDate null ⇒ open-ended.
   startDate: String
@@ -497,7 +498,8 @@ input DeleteTaskStepInput {
 
 # Create a TaskAssignment (schedule rule). Validates the source Task exists but creates NO
 # TaskInstance rows. ONE_TIME requires scheduledFor + timezone; RECURRING requires
-# scheduleRule + startDate + startTime + timezone (endDate optional).
+# scheduleRule + startDate + startTime + timezone (endDate optional). The RRULE's FREQ must be
+# DAILY/WEEKLY/MONTHLY/YEARLY — a missing FREQ or HOURLY/MINUTELY/SECONDLY is rejected.
 input CreateTaskAssignmentInput {
   taskId: ID!
   userId: ID!
@@ -537,6 +539,7 @@ input UpdateTaskInstanceStatusInput {
 }
 
 # Cancel one occurrence — creates or updates a real TaskInstance (CANCELLED, isException:true).
+# Rejected if an instance already exists and is terminal (COMPLETED/SKIPPED/CANCELLED).
 input CancelTaskInstanceInput {
   userId: ID!
   assignmentId: ID!
@@ -544,8 +547,9 @@ input CancelTaskInstanceInput {
   scheduledTime: String!
 }
 
-# End an assignment from effectiveDate onward (RECURRING: caps endDate to the day before, or
-# fully ends it; ONE_TIME: fully ends it).
+# End an assignment from effectiveDate onward (RECURRING with days remaining: caps endDate to
+# the earlier of its current value and the day before effectiveDate — only ever shortening the
+# window, never extending it; otherwise fully ends it. ONE_TIME: fully ends it).
 input EndTaskAssignmentInput {
   userId: ID!
   assignmentId: ID!
@@ -789,8 +793,9 @@ type Mutation {
   # Set an instance's status (IN_PROGRESS/COMPLETED/SKIPPED). COMPLETED requires all steps complete.
   updateTaskInstanceStatus(input: UpdateTaskInstanceStatusInput!): TaskInstance!
   # Cancel one occurrence — writes a CANCELLED, isException TaskInstance (creating it if needed).
+  # Rejected on a terminal (COMPLETED/SKIPPED/CANCELLED) instance.
   cancelTaskInstance(input: CancelTaskInstanceInput!): TaskInstance!
-  # End an assignment from a date onward (caps endDate, or fully ends it).
+  # End an assignment from a date onward (shortens endDate — never extends it — or fully ends it).
   endTaskAssignment(input: EndTaskAssignmentInput!): TaskAssignment!
   # Soft-delete an assignment (active:false; unblocks deleteTask for the source task).
   deleteTaskAssignment(input: DeleteTaskAssignmentInput!): TaskAssignment!
