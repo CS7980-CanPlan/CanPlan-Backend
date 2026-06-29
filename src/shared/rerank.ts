@@ -1,3 +1,5 @@
+import { RerankCommand } from '@aws-sdk/client-bedrock-agent-runtime';
+import { kb, RERANK_MODEL_ARN } from './kb';
 import type { RetrievedPassage } from './types';
 
 /** A retrieved passage carrying its stage-2 rerank relevance score (internal). */
@@ -37,4 +39,45 @@ export function selectPassages(
   kept = kept.slice(0, cfg.max);
 
   return kept.map((x) => ({ chunkId: x.chunkId, text: x.text, title: x.title, url: x.url }));
+}
+
+async function callRerank(
+  query: string,
+  passages: RetrievedPassage[],
+): Promise<ScoredPassage[]> {
+  const response = await kb.send(
+    new RerankCommand({
+      queries: [{ type: 'TEXT', textQuery: { text: query } }],
+      sources: passages.map((p) => ({
+        type: 'INLINE',
+        inlineDocumentSource: { type: 'TEXT', textDocument: { text: p.text } },
+      })),
+      rerankingConfiguration: {
+        type: 'BEDROCK_RERANKING_MODEL',
+        bedrockRerankingConfiguration: {
+          numberOfResults: passages.length,
+          modelConfiguration: { modelArn: RERANK_MODEL_ARN },
+        },
+      },
+    }),
+  );
+  return (response.results ?? []).map((r) => ({
+    ...passages[r.index as number],
+    score: r.relevanceScore as number,
+  }));
+}
+
+/**
+ * Stage 2: score every coarse candidate with the reranker. Fail-closed — retry
+ * once on failure, then let the error propagate (no fallback to coarse ranking).
+ */
+export async function rerankPassages(
+  query: string,
+  passages: RetrievedPassage[],
+): Promise<ScoredPassage[]> {
+  try {
+    return await callRerank(query, passages);
+  } catch {
+    return await callRerank(query, passages); // one retry, then throws
+  }
 }

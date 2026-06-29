@@ -1,6 +1,21 @@
-import { selectPassages, type ScoredPassage, type ThresholdConfig } from './rerank';
+import { selectPassages, rerankPassages, type ScoredPassage, type ThresholdConfig } from './rerank';
+import { kb } from './kb';
+
+jest.mock('./kb', () => ({
+  kb: { send: jest.fn() },
+  RERANK_MODEL_ARN: 'arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0',
+}));
+
+const mockSend = kb.send as jest.Mock;
 
 const cfg: ThresholdConfig = { floor: 0.3, ratio: 0.5, min: 2, max: 5 };
+
+const candidates = [
+  { chunkId: 'a', text: 'alpha', title: 'A', url: undefined },
+  { chunkId: 'b', text: 'beta', title: 'B', url: undefined },
+];
+
+afterEach(() => jest.clearAllMocks());
 
 function p(chunkId: string, score: number): ScoredPassage {
   return { chunkId, text: `text-${chunkId}`, title: `title-${chunkId}`, url: undefined, score };
@@ -47,5 +62,36 @@ describe('selectPassages', () => {
   it('sorts by score descending before selecting', () => {
     const out = selectPassages([p('low', 0.6), p('high', 0.95)], cfg);
     expect(out[0].chunkId).toBe('high');
+  });
+});
+
+describe('rerankPassages', () => {
+  it('maps Rerank results (index + relevanceScore) back onto passages', async () => {
+    mockSend.mockResolvedValueOnce({
+      results: [
+        { index: 1, relevanceScore: 0.91 },
+        { index: 0, relevanceScore: 0.42 },
+      ],
+    });
+    const out = await rerankPassages('q', candidates);
+    expect(out).toEqual([
+      { chunkId: 'b', text: 'beta', title: 'B', url: undefined, score: 0.91 },
+      { chunkId: 'a', text: 'alpha', title: 'A', url: undefined, score: 0.42 },
+    ]);
+  });
+
+  it('retries once on failure then succeeds', async () => {
+    mockSend
+      .mockRejectedValueOnce(new Error('throttled'))
+      .mockResolvedValueOnce({ results: [{ index: 0, relevanceScore: 0.7 }] });
+    const out = await rerankPassages('q', candidates);
+    expect(mockSend).toHaveBeenCalledTimes(2);
+    expect(out[0].chunkId).toBe('a');
+  });
+
+  it('throws when both attempts fail', async () => {
+    mockSend.mockRejectedValue(new Error('down'));
+    await expect(rerankPassages('q', candidates)).rejects.toThrow('down');
+    expect(mockSend).toHaveBeenCalledTimes(2);
   });
 });
