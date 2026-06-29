@@ -26,7 +26,6 @@ export interface Task {
   title: string;
   categoryId?: string | null;
   description?: string | null;
-  notificationEnabled?: boolean | null;
   createdAt?: string | null;
   updatedAt?: string | null;
 }
@@ -42,15 +41,23 @@ export interface Category {
   updatedAt?: string | null;
 }
 
-export type AssignmentStatus = 'TO_DO' | 'OVERDUE' | 'COMPLETED' | 'SKIPPED';
+export type TaskAssignmentScheduleType = 'ONE_TIME' | 'RECURRING';
 
-export interface Assignment {
+/** A schedule rule binding a Task template to a user (no status/step completion). */
+export interface TaskAssignment {
   assignmentId: string;
   taskId: string;
   userId: string;
   assignedBy?: string | null;
-  dueDate?: string | null;
-  status: AssignmentStatus;
+  scheduleType: TaskAssignmentScheduleType;
+  scheduledFor?: string | null;
+  scheduleRule?: string | null;
+  startDate?: string | null;
+  endDate?: string | null;
+  startTime?: string | null;
+  timezone: string;
+  active: boolean;
+  endedAt?: string | null;
   assignedAt?: string | null;
   createdAt?: string | null;
   updatedAt?: string | null;
@@ -73,7 +80,7 @@ export interface AdminUserData {
   profile: UserProfile | null;
   tasks: Task[];
   categories: Category[];
-  assignments: Assignment[];
+  taskAssignments: TaskAssignment[];
   supportLinks: SupportLink[];
 }
 

@@ -8,6 +8,10 @@ import {
   AdminRemoveUserFromGroupCommand,
 } from '@aws-sdk/client-cognito-identity-provider';
 import { GetCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import {
+  assertNoActiveAssignmentsForTask,
+  queryActiveAssignmentKeysForTask,
+} from '../../shared/assignment';
 import { requireGroup } from '../../shared/auth';
 import { requireCaller } from '../../shared/authz';
 import { batchDelete, type ItemKey, queryAllItems, queryAllKeys } from '../../shared/batch';
@@ -22,7 +26,6 @@ import {
 } from '../../shared/cognito';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import {
-  ASSIGN_PREFIX,
   CATEGORY_PREFIX,
   ENTITY,
   ENTITY_TYPE_INDEX,
@@ -30,6 +33,7 @@ import {
   PRIMARY_USER_SUPPORT_LINK_INDEX,
   PROFILE_SK,
   supporterPk,
+  TASK_ASSIGNMENT_PREFIX,
   TASK_OWNER_INDEX,
   USER_LINK_PREFIX,
   userPk,
@@ -44,7 +48,6 @@ import type {
   AdminUserResult,
   AppSyncEvent,
   AppSyncIdentity,
-  Assignment,
   Category,
   Connection,
   InviteUserInput,
@@ -52,6 +55,7 @@ import type {
   SetUserBaseRoleInput,
   SupportLink,
   Task,
+  TaskAssignment,
   UserProfile,
 } from '../../shared/types';
 
@@ -126,25 +130,25 @@ function listByEntityType<T>(entityType: EntityType, page: PageArgs): Promise<Co
 
 /**
  * Aggregate everything one user owns, for the SystemAdmin user-detail view. Gathers the
- * profile, owned tasks (taskOwnerIndex), categories + assignments (the USER#<id> partition),
- * and support links in BOTH directions — all with PK queries + GSIs, never a Scan. Each
- * collection is read in full (no pagination); a single user's footprint is bounded and this
- * mirrors what adminDeleteUser already traverses. Internal storage attributes (PK/SK/etc.)
- * on the items are simply not selected by the GraphQL type, so they are not returned.
+ * profile, owned tasks (taskOwnerIndex), categories + task assignments (the USER#<id>
+ * partition), and support links in BOTH directions — all with PK queries + GSIs, never a
+ * Scan. Each collection is read in full (no pagination); a single user's footprint is bounded
+ * and this mirrors what adminDeleteUser already traverses. Internal storage attributes
+ * (PK/SK/etc.) on the items are simply not selected by the GraphQL type, so they are not returned.
  */
 async function adminGetUserData(userId: string): Promise<AdminUserData> {
   const id = userId?.trim();
   if (!id) throw new ValidationError('userId is required and cannot be empty');
 
-  const [profile, tasks, categories, assignments, supportLinks] = await Promise.all([
+  const [profile, tasks, categories, taskAssignments, supportLinks] = await Promise.all([
     readProfile(id),
     queryAllOwnedTasks(id),
     queryAllItems<Category>(userPk(id), CATEGORY_PREFIX),
-    queryAllItems<Assignment>(userPk(id), ASSIGN_PREFIX),
+    queryAllItems<TaskAssignment>(userPk(id), TASK_ASSIGNMENT_PREFIX),
     gatherSupportLinks(id),
   ]);
 
-  return { userId: id, profile, tasks, categories, assignments, supportLinks };
+  return { userId: id, profile, tasks, categories, taskAssignments, supportLinks };
 }
 
 /**
@@ -322,6 +326,8 @@ async function setSystemAdmin(
 async function adminDeleteTask(taskId: string): Promise<Task | null> {
   const id = taskId?.trim();
   if (!id) throw new ValidationError('taskId is required and cannot be empty');
+  // Same guard as the owner deleteTask: refuse while an active TaskAssignment references it.
+  await assertNoActiveAssignmentsForTask(id);
   return deleteTaskCascade(id);
 }
 
@@ -355,13 +361,23 @@ async function adminDeleteUser(
   }
 
   // 1) Every task owned by the user (taskOwnerIndex, entityType=Task) — full cascade each.
+  //    Owner deleteTask is normally rejected while an active TaskAssignment references the
+  //    task, but full user deletion bypasses that guard. A task this user owns may be assigned
+  //    to ANOTHER user (whose partition is NOT deleted here), so first remove every active
+  //    TaskAssignment referencing these tasks — otherwise it would dangle, pointing at a
+  //    now-missing template.
   const ownedTasks = await queryAllOwnedTasks(userId);
+  const orphanedAssignmentKeys: ItemKey[] = [];
+  for (const task of ownedTasks) {
+    orphanedAssignmentKeys.push(...(await queryActiveAssignmentKeysForTask(task.taskId)));
+  }
+  await batchDelete(orphanedAssignmentKeys);
   for (const task of ownedTasks) {
     await deleteTaskCascade(task.taskId, { task });
   }
 
-  // 2) Every row in the user's own partition (UserProfile, Category, Assignment,
-  //    AssignmentStep, ProgressEvent, …) — one PK query, no Scan.
+  // 2) Every row in the user's own partition (UserProfile, Category, TaskAssignment,
+  //    TaskInstance, TaskInstanceStep, …) — one PK query, no Scan.
   const userRows = await queryAllKeys(userPk(userId));
   await batchDelete(userRows);
 

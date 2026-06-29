@@ -45,7 +45,7 @@ export async function listAllTasks(args: PageArgs = {}): Promise<TaskConnection>
   return data.listAllTasks;
 }
 
-/** Full read-only snapshot of one user's data (profile, tasks, categories, assignments, links). */
+/** Full read-only snapshot of one user's data (profile, tasks, categories, task assignments, links). */
 export async function adminGetUserData(userId: string): Promise<AdminUserData> {
   const data = await gqlRequest<{ adminGetUserData: AdminUserData }>(ADMIN_GET_USER_DATA, {
     userId,

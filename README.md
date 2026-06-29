@@ -10,8 +10,8 @@ The GraphQL schema is in [graphql/schema.graphql](graphql/schema.graphql) and th
 frontend-facing reference is [docs/API.md](docs/API.md).
 
 CanPlan uses a **single DynamoDB table** (`CanPlanTasks-<env>`, composite `PK`/`SK`)
-for every entity — UserProfile, SupportLink, Category, Task, TaskStep, Assignment,
-AssignmentStep, MediaAsset, Report. The item-key conventions live in
+for every entity — UserProfile, SupportLink, Category, Task, TaskStep, TaskAssignment,
+TaskInstance, TaskInstanceStep, MediaAsset, Report. The item-key conventions live in
 [src/shared/keys.ts](src/shared/keys.ts).
 
 | Operation(s) | Type | Backing service |
@@ -21,7 +21,7 @@ AssignmentStep, MediaAsset, Report. The item-key conventions live in
 | `createUserProfile`, `updateMyUserProfile`, `createSupportLink`, `getUserProfile`, `listUsersByOrganization`, `listPrimaryUsersBySupporter` | Query/Mutation | `canplan-users-<env>` Lambda + DynamoDB (createUserProfile also creates the user's default category atomically) |
 | `createCategory`, `updateCategory`, `deleteCategory`, `listMyCategories` | Query/Mutation | `canplan-categories-<env>` Lambda + DynamoDB (owner derived from the Cognito identity; deleteCategory reparents tasks to the default category) |
 | `getTask`, `listTaskSteps`, `listTasksByOwner`, `listTasksByCategory`, `updateTask`, `createTaskStep`, `updateTaskStep`, `deleteTaskStep`, `reorderTaskSteps`, `deleteTask` | Query/Mutation | `canplan-tasks-<env>` Lambda + DynamoDB + S3 (media cleanup) |
-| `createAssignment`, `updateAssignmentStatus`, `setAssignmentStepCompletion`, `deleteAssignment`, `listAssignmentsForUser`, `listAssignmentSteps` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB |
+| `createTaskAssignment`, `startTaskInstance`, `setTaskInstanceStepCompletion`, `updateTaskInstanceStatus`, `cancelTaskInstance`, `endTaskAssignment`, `deleteTaskAssignment`, `listTaskAssignmentsForUser`, `getTaskInstanceViews`, `listTaskInstanceSteps` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB (TaskAssignment schedule rules; lazily-materialized TaskInstances; calendar feed) |
 | `createMediaUploadUrl`, `createTaskCoverImageUploadUrl`, `createMediaAsset`, `deleteMediaAsset`, `getMediaDownloadUrl`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB + S3 media bucket (presigned upload/download, cover images, cascade delete) |
 | `listAllUsers`, `listAllTasks` | Query | `canplan-admin-<env>` Lambda + DynamoDB `entityTypeIndex` (SystemAdmin only, paginated) |
 | `inviteSupportPerson`, `inviteOrganizationAdmin`, `setUserBaseRole`, `setSystemAdmin`, `adminDeleteTask`, `adminDeleteUser` | Mutation | `canplan-admin-<env>` Lambda + Cognito + DynamoDB + S3 (SystemAdmin only — manage Cognito roles, delete any task, full user deletion) |
@@ -135,6 +135,19 @@ Standalone `createTaskStep` is append-only and concurrency-safe. Task metadata
 allowed, concurrent calls from the same state yield exactly one success, and the other
 callers receive a retryable validation error after reloading the task steps. Deleting a step
 does not reclaim its order; `reorderTaskSteps` normalizes orders atomically.
+
+**Scheduling is a three-layer model** (a `Task` is a reusable template only — it carries no
+schedule). A `TaskAssignment` is the schedule rule binding a template to a user, either
+`ONE_TIME` (`scheduledFor`) or `RECURRING` (an RRULE `scheduleRule` + `startDate`/`startTime`/
+`timezone`, optional `endDate`). Occurrences are **virtual** until a user acts on one:
+`getTaskInstanceViews` expands an active assignment's occurrences over a date range
+(`rrule` + `luxon`, DST-correct; max 370-day span) and overlays any real rows, while
+`startTaskInstance` lazily materializes a `TaskInstance` (status + lifecycle timestamps) and
+snapshots the task's current steps into immutable `TaskInstanceStep` rows. `cancelTaskInstance`
+writes a `CANCELLED` exception; `endTaskAssignment`/`deleteTaskAssignment` end an assignment
+(soft delete). An active assignment carries a sparse `activeTaskAssignmentTaskId` marker
+(`activeTaskAssignmentTaskIndex` GSI), so `deleteTask` is rejected while any active assignment
+still references the template. See [docs/API.md](docs/API.md) for the full contract.
 
 ## Region Layout
 

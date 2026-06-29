@@ -56,11 +56,14 @@ export class Auth extends Construct {
     });
 
     // Frontend client (mobile app + web portal). Public clients can't keep a
-    // secret, so none is generated; SRP keeps the password off the wire.
+    // secret, so none is generated. Support both Amplify password and SRP flows.
     this.userPoolClient = this.userPool.addClient('CanPlanUserPoolClient', {
       userPoolClientName: `CanPlan-${envName}-UserPoolClient`,
       generateSecret: false,
-      authFlows: { userSrp: true },
+      authFlows: {
+        userPassword: true,
+        userSrp: true,
+      },
     });
 
     // Seed the role taxonomy. Group-based resolver authorization is a later issue.

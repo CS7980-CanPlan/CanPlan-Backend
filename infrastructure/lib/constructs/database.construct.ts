@@ -11,8 +11,8 @@ export interface DatabaseProps {
 
 /**
  * Single-table DynamoDB store for CanPlan. Every entity (UserProfile, SupportLink,
- * Category, Task, TaskStep, Assignment, AssignmentStep, MediaAsset, Report) lives in
- * one table keyed by a composite PK/SK plus an `entityType` discriminator — see
+ * Category, Task, TaskStep, TaskAssignment, TaskInstance, TaskInstanceStep, MediaAsset,
+ * Report) lives in one table keyed by a composite PK/SK plus an `entityType` discriminator — see
  * src/shared/keys.ts for the item-key conventions and the access patterns each GSI
  * serves. The table name keeps the historical CanPlanTasks-<env> pattern.
  */
@@ -84,8 +84,19 @@ export class Database extends Construct {
       projectionType: dynamodb.ProjectionType.ALL,
     });
 
+    // activeTaskAssignmentTaskIndex — active TaskAssignments by their source task. Sparse:
+    // only an ACTIVE TaskAssignment row carries `activeTaskAssignmentTaskId` (= its taskId);
+    // ending/deleting an assignment removes it. Lets deleteTask cheaply prove no active
+    // assignment still references a task before removing the template.
+    this.table.addGlobalSecondaryIndex({
+      indexName: 'activeTaskAssignmentTaskIndex',
+      partitionKey: { name: 'activeTaskAssignmentTaskId', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'createdAt', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.KEYS_ONLY,
+    });
+
     // entityTypeIndex — general-purpose index for SystemAdmin/admin listing APIs:
-    // list every item of one entityType (UserProfile, Task, Assignment, MediaAsset,
+    // list every item of one entityType (UserProfile, Task, TaskAssignment, MediaAsset,
     // …) newest-first, without scanning the table. Every item carries entityType +
     // createdAt. NOTE: partitioning by entityType concentrates each type on one
     // partition (a hot-partition trade-off acceptable for low-volume admin/debug
