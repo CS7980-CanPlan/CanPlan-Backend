@@ -3,8 +3,12 @@ import {
   aggregateByTask,
   aggregateByCategory,
   aggregateTrend,
+  aggregateStepDwell,
+  aggregateAbandonment,
+  aggregateSkipPatterns,
+  aggregateTimeOfDay,
 } from './reportMetrics';
-import type { TaskInstance, Task, Category } from './types';
+import type { TaskInstance, Task, Category, TaskInstanceStep } from './types';
 
 const NOW = '2026-06-30T00:00:00.000Z';
 
@@ -94,5 +98,99 @@ describe('aggregateTrend', () => {
       { weekStart: '2026-06-01', completed: 1, total: 2, completionRate: 0.5 },
       { weekStart: '2026-06-08', completed: 1, total: 1, completionRate: 1 },
     ]);
+  });
+});
+
+function step(p: Partial<TaskInstanceStep>): TaskInstanceStep {
+  return {
+    instanceId: 'a#2026-06-01#09:00',
+    assignmentId: 'a',
+    taskId: 't1',
+    stepId: 's1',
+    order: 0,
+    text: 'Step',
+    completed: true,
+    createdAt: NOW,
+    updatedAt: NOW,
+    ...p,
+  };
+}
+
+describe('aggregateStepDwell', () => {
+  it('derives per-step seconds (first step from startedAt, later from prev completedAt)', () => {
+    const instances = [
+      inst({
+        instanceId: 'i1',
+        taskId: 't1',
+        startedAt: '2026-06-01T09:00:00.000Z',
+      }),
+    ];
+    const steps = [
+      step({ instanceId: 'i1', stepId: 's1', order: 0, text: 'A', completedAt: '2026-06-01T09:00:30.000Z' }),
+      step({ instanceId: 'i1', stepId: 's2', order: 1, text: 'B', completedAt: '2026-06-01T09:01:30.000Z' }),
+    ];
+    const tasks = [{ taskId: 't1', title: 'Brush' } as Task];
+    expect(aggregateStepDwell(instances, steps, tasks)).toEqual([
+      { taskId: 't1', title: 'Brush', stepOrder: 0, stepText: 'A', samples: 1, avgSeconds: 30 },
+      { taskId: 't1', title: 'Brush', stepOrder: 1, stepText: 'B', samples: 1, avgSeconds: 60 },
+    ]);
+  });
+
+  it('skips steps with missing/negative gaps', () => {
+    const instances = [inst({ instanceId: 'i1' })]; // no startedAt
+    const steps = [step({ instanceId: 'i1', order: 0, completedAt: '2026-06-01T09:00:30.000Z' })];
+    expect(aggregateStepDwell(instances, steps, [])).toEqual([]);
+  });
+});
+
+describe('aggregateAbandonment', () => {
+  it('flags started-but-not-completed instances and the first incomplete step', () => {
+    const instances = [
+      inst({ instanceId: 'i1', taskId: 't1', status: 'IN_PROGRESS', startedAt: NOW }),
+    ];
+    const steps = [
+      step({ instanceId: 'i1', order: 0, completed: true }),
+      step({ instanceId: 'i1', order: 1, completed: false }),
+    ];
+    const tasks = [{ taskId: 't1', title: 'Brush' } as Task];
+    expect(aggregateAbandonment(instances, steps, tasks)).toEqual([
+      { instanceId: 'i1', taskId: 't1', title: 'Brush', stalledAtStepOrder: 1 },
+    ]);
+  });
+
+  it('ignores completed and cancelled instances', () => {
+    const instances = [
+      inst({ instanceId: 'i1', status: 'COMPLETED', startedAt: NOW }),
+      inst({ instanceId: 'i2', status: 'CANCELLED', startedAt: NOW }),
+    ];
+    expect(aggregateAbandonment(instances, [], [])).toEqual([]);
+  });
+});
+
+describe('aggregateSkipPatterns', () => {
+  it('counts skips per task and by local hour of skippedAt', () => {
+    const instances = [
+      inst({
+        taskId: 't1',
+        status: 'SKIPPED',
+        skippedAt: '2026-06-01T13:00:00.000Z', // 09:00 in America/Toronto (EDT -4)
+        timezone: 'America/Toronto',
+      }),
+    ];
+    const tasks = [{ taskId: 't1', title: 'Brush' } as Task];
+    const out = aggregateSkipPatterns(instances, tasks);
+    expect(out.byTask).toEqual([{ taskId: 't1', title: 'Brush', skipped: 1 }]);
+    expect(out.byHour[9]).toBe(1);
+    expect(out.byHour).toHaveLength(24);
+  });
+});
+
+describe('aggregateTimeOfDay', () => {
+  it('buckets COMPLETED instances by local completion hour', () => {
+    const out = aggregateTimeOfDay([
+      inst({ status: 'COMPLETED', completedAt: '2026-06-01T13:00:00.000Z', timezone: 'America/Toronto' }),
+    ]);
+    expect(out[9]).toBe(1);
+    expect(out).toHaveLength(24);
   });
 });

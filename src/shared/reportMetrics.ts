@@ -1,5 +1,5 @@
 import { DateTime } from 'luxon';
-import type { TaskInstance, Task, Category, ReportStats } from './types';
+import type { TaskInstance, Task, Category, ReportStats, TaskInstanceStep } from './types';
 
 /** Round to 4 decimals so completionRate is stable for assertions and JSON. */
 function rate(completed: number, total: number): number {
@@ -104,4 +104,123 @@ export function aggregateTrend(instances: TaskInstance[]): ReportStats['trend'] 
       total: a.total,
       completionRate: rate(a.completed, a.total),
     }));
+}
+
+/** Group step snapshots by their instanceId, sorted by `order`. */
+function stepsByInstance(steps: TaskInstanceStep[]): Map<string, TaskInstanceStep[]> {
+  const map = new Map<string, TaskInstanceStep[]>();
+  for (const s of steps) {
+    const list = map.get(s.instanceId) ?? [];
+    list.push(s);
+    map.set(s.instanceId, list);
+  }
+  for (const list of map.values()) list.sort((a, b) => a.order - b.order);
+  return map;
+}
+
+export function aggregateStepDwell(
+  instances: TaskInstance[],
+  steps: TaskInstanceStep[],
+  tasks: Task[],
+): ReportStats['stepDwell'] {
+  const titleOf = new Map(tasks.map((t) => [t.taskId, t.title]));
+  const byInstance = stepsByInstance(steps);
+  const instById = new Map(instances.map((i) => [i.instanceId, i]));
+  // key = `${taskId}#${order}` → accumulated seconds + sample count + step text
+  const acc = new Map<
+    string,
+    { taskId: string; stepOrder: number; stepText: string; totalSeconds: number; samples: number }
+  >();
+
+  for (const [instanceId, instSteps] of byInstance.entries()) {
+    const inst = instById.get(instanceId);
+    if (!inst) continue;
+    let prev = inst.startedAt; // first step is measured from instance start
+    for (const s of instSteps) {
+      if (s.completedAt && prev) {
+        const seconds = (Date.parse(s.completedAt) - Date.parse(prev)) / 1000;
+        if (seconds >= 0) {
+          const key = `${s.taskId}#${s.order}`;
+          const a =
+            acc.get(key) ??
+            { taskId: s.taskId, stepOrder: s.order, stepText: s.text, totalSeconds: 0, samples: 0 };
+          a.totalSeconds += seconds;
+          a.samples++;
+          acc.set(key, a);
+        }
+      }
+      // Advance the cursor only when this step has a timestamp; a gap breaks the chain.
+      if (s.completedAt) prev = s.completedAt;
+    }
+  }
+
+  return [...acc.values()]
+    .sort((a, b) => a.taskId.localeCompare(b.taskId) || a.stepOrder - b.stepOrder)
+    .map((a) => ({
+      taskId: a.taskId,
+      title: titleOf.get(a.taskId) ?? a.taskId,
+      stepOrder: a.stepOrder,
+      stepText: a.stepText,
+      samples: a.samples,
+      avgSeconds: Math.round(a.totalSeconds / a.samples),
+    }));
+}
+
+export function aggregateAbandonment(
+  instances: TaskInstance[],
+  steps: TaskInstanceStep[],
+  tasks: Task[],
+): ReportStats['abandonment'] {
+  const titleOf = new Map(tasks.map((t) => [t.taskId, t.title]));
+  const byInstance = stepsByInstance(steps);
+  const out: ReportStats['abandonment'] = [];
+  for (const inst of instances) {
+    const abandoned =
+      !!inst.startedAt && inst.status !== 'COMPLETED' && inst.status !== 'CANCELLED';
+    if (!abandoned) continue;
+    const instSteps = byInstance.get(inst.instanceId) ?? [];
+    const firstIncomplete = instSteps.find((s) => !s.completed);
+    out.push({
+      instanceId: inst.instanceId,
+      taskId: inst.taskId,
+      title: titleOf.get(inst.taskId) ?? inst.taskId,
+      stalledAtStepOrder: firstIncomplete ? firstIncomplete.order : null,
+    });
+  }
+  return out;
+}
+
+export function aggregateSkipPatterns(
+  instances: TaskInstance[],
+  tasks: Task[],
+): ReportStats['skipPatterns'] {
+  const titleOf = new Map(tasks.map((t) => [t.taskId, t.title]));
+  const byTaskAcc = new Map<string, number>();
+  const byHour = new Array<number>(24).fill(0);
+  for (const inst of instances) {
+    if (inst.status !== 'SKIPPED') continue;
+    byTaskAcc.set(inst.taskId, (byTaskAcc.get(inst.taskId) ?? 0) + 1);
+    if (inst.skippedAt) {
+      const hour = DateTime.fromISO(inst.skippedAt, { zone: inst.timezone }).hour;
+      if (hour >= 0 && hour < 24) byHour[hour]++;
+    }
+  }
+  return {
+    byTask: [...byTaskAcc.entries()].map(([taskId, skipped]) => ({
+      taskId,
+      title: titleOf.get(taskId) ?? taskId,
+      skipped,
+    })),
+    byHour,
+  };
+}
+
+export function aggregateTimeOfDay(instances: TaskInstance[]): ReportStats['timeOfDay'] {
+  const byHour = new Array<number>(24).fill(0);
+  for (const inst of instances) {
+    if (inst.status !== 'COMPLETED' || !inst.completedAt) continue;
+    const hour = DateTime.fromISO(inst.completedAt, { zone: inst.timezone }).hour;
+    if (hour >= 0 && hour < 24) byHour[hour]++;
+  }
+  return byHour;
 }
