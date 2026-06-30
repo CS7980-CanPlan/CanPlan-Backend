@@ -800,6 +800,12 @@ input GenerateTaskStepsInput {
   context: QueryContext
 }
 
+input GenerateReportInput {
+  userId: ID!
+  from: AWSDate!
+  to: AWSDate!
+}
+
 # ─── Pagination / connections ───────────────────────────────────────────────--
 # Every list query is paginated: pass an optional `limit` (page size) and the
 # `nextToken` from the previous page. `nextToken` is an opaque, base64-encoded
@@ -870,6 +876,11 @@ type TaskInstanceLookupResult {
 
 type MediaAssetConnection {
   items: [MediaAsset!]!
+  nextToken: String
+}
+
+type ReportConnection {
+  items: [Report!]!
   nextToken: String
 }
 
@@ -957,6 +968,10 @@ type Query {
   # UserProfiles. A membership row whose profile is missing is skipped. Paginated by nextToken.
   adminListOrganizationUsers(organizationId: ID!, limit: Int, nextToken: String): UserProfileConnection!
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+
+  # AI progress reports for a cared-for user (caller must have an active support link).
+  listReports(userId: ID!, limit: Int, nextToken: String): ReportConnection!
+  getReportDownloadUrl(userId: ID!, reportId: ID!): MediaDownloadTarget!
 }
 
 type Mutation {
@@ -1072,6 +1087,10 @@ type Mutation {
 
   # Break a daily-living task into ordered, source-cited steps via Bedrock KB + RAG.
   generateTaskSteps(input: GenerateTaskStepsInput!): TaskStepsResponse!
+
+  # Generate an AI progress report for a cared-for user over a date range. Computes the
+  # stats in code, has the AI write the narrative, persists JSON to S3 + a DynamoDB row.
+  generateReport(input: GenerateReportInput!): Report!
 
   # ─── Admin mutations (SystemAdmin-only) ──────────────────────────────────────
   # All gated to the SystemAdmin Cognito group at the AppSync edge AND re-checked in the
