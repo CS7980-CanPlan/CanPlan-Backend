@@ -1010,19 +1010,32 @@ is rejected with `VALIDATION`). `categoryId` is accepted by the input type but *
 — nothing is saved, so no category is resolved.
 
 **Returns — `GeneratedAiTask!`**: `title: String!`, `steps: [GeneratedAiTaskStep!]!`
-(each `{ text }` — **text only**, no step ids and no citations), plus `inputTokens`,
-`outputTokens`. No database-created fields (`taskId`, `ownerId`, `categoryId`,
-`createdAt`, `updatedAt`) are returned.
+(each `{ text }` — **text only**, no step ids and no citations), `grounded: Boolean!`,
+plus `inputTokens`, `outputTokens`. No database-created fields (`taskId`, `ownerId`,
+`categoryId`, `createdAt`, `updatedAt`) are returned.
 
-> A generation failure (e.g. no relevant KB guidance) throws before anything is
-> returned and nothing is ever written. Because it persists nothing, the result is a
-> throwaway preview: re-running the same `query` may yield different wording.
+`grounded` reports whether the steps are backed by the guidance corpus: `true` = built
+from retrieved sources; `false` = an **ungrounded fallback** generated from the model's
+general knowledge. Render an "AI-generated, not from our guidance" notice when `false`.
+
+> **No-guidance behaviour (role-gated).** When the query retrieves nothing that clears the
+> rerank relevance floor:
+> - **Support persons** get the ungrounded fallback — steps are still returned, with
+>   `grounded: false` and no citations.
+> - **All other callers** (e.g. primary users / care recipients) get a **`NotFoundError`**
+>   (`message: "no relevant guidance found for this task"`); `data.createAiTask` is null and
+>   nothing is generated. See [Error handling](#error-handling).
+>
+> When guidance is found the steps are built from the corpus and `grounded: true`. Because
+> it persists nothing, the result is a throwaway preview: re-running the same `query` may
+> yield different wording.
 
 ```graphql
 mutation CreateAiTask($input: CreateAiTaskInput!) {
   createAiTask(input: $input) {
     title
     steps { text }
+    grounded
     inputTokens
     outputTokens
   }
