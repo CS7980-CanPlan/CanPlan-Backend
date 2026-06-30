@@ -1,6 +1,6 @@
 # CanPlan 2.0 — Frontend API Reference
 
-_Last updated: 2026-06-28. Version: phase 1 (pre-authorization)._
+_Last updated: 2026-06-29. Version: phase 2 (SupportPerson delegated access)._
 
 > ## 🚨 Breaking change — categories, default category, Task status, TaskStep keys
 >
@@ -31,28 +31,50 @@ The schema lives at [graphql/schema.graphql](../graphql/schema.graphql) — it i
 canonical source of truth for exact types and nullability; this doc is its
 human-readable companion.
 
-> ## ⚠️ Authorization: Task & Category operations are owner-scoped; the rest are not yet
+> ## ⚠️ Authorization model: self-ownership + SupportPerson delegation
 >
-> **Enforced today:** the `SystemAdmin` admin queries; the **identity-scoped** creators
-> (`createUserProfile`, `createTask`) and **all category** operations, which derive the
-> owner from the caller's Cognito `sub` and ignore any client-supplied owner id; and
-> **every Task / TaskStep operation** — `getTask`, `listTaskSteps`, `listTasksByOwner`,
-> `listTasksByCategory`, `updateTask`, `deleteTask`, `createTaskStep`, `updateTaskStep`,
-> `deleteTaskStep`, `reorderTaskSteps` — which require the caller's `sub` to equal the
-> task's (or requested) `ownerId`, returning `NOT_AUTHORIZED` otherwise. There is no
-> delegated-role model yet, so this is strict self-ownership.
+> **Owner-scoped (caller `sub` must equal the resource owner).** The **identity-scoped**
+> creators (`createUserProfile`, `createTask`) and **all category** operations derive the
+> owner from the caller's Cognito `sub` and ignore any client-supplied owner id; **every
+> Task / TaskStep write** (`updateTask`, `deleteTask`, `createTaskStep`, `updateTaskStep`,
+> `deleteTaskStep`, `reorderTaskSteps`, `updateTaskOrder`) and the owner-scoped lists
+> (`listTasksByOwner`, `listTasksByCategory`) require the caller to be the owner; and **media
+> writes** (`createMediaUploadUrl`, `createMediaAsset`, `deleteMediaAsset`) are owner-only.
+> A non-owner gets `NOT_AUTHORIZED`.
 >
-> **Not enforced yet:** profile reads and the assignment / support-link operations still
-> let any authenticated caller act on any `id` (read another user's profile, assign a task
-> to any `userId`, link any supporter to any primary user). The schema and keys are
-> structured to support per-role rules there, but they are **not implemented in this phase**.
+> **SupportPerson delegated access (NEW).** A `SUPPORT_PERSON` may act on a `PRIMARY_USER`
+> they have **selected** — `selectPrimaryUser` writes an **ACTIVE** `SupportLink`. Delegation
+> is granted only while (a) the caller's role is `SUPPORT_PERSON`, (b) the `SupportLink` is
+> `ACTIVE`, (c) the **target is still a `PRIMARY_USER`** (a legacy link pointing at a
+> SupportPerson/ORG_ADMIN, or at a deleted user, grants nothing), and (d) the primary user
+> **currently shares the SupportPerson's `organizationId`**. With it, a SupportPerson may use
+> **every assignment / instance operation** for the selected user (`createTaskAssignment`,
+> `startTaskInstance`, `updateTaskInstanceStatus`, `cancelTaskInstance`, `endTaskAssignment`,
+> `deleteTaskAssignment`, `listTaskAssignmentsForUser`, `getTaskInstanceViews`,
+> `listTaskInstanceSteps`). A **stale** link (after either party changes org, the target's role
+> changes, or the link is revoked) stops granting access immediately.
 >
-> **Do not bake "the server lets me, so it's allowed" into the client.** When
-> enforcement ships, calls that succeed today will start returning a `NOT_AUTHORIZED`
-> error (see [Error handling](#error-handling)). Write the client so an authorization
-> denial is a normal, handleable outcome — not an exception. In particular, always
-> pass the caller's own id for self-scoped operations (see below); don't rely on the
-> server tolerating someone else's id.
+> **Read-only access for assigned templates/media (NEW).** A user who holds an **active
+> assignment referencing a task** may READ that task and its resources even though they don't
+> own it: `getTask`, `listTaskSteps`, `getMediaDownloadUrl`, and `listMediaForTask`. This is
+> **read-only** — it never permits mutating the task, its steps, or its media.
+>
+> **Assignments are owner-of-template + delegated-for-user.** `createTaskAssignment` requires
+> the caller to **own the referenced Task template** AND be allowed to act for the target
+> `userId` (self or active delegation). `assignedBy` is always derived from the caller's
+> identity — a client-supplied `assignedBy` is ignored.
+>
+> **SupportLink mutations are identity-derived.** `selectPrimaryUser` / `unselectPrimaryUser`
+> (and the deprecated `createSupportLink`) always take the supporter from the caller's identity;
+> a client-supplied `supporterId` is never trusted. Only a SupportPerson may select/unselect.
+>
+> **Still self-scoped only (no delegation yet):** profile reads (`getUserProfile`) remain
+> readable by any authenticated caller. `updateMyUserProfile` only ever edits the caller's own
+> profile.
+>
+> **Do not bake "the server lets me, so it's allowed" into the client.** Always pass the
+> caller's own id for self-scoped operations, and treat a `NOT_AUTHORIZED` denial as a normal,
+> handleable outcome.
 
 ---
 
@@ -225,7 +247,7 @@ object instead is the most common mistake here and is rejected at the AppSync ed
 ```
 
 In practice: `accessibilitySettings: JSON.stringify(settings)` on the way in. The same
-applies to `permissions` (`createSupportLink`).
+applies to `permissions` (`selectPrimaryUser` / `createSupportLink`).
 **Responses are symmetric** — these fields come back as JSON strings, so
 `JSON.parse(profile.accessibilitySettings)` on the way out.
 
@@ -360,7 +382,7 @@ fields are marked `!` and everything else is optional; see
 >
 > **Index-backed lists return a partial projection.** As a general rule, any list that
 > reads from a GSI returns only the fields that index projects, not the full entity —
-> non-projected fields come back `null`. `listUsersByOrganization` is the canonical
+> non-projected fields come back `null`. `listMyOrganizationUsers` is the canonical
 > example (it populates only `userId`, `displayName`, `role`). Use these lists for
 > rosters/pickers, then `get*` the full entity by id when you need the rest; don't
 > assume a list item is fully hydrated.
@@ -370,11 +392,15 @@ fields are marked `!` and everything else is optional; see
 | Operation | Input | Returns |
 |---|---|---|
 | `createUserProfile` | `input: { displayName!, organizationId, accessibilitySettings }` (`CreateMyUserProfileInput`) | `UserProfile` — creates the **caller's own** profile **and its default category** atomically; `displayName` is required, while `userId` (Cognito `sub`), `email`, `role`, and `defaultCategoryId` are derived server-side and cannot be supplied by the client |
-| `updateMyUserProfile` | `input: { displayName, accessibilitySettings }` (`UpdateMyUserProfileInput`) | `UserProfile!` — **partial** update of the **caller's own** profile; see below |
+| `updateMyUserProfile` | `input: { displayName, accessibilitySettings, organizationId }` (`UpdateMyUserProfileInput`) | `UserProfile!` — **partial** update of the **caller's own** profile; `organizationId` is now editable (MVP self-service); see below |
 | `getUserProfile` | `userId!` | `UserProfile` · `null` if not found |
-| `listUsersByOrganization` | `organizationId!, limit, nextToken` | `UserProfileConnection!` — **roster only**: just `userId`, `displayName`, `role` are populated (orgIndex projection); other fields are `null` |
-| `createSupportLink` | `input: { supporterId!, primaryUserId!, status, permissions }` | `SupportLink` · `status` defaults to `PENDING` |
-| `listPrimaryUsersBySupporter` | `supporterId!, limit, nextToken` | `SupportLinkConnection!` |
+| `listUsersByOrganization` | `organizationId!, limit, nextToken` | `UserProfileConnection!` · **DEPRECATED** — prefer `listMyOrganizationUsers`. Now **strictly self-scoped**: `organizationId` must equal the **caller's own** current org (else `NOT_AUTHORIZED`); a caller with no org gets `VALIDATION`. **Roster only**: just `userId`, `displayName`, `role` are populated (orgIndex projection) |
+| `listMyOrganizationUsers` | `limit, nextToken` | `UserProfileConnection!` — **the caller's OWN** org roster (same projection). The org is read from the caller's profile (no `organizationId` argument), so a SupportPerson can only ever list their own org. `VALIDATION` if the caller has no current org |
+| `selectPrimaryUser` | `input: { primaryUserId!, permissions }` (`SelectPrimaryUserInput`) | `SupportLink!` — a **SupportPerson** selects an in-org `PRIMARY_USER` (supporter = caller); writes/restores the link **ACTIVE**; see below |
+| `unselectPrimaryUser` | `input: { primaryUserId! }` (`UnselectPrimaryUserInput`) | `SupportLink!` — soft-revokes the link (**REVOKED**, never deleted); see below |
+| `listMySupportList` | `limit, nextToken` | `SupportLinkConnection!` — the caller's OWN support list (every primary user they selected, ACTIVE + REVOKED), via supporterIndex on the caller's sub |
+| `createSupportLink` | `input: { supporterId!, primaryUserId!, status, permissions }` | `SupportLink` · **DEPRECATED** alias of `selectPrimaryUser` — supporter is the caller (supplied `supporterId`/`status` ignored); writes ACTIVE with the same SupportPerson/org checks |
+| `listPrimaryUsersBySupporter` | `supporterId!, limit, nextToken` | `SupportLinkConnection!` · **DEPRECATED** alias of `listMySupportList` — now strictly self-scoped (`supporterId` must equal the caller's sub, else `NOT_AUTHORIZED`) |
 
 > **Profile bootstrap — the client must create the profile on first run.** There is
 > **no automatic profile creation.** The Cognito Post Confirmation trigger does one
@@ -402,10 +428,10 @@ fields are marked `!` and everything else is optional; see
 > only — the owner is the Cognito `sub`, never a client-supplied `userId`, so a caller can
 > only edit their own row. Unlike `createUserProfile`, it **never creates** a profile or a
 > default category: if no profile exists it returns **NotFound** (the write is conditioned on
-> the row existing). Only **`displayName`** and **`accessibilitySettings`** are editable — every
-> other field (`userId`, `email`, `role`, **`organizationId`**, `defaultCategoryId`,
-> `createdAt`) is left untouched and **cannot be changed through this mutation**. Supply at
-> least one of the two editable fields (an empty input is rejected). Per-field rules:
+> the row existing). Editable fields are **`displayName`**, **`accessibilitySettings`**, and
+> **`organizationId`** — `userId`, `email`, `role`, `defaultCategoryId`, and `createdAt` are
+> left untouched and **cannot be changed through this mutation**. Supply at least one editable
+> field (an empty input is rejected). Per-field rules:
 >
 > - **`displayName`** — omitted ⇒ unchanged; otherwise it is **trimmed**, and `null`, empty,
 >   or whitespace-only values are rejected.
@@ -414,15 +440,32 @@ fields are marked `!` and everything else is optional; see
 >   **not** deep-merged with the previous value. As elsewhere, this is an `AWSJSON` field:
 >   send `JSON.stringify(settings)` and `JSON.parse` it back off the returned profile (see
 >   [AWSJSON fields](#awsjson-fields--encoding-foot-gun)).
+> - **`organizationId`** (MVP self-service org membership) — the key **omitted** ⇒ unchanged;
+>   a **non-empty string** ⇒ set it (trimmed); explicit **`null`** ⇒ clear it; a blank/whitespace
+>   string is rejected (use `null` to clear). **Any signed-in user may change their own**
+>   `organizationId` in this MVP — there is no org-admin gating yet. Changing it moves you in
+>   `listMyOrganizationUsers`/`orgIndex` and **affects SupportPerson delegation**: a supporter
+>   only keeps delegated access while you still share their org (see the authorization model).
 >
 > The server also stamps a fresh `updatedAt`. Use this for ordinary profile edits; use
 > `createUserProfile` only for first-run creation (or a deliberate full replace).
 >
-> **`createSupportLink` semantics.** Same shape: an unconditional put keyed on
-> `(supporterId, primaryUserId)`. Re-creating the same pair **overwrites** the prior
-> link — including resetting `status` back to its default `PENDING` if you omit
-> `status` — rather than erroring on a duplicate. Pass `status` explicitly if you
-> re-issue a link you don't want demoted.
+> **`selectPrimaryUser` / `unselectPrimaryUser` (SupportPerson).** A **SupportPerson** selects a
+> `PRIMARY_USER` in their **own current organization** to support; the supporter is always the
+> caller's identity (never client-supplied). `selectPrimaryUser` writes (or **restores** a
+> previously revoked) `SupportLink` as **ACTIVE**, preserving the original `createdAt`; the
+> target must exist, be a `PRIMARY_USER`, and currently share the caller's `organizationId`
+> (else `NOT_AUTHORIZED`/`VALIDATION`). `unselectPrimaryUser` **soft-revokes** (status
+> `REVOKED`) — it never hard-deletes, so re-selecting restores the row; `NOT_FOUND` if no link
+> exists. **Only a SupportPerson** may call either (a primary user gets `NOT_AUTHORIZED`).
+> Optional `permissions` (`AWSJSON`) is stored on the link. List your selections with
+> `listMySupportList`.
+>
+> **`createSupportLink` (DEPRECATED).** A thin compatibility alias for `selectPrimaryUser`: the
+> supporter is taken from the caller's identity (a client-supplied **`supporterId` is ignored**,
+> never trusted), the same SupportPerson-only / same-organization / target-is-a-primary-user
+> checks apply, and the link is always (re)activated **ACTIVE** (the client `status` is ignored).
+> Prefer `selectPrimaryUser`.
 
 **Categories** (all **private to the caller** — the owner is the Cognito identity, never a
 client-supplied id)
@@ -477,8 +520,8 @@ client-supplied id)
 
 | Operation | Input | Returns |
 |---|---|---|
-| `getTask` | `taskId!` | `Task` · `null` if not found · `steps` is `null` here (use `listTaskSteps`) · owner-only |
-| `listTaskSteps` | `taskId!, limit, nextToken` | `TaskStepConnection!` — steps sorted by ascending `order`, order preserved across pages; owner-only; see below |
+| `getTask` | `taskId!` | `Task` · `null` if not found · `steps` is `null` here (use `listTaskSteps`) · readable by the **owner OR a user with an active assignment referencing the task** (read-only) |
+| `listTaskSteps` | `taskId!, limit, nextToken` | `TaskStepConnection!` — steps sorted by ascending `order`, order preserved across pages; readable by the **owner OR an assignee** (read-only); see below |
 | `listTasksByOwner` | `ownerId!, limit, nextToken` | `TaskConnection!` — tasks sorted by ascending per-owner `order` (un-ordered legacy rows last), order preserved across pages; `ownerId` must be the caller |
 | `listTasksByCategory` | `ownerId!, categoryId!, limit, nextToken` | `TaskConnection!` — tasks in one real category; **`categoryId` is required** and is validated (owned + exists + not deleting → `NOT_FOUND`/`VALIDATION`, never a silent empty result); `ownerId` must be the caller |
 | `updateTask` | `input: { taskId!, title, categoryId, description, coverImageS3Key }` | `Task` — **partial edit**; owner-only; see below |
@@ -695,6 +738,18 @@ A `Task` is a reusable template. To put it on a user's calendar, create a
 overlays any real `TaskInstance` rows; `startTaskInstance` materializes one occurrence and
 snapshots the task's current steps into `TaskInstanceStep` rows.
 
+> **Authorization (delegated).** Every operation below takes a `userId` and is allowed only
+> when the caller may **act for that user**: either it's the caller themselves, or the caller
+> is a `SUPPORT_PERSON` with an **ACTIVE** `SupportLink` to that user **and** they currently
+> share an `organizationId` (see the authorization model at the top). Additionally,
+> `createTaskAssignment` requires the caller to **own the referenced `Task` template** — a
+> SupportPerson schedules **their own** template for a selected primary user, and the
+> assignment **references the template by id** (it is never copied into the primary user's
+> account). `assignedBy` is always the caller's identity; a client-supplied `assignedBy` is
+> **ignored**. Editing the SupportPerson's template later changes what **future/unstarted**
+> occurrences snapshot; already-started `TaskInstanceStep` snapshots are immutable. `deleteTask`
+> stays blocked while any active assignment references the template.
+
 | Operation | Input | Returns |
 |---|---|---|
 | `createTaskAssignment` | `input: { taskId!, userId!, assignedBy, scheduleType!, scheduledFor, scheduleRule, startDate, endDate, startTime, timezone! }` | `TaskAssignment!` · validates the `Task` exists and the schedule, then writes **one** row — **no** `TaskInstance`s. `ONE_TIME` requires `scheduledFor` + `timezone`; `RECURRING` requires `scheduleRule` (an RRULE) + `startDate` + `startTime` + `timezone` (`endDate` optional). The RRULE must carry a `FREQ` of `DAILY`/`WEEKLY`/`MONTHLY`/`YEARLY` — incomplete rules and `HOURLY`/`MINUTELY`/`SECONDLY` are rejected. An active assignment carries the sparse `activeTaskAssignmentTaskId` marker. |
@@ -734,8 +789,16 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 | `createTaskCoverImageUploadUrl` | `input: { contentType!, fileName }` | `MediaUploadTarget!` — temporary cover-image upload; see [cover images](#task-cover-images) |
 | `createMediaAsset` | `input: { taskId!, s3Key!, type!, mimeType!, ownerId!, size }` | `MediaAsset` — initially unattached; see flow below |
 | `deleteMediaAsset` | `input: { taskId!, assetId! }` | `MediaAsset` — deletes the binary + row + dangling refs; see below |
-| `getMediaDownloadUrl` | `taskId!, assetId!` | `MediaDownloadTarget` — see flow below |
-| `listMediaForTask` | `taskId!, limit, nextToken` | `MediaAssetConnection!` |
+| `getMediaDownloadUrl` | `taskId!, assetId!` | `MediaDownloadTarget` — see flow below; readable by the **owner OR an assignee** (read-only) |
+| `listMediaForTask` | `taskId!, limit, nextToken` | `MediaAssetConnection!` — readable by the **owner OR an assignee** |
+
+> **Media authorization.** **Writes are owner-only** — `createMediaUploadUrl`, `createMediaAsset`,
+> and `deleteMediaAsset` require the caller to own the task (`NOT_AUTHORIZED` otherwise).
+> **Reads** (`getMediaDownloadUrl`, `listMediaForTask`) are allowed for the owner **or** a user
+> who holds an **active assignment referencing the task** — so an assigned primary user can view
+> a SupportPerson's task media, but never mutate it. `createTaskCoverImageUploadUrl` only
+> requires an authenticated caller (no task exists yet; the pending upload is promoted to a
+> task-owned asset by the owner-scoped `createTask`/`updateTask`).
 
 > **Media is upload-first.** Binaries live in the S3 media bucket; DynamoDB stores
 > only the `s3Key` and metadata (`type`, `mimeType`, `ownerId`, `size`). Newly created
@@ -1098,14 +1161,16 @@ Planned but not implemented — don't build against them:
   `getTaskInstanceViews` expands occurrences on read, but **nothing fires reminders yet**.
   There is no delivery engine (EventBridge), no device-token registration, and no
   push-notification Lambda in this phase.
-- **Per-role/owner authorization on domain operations** — the `SystemAdmin` admin
-  queries are group-gated (enforced), and `createUserProfile` is self-scoped (it
-  derives `userId`/`email`/`role` from the caller's Cognito session). The other
-  create/get/list resolvers don't yet verify the caller (e.g. that a primary user
-  only reads their own data, or that a supporter owns the task). The schema and
-  single-table keys are structured to support these rules. **See the authorization
-  warning at the top of this doc** — when these land, currently-succeeding calls on
-  someone else's id will start returning a `NOT_AUTHORIZED` error.
+- **Org-admin gating of organization membership** — in this MVP **any signed-in user may set
+  their own `organizationId`** via `updateMyUserProfile` (self-service). There is no
+  `OrganizationAdmin`-approved join/invite flow, and no admin API to move another user between
+  organizations. This is expected to tighten later (an org-admin-gated membership model), at
+  which point unrestricted self-service org changes may be removed.
+- **PENDING / invite-style SupportLinks** — selection is immediate: `selectPrimaryUser` writes
+  an **ACTIVE** link with no primary-user acceptance step. The `PENDING` `SupportLinkStatus`
+  exists in the schema but no operation produces it (an invite/accept handshake is not built).
+- **Profile-read authorization** — `getUserProfile(userId)` is still readable by any
+  authenticated caller; per-relationship gating of profile reads is not implemented yet.
 - **Stable resolver `errorType` codes** — `VALIDATION` / `NOT_FOUND` / `NOT_AUTHORIZED`
   / `INTERNAL` (see [Error handling](#error-handling)) are the intended contract, but
   resolver errors currently surface as `Lambda:Unhandled` with the cause only in

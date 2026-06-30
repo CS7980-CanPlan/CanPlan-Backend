@@ -297,22 +297,37 @@ export interface CreateMyUserProfileInput {
 /**
  * Partial update of the caller's OWN profile. The owner is derived from the Cognito
  * identity (never client-supplied), so there is no userId — and userId, email, role,
- * organizationId, defaultCategoryId, and timestamps are intentionally absent: they cannot
- * be changed here. At least one of `displayName`/`accessibilitySettings` must be supplied.
+ * defaultCategoryId, and timestamps are intentionally absent: they cannot be changed here.
+ * At least one editable field must be supplied.
  * `displayName`: omitted ⇒ unchanged; otherwise trimmed and may not be empty/whitespace.
  * `accessibilitySettings`: omitted ⇒ unchanged; explicit `null` ⇒ cleared; a non-null value
  * ⇒ FULL replacement of the stored settings (never deep-merged).
+ * `organizationId` (MVP self-service org membership): omitted (the key absent) ⇒ unchanged; a
+ * non-empty string ⇒ set; explicit `null` ⇒ cleared. Any signed-in user may change their own.
  */
 export interface UpdateMyUserProfileInput {
   displayName?: string | null;
   accessibilitySettings?: Record<string, unknown> | null;
+  organizationId?: string | null;
 }
 
+/** DEPRECATED — prefer `SelectPrimaryUserInput`. supporterId/status are ignored (see schema). */
 export interface CreateSupportLinkInput {
   supporterId: string;
   primaryUserId: string;
   status?: SupportLinkStatus;
   permissions?: Record<string, unknown>;
+}
+
+/** A SupportPerson selects a primary user (supporter derived from identity). Writes ACTIVE. */
+export interface SelectPrimaryUserInput {
+  primaryUserId: string;
+  permissions?: Record<string, unknown>;
+}
+
+/** A SupportPerson un-selects a primary user (supporter derived from identity). Soft-revokes. */
+export interface UnselectPrimaryUserInput {
+  primaryUserId: string;
 }
 
 // ownerId is intentionally absent — the owner is derived from the authenticated
