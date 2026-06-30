@@ -631,6 +631,13 @@ export interface GeneratedAiTaskStep {
 export interface GeneratedAiTask {
   title: string;
   steps: GeneratedAiTaskStep[];
+  /**
+   * Whether the steps are grounded in the guidance corpus. true = built from retrieved
+   * sources; false = ungrounded fallback generated from the model's general knowledge
+   * (only returned to support persons). The frontend renders an "AI-generated, not from
+   * our guidance" notice when false.
+   */
+  grounded: boolean;
   inputTokens?: number;
   outputTokens?: number;
 }

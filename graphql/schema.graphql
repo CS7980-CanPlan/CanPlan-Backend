@@ -286,6 +286,11 @@ type GeneratedAiTaskStep {
 type GeneratedAiTask {
   title: String!
   steps: [GeneratedAiTaskStep!]!
+  # Whether the steps are grounded in the guidance corpus. true = built from retrieved
+  # sources; false = ungrounded fallback generated from general knowledge (only returned
+  # to support persons). Frontend shows an "AI-generated, not from our guidance" notice
+  # when false.
+  grounded: Boolean!
   inputTokens: Int
   outputTokens: Int
 }
