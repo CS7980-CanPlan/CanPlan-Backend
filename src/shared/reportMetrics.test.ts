@@ -7,8 +7,16 @@ import {
   aggregateAbandonment,
   aggregateSkipPatterns,
   aggregateTimeOfDay,
+  computeReportStats,
+  buildReportStats,
 } from './reportMetrics';
-import type { TaskInstance, Task, Category, TaskInstanceStep } from './types';
+import type { TaskInstance, Task, Category, TaskInstanceStep, ReportComputeInput } from './types';
+import { queryAll, queryAllItems } from './batch';
+
+jest.mock('./batch', () => ({ queryAll: jest.fn(), queryAllItems: jest.fn() }));
+
+const mockQueryAll = queryAll as jest.Mock;
+const mockQueryAllItems = queryAllItems as jest.Mock;
 
 const NOW = '2026-06-30T00:00:00.000Z';
 
@@ -192,5 +200,70 @@ describe('aggregateTimeOfDay', () => {
     ]);
     expect(out[9]).toBe(1);
     expect(out).toHaveLength(24);
+  });
+});
+
+describe('computeReportStats', () => {
+  it('assembles meta + all metric sections', () => {
+    const input: ReportComputeInput = {
+      userId: 'u1',
+      from: '2026-06-01',
+      to: '2026-06-30',
+      now: NOW,
+      instances: [inst({ status: 'COMPLETED' }), inst({ status: 'SKIPPED' })],
+      steps: [],
+      tasks: [{ taskId: 't1', title: 'Brush', categoryId: 'c1' } as Task],
+      categories: [{ categoryId: 'c1', name: 'Hygiene' } as Category],
+    };
+    const stats = computeReportStats(input);
+    expect(stats.meta).toEqual({
+      userId: 'u1',
+      from: '2026-06-01',
+      to: '2026-06-30',
+      basis: 'attempted-instances-only',
+      totalInstances: 2,
+    });
+    expect(stats.completion.completed).toBe(1);
+    expect(stats.byTask).toHaveLength(1);
+    expect(stats.byCategory).toHaveLength(1);
+    expect(stats.timeOfDay).toHaveLength(24);
+  });
+
+  it('produces a valid zeroed report for an empty range', () => {
+    const stats = computeReportStats({
+      userId: 'u1',
+      from: '2026-06-01',
+      to: '2026-06-30',
+      now: NOW,
+      instances: [],
+      steps: [],
+      tasks: [],
+      categories: [],
+    });
+    expect(stats.meta.totalInstances).toBe(0);
+    expect(stats.completion.completionRate).toBe(0);
+    expect(stats.trend).toEqual([]);
+  });
+});
+
+describe('buildReportStats', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it('queries instances by date range, steps + categories by prefix, tasks by owner index', async () => {
+    mockQueryAll
+      .mockResolvedValueOnce([inst({ status: 'COMPLETED' })]) // instances (BETWEEN)
+      .mockResolvedValueOnce([{ taskId: 't1', title: 'Brush', categoryId: 'c1' }]); // tasks (owner index)
+    mockQueryAllItems
+      .mockResolvedValueOnce([]) // steps
+      .mockResolvedValueOnce([{ categoryId: 'c1', name: 'Hygiene' }]); // categories
+
+    const stats = await buildReportStats('u1', '2026-06-01', '2026-06-30');
+
+    expect(stats.meta.totalInstances).toBe(1);
+    // instances query uses a BETWEEN on the TASK_INSTANCE# prefix
+    const between = mockQueryAll.mock.calls[0][0];
+    expect(between.KeyConditionExpression).toContain('BETWEEN');
+    expect(between.ExpressionAttributeValues[':from']).toBe('TASK_INSTANCE#2026-06-01');
+    expect(between.ExpressionAttributeValues[':to']).toBe('TASK_INSTANCE#2026-06-30￿');
   });
 });

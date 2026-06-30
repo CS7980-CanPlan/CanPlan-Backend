@@ -1,5 +1,5 @@
 import { DateTime } from 'luxon';
-import type { TaskInstance, Task, Category, ReportStats, TaskInstanceStep } from './types';
+import type { TaskInstance, Task, Category, ReportStats, TaskInstanceStep, ReportComputeInput } from './types';
 
 /** Round to 4 decimals so completionRate is stable for assertions and JSON. */
 function rate(completed: number, total: number): number {
@@ -223,4 +223,85 @@ export function aggregateTimeOfDay(instances: TaskInstance[]): ReportStats['time
     if (hour >= 0 && hour < 24) byHour[hour]++;
   }
   return byHour;
+}
+
+export function computeReportStats(input: ReportComputeInput): ReportStats {
+  const { userId, from, to, now, instances, steps, tasks, categories } = input;
+  return {
+    meta: {
+      userId,
+      from,
+      to,
+      basis: 'attempted-instances-only',
+      totalInstances: instances.length,
+    },
+    completion: aggregateCompletion(instances, now),
+    trend: aggregateTrend(instances),
+    byCategory: aggregateByCategory(instances, tasks, categories),
+    byTask: aggregateByTask(instances, tasks),
+    stepDwell: aggregateStepDwell(instances, steps, tasks),
+    skipPatterns: aggregateSkipPatterns(instances, tasks),
+    abandonment: aggregateAbandonment(instances, steps, tasks),
+    timeOfDay: aggregateTimeOfDay(instances),
+  };
+}
+
+import { queryAll, queryAllItems } from './batch';
+import { TABLE_NAME } from './dynamodb';
+import {
+  ENTITY,
+  CATEGORY_PREFIX,
+  TASK_INSTANCE_PREFIX,
+  TASK_INSTANCE_STEP_PREFIX,
+  TASK_OWNER_INDEX,
+  userPk,
+} from './keys';
+
+/**
+ * Gather a user's task data for the range and compute the deterministic stats.
+ * Instances use a single BETWEEN on the date-sorted SK; steps/categories are prefix
+ * scans of the user partition; tasks come from the owner index (title + category).
+ */
+export async function buildReportStats(
+  userId: string,
+  from: string,
+  to: string,
+): Promise<ReportStats> {
+  const pk = userPk(userId);
+  const [instances, allSteps, tasks, categories] = await Promise.all([
+    queryAll<TaskInstance>({
+      TableName: TABLE_NAME,
+      KeyConditionExpression: 'PK = :pk AND SK BETWEEN :from AND :to',
+      ExpressionAttributeValues: {
+        ':pk': pk,
+        ':from': `${TASK_INSTANCE_PREFIX}${from}`,
+        // ￿ sorts after every `TASK_INSTANCE#<to>#...` so the whole `to` day is included.
+        ':to': `${TASK_INSTANCE_PREFIX}${to}￿`,
+      },
+    }),
+    queryAllItems<TaskInstanceStep>(pk, TASK_INSTANCE_STEP_PREFIX),
+    queryAll<Task>({
+      TableName: TABLE_NAME,
+      IndexName: TASK_OWNER_INDEX,
+      KeyConditionExpression: 'ownerId = :owner',
+      FilterExpression: 'entityType = :task',
+      ExpressionAttributeValues: { ':owner': userId, ':task': ENTITY.TASK },
+    }),
+    queryAllItems<Category>(pk, CATEGORY_PREFIX),
+  ]);
+
+  // Keep only step rows belonging to in-range instances (steps aren't date-keyed).
+  const inRange = new Set(instances.map((i) => i.instanceId));
+  const steps = allSteps.filter((s) => inRange.has(s.instanceId));
+
+  return computeReportStats({
+    userId,
+    from,
+    to,
+    now: new Date().toISOString(),
+    instances,
+    steps,
+    tasks,
+    categories,
+  });
 }
