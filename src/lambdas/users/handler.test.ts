@@ -230,30 +230,60 @@ describe('users handler — UserProfile', () => {
     expect(result).toBeNull();
   });
 
-  it('listUsersByOrganization queries the orgIndex by organizationId and returns a connection', async () => {
-    mockSend.mockResolvedValueOnce({ Items: [{ userId: 'u1', role: 'PRIMARY_USER' }] });
+  it('listUsersByOrganization (deprecated, self-scoped) lists the caller OWN org via orgIndex', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { userId: 'sub-1', organizationId: 'org-1' } }) // caller profile
+      .mockResolvedValueOnce({ Items: [{ userId: 'u1', role: 'PRIMARY_USER' }] }); // orgIndex query
     const result = (await handler(
-      event('listUsersByOrganization', { organizationId: 'org-1' }),
+      event('listUsersByOrganization', { organizationId: 'org-1' }, caller(['SupportPerson'], 'sub-1')),
     )) as Connection<unknown>;
-    expect(lastInput().IndexName).toBe('orgIndex');
-    expect(lastInput().ExpressionAttributeValues).toEqual({ ':org': 'org-1' });
+    // First call = caller profile GET; second = orgIndex query scoped to the caller's own org.
+    const query = mockSend.mock.calls[1][0].input;
+    expect(query.IndexName).toBe('orgIndex');
+    expect(query.ExpressionAttributeValues).toEqual({ ':org': 'org-1' });
     expect(result.items).toHaveLength(1);
     expect(result.nextToken).toBeNull();
   });
 
   it('listUsersByOrganization forwards limit and decodes nextToken into ExclusiveStartKey', async () => {
     const startKey = { organizationId: 'org-1', userId: 'u0', PK: 'USER#u0', SK: '#PROFILE' };
-    mockSend.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: startKey });
+    mockSend
+      .mockResolvedValueOnce({ Item: { userId: 'sub-1', organizationId: 'org-1' } }) // caller profile
+      .mockResolvedValueOnce({ Items: [], LastEvaluatedKey: startKey }); // orgIndex query
     const result = (await handler(
-      event('listUsersByOrganization', {
-        organizationId: 'org-1',
-        limit: 10,
-        nextToken: encodeNextToken(startKey)!,
-      }),
+      event(
+        'listUsersByOrganization',
+        { organizationId: 'org-1', limit: 10, nextToken: encodeNextToken(startKey)! },
+        caller(['SupportPerson'], 'sub-1'),
+      ),
     )) as Connection<unknown>;
-    expect(lastInput().Limit).toBe(10);
-    expect(lastInput().ExclusiveStartKey).toEqual(startKey);
+    const query = mockSend.mock.calls[1][0].input;
+    expect(query.Limit).toBe(10);
+    expect(query.ExclusiveStartKey).toEqual(startKey);
     expect(result.nextToken).not.toBeNull(); // LastEvaluatedKey present → another page
+  });
+
+  it('listUsersByOrganization rejects listing another organization', async () => {
+    mockSend.mockResolvedValueOnce({ Item: { userId: 'sub-1', organizationId: 'org-1' } }); // caller profile
+    await expect(
+      handler(event('listUsersByOrganization', { organizationId: 'org-2' }, caller(['SupportPerson'], 'sub-1'))),
+    ).rejects.toThrow('only list your own organization');
+    // It must never run the roster query for a foreign org.
+    expect(mockSend.mock.calls.some((c) => c[0].input.IndexName === 'orgIndex')).toBe(false);
+  });
+
+  it('listUsersByOrganization rejects a caller with no organization (VALIDATION)', async () => {
+    mockSend.mockResolvedValueOnce({ Item: { userId: 'sub-1' } }); // profile has no organizationId
+    await expect(
+      handler(event('listUsersByOrganization', { organizationId: 'org-1' }, caller(['SupportPerson'], 'sub-1'))),
+    ).rejects.toThrow('no current organization');
+  });
+
+  it('listUsersByOrganization rejects an unauthenticated caller', async () => {
+    await expect(
+      handler(event('listUsersByOrganization', { organizationId: 'org-1' }, undefined)),
+    ).rejects.toThrow('authenticated user is required');
+    expect(mockSend).not.toHaveBeenCalled();
   });
 });
 
@@ -336,7 +366,7 @@ describe('users handler — updateMyUserProfile', () => {
   it('rejects an empty input (no editable field supplied)', async () => {
     await expect(
       handler(event('updateMyUserProfile', { input: {} }, caller(['PrimaryUser'], 'sub-1'))),
-    ).rejects.toThrow('at least one of displayName or accessibilitySettings');
+    ).rejects.toThrow('at least one of displayName, accessibilitySettings, or organizationId');
     expect(mockSend).not.toHaveBeenCalled();
   });
 
@@ -395,17 +425,17 @@ describe('users handler — updateMyUserProfile', () => {
     expect(lastInput().Key).toEqual({ PK: 'USER#sub-me', SK: '#PROFILE' });
   });
 
-  it('never changes organizationId, role, email, defaultCategoryId, or createdAt', async () => {
+  it('never changes role, email, defaultCategoryId, or createdAt', async () => {
     mockSend.mockResolvedValueOnce({ Attributes: storedProfile({ displayName: 'New name' }) });
     await handler(
       event(
         'updateMyUserProfile',
         {
           // An attacker tries to slip protected fields into the input — they are not part
-          // of the input type and must never appear in the write expression.
+          // of the input type and must never appear in the write expression. (organizationId
+          // IS editable now and is covered separately below.)
           input: {
             displayName: 'New name',
-            organizationId: 'evil-org',
             role: 'ORG_ADMIN',
             email: 'evil@example.com',
             defaultCategoryId: 'evil-cat',
@@ -419,49 +449,249 @@ describe('users handler — updateMyUserProfile', () => {
     const cmd = lastInput();
     // Only updatedAt + displayName are written; no protected field appears.
     expect(cmd.UpdateExpression).toBe('SET updatedAt = :now, displayName = :displayName');
-    for (const field of ['organizationId', 'role', 'email', 'defaultCategoryId', 'createdAt']) {
+    for (const field of ['role', 'email', 'defaultCategoryId', 'createdAt']) {
       expect(cmd.UpdateExpression).not.toContain(field);
       expect(cmd.ExpressionAttributeValues[`:${field}`]).toBeUndefined();
     }
   });
+
+  it('sets organizationId from a non-empty string (any signed-in user — MVP self-service)', async () => {
+    mockSend.mockResolvedValueOnce({ Attributes: storedProfile({ organizationId: 'org-2' }) });
+    await handler(
+      event('updateMyUserProfile', { input: { organizationId: '  org-2  ' } }, caller(['PrimaryUser'], 'sub-1')),
+    );
+    const cmd = lastInput();
+    expect(cmd.UpdateExpression).toBe('SET updatedAt = :now, organizationId = :organizationId');
+    expect(cmd.ExpressionAttributeValues[':organizationId']).toBe('org-2'); // trimmed
+  });
+
+  it('clears organizationId with an explicit null (REMOVE)', async () => {
+    mockSend.mockResolvedValueOnce({ Attributes: storedProfile() });
+    await handler(
+      event(
+        'updateMyUserProfile',
+        { input: { organizationId: null } as Record<string, unknown> },
+        caller(['PrimaryUser'], 'sub-1'),
+      ),
+    );
+    const cmd = lastInput();
+    expect(cmd.UpdateExpression).toContain('REMOVE organizationId');
+    expect(cmd.ExpressionAttributeValues[':organizationId']).toBeUndefined();
+  });
+
+  it('leaves organizationId unchanged when the key is omitted', async () => {
+    mockSend.mockResolvedValueOnce({ Attributes: storedProfile({ displayName: 'X' }) });
+    await handler(
+      event('updateMyUserProfile', { input: { displayName: 'X' } }, caller(['PrimaryUser'], 'sub-1')),
+    );
+    expect(lastInput().UpdateExpression).not.toContain('organizationId');
+  });
+
+  it('rejects a whitespace-only organizationId (use null to clear)', async () => {
+    await expect(
+      handler(
+        event('updateMyUserProfile', { input: { organizationId: '   ' } }, caller(['PrimaryUser'], 'sub-1')),
+      ),
+    ).rejects.toThrow('organizationId cannot be empty');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
 });
 
-describe('users handler — SupportLink', () => {
-  it('createSupportLink writes SUPPORTER#<id>/USER#<id> carrying the supporterIndex fields (supporterId, userId)', async () => {
-    await handler(
-      event('createSupportLink', {
-        input: { supporterId: 's1', primaryUserId: 'u1', status: 'ACTIVE' },
-      }),
-    );
-    const { Item } = lastInput();
-    expect(Item.PK).toBe('SUPPORTER#s1');
-    expect(Item.SK).toBe('USER#u1');
-    expect(Item.entityType).toBe('SupportLink');
-    expect(Item.supporterId).toBe('s1');
-    expect(Item.primaryUserId).toBe('u1');
-    // userId mirrors primaryUserId so it can be the supporterIndex sort key.
-    expect(Item.userId).toBe('u1');
-    expect(Item.status).toBe('ACTIVE');
-  });
-
-  it('createSupportLink defaults status to PENDING and validates ids', async () => {
-    await handler(
-      event('createSupportLink', { input: { supporterId: 's1', primaryUserId: 'u1' } }),
-    );
-    expect(lastInput().Item.status).toBe('PENDING');
-    await expect(
-      handler(event('createSupportLink', { input: { supporterId: 's1' } })),
-    ).rejects.toThrow('primaryUserId is required');
-  });
-
-  it('listPrimaryUsersBySupporter queries the supporterIndex by supporterId', async () => {
-    mockSend.mockResolvedValueOnce({ Items: [{ supporterId: 's1', userId: 'u1' }] });
+describe('users handler — listMyOrganizationUsers', () => {
+  it('reads the caller org from their profile, then queries orgIndex by THAT org', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { userId: 'sub-1', organizationId: 'org-1' } }) // caller profile
+      .mockResolvedValueOnce({ Items: [{ userId: 'u2', role: 'PRIMARY_USER' }] }); // orgIndex query
     const result = (await handler(
-      event('listPrimaryUsersBySupporter', { supporterId: 's1' }),
+      event('listMyOrganizationUsers', {}, caller(['SupportPerson'], 'sub-1')),
+    )) as Connection<unknown>;
+    // First call = caller profile GET; second = orgIndex query scoped to the caller's own org.
+    const query = mockSend.mock.calls[1][0].input;
+    expect(query.IndexName).toBe('orgIndex');
+    expect(query.ExpressionAttributeValues).toEqual({ ':org': 'org-1' });
+    expect(result.items).toHaveLength(1);
+  });
+
+  it('rejects when the caller has no current organization', async () => {
+    mockSend.mockResolvedValueOnce({ Item: { userId: 'sub-1' } }); // no organizationId
+    await expect(
+      handler(event('listMyOrganizationUsers', {}, caller(['SupportPerson'], 'sub-1'))),
+    ).rejects.toThrow('no current organization');
+  });
+
+  it('rejects an unauthenticated caller', async () => {
+    await expect(handler(event('listMyOrganizationUsers', {}, undefined))).rejects.toThrow(
+      'authenticated user is required',
+    );
+  });
+});
+
+describe('users handler — selectPrimaryUser / unselectPrimaryUser', () => {
+  const SP = 'support-1';
+  const PU = 'primary-1';
+  // selectPrimaryUser reads, in order: [0] supporter profile, [1] target profile, then (only
+  // if all checks pass) [2] the upsert. Queue EXACTLY the reads each path consumes so an
+  // unconsumed mockResolvedValueOnce never leaks into the next test.
+  const profileReads = (
+    supporter: Record<string, unknown> | undefined,
+    target: Record<string, unknown> | undefined,
+  ) => {
+    mockSend.mockResolvedValueOnce({ Item: supporter }).mockResolvedValueOnce({ Item: target });
+  };
+
+  it('a SupportPerson selects an in-org PRIMARY_USER → writes the link ACTIVE (supporter from identity)', async () => {
+    profileReads(
+      { userId: SP, role: 'SUPPORT_PERSON', organizationId: 'org-1' },
+      { userId: PU, role: 'PRIMARY_USER', organizationId: 'org-1' },
+    );
+    mockSend.mockResolvedValueOnce({
+      Attributes: {
+        PK: `SUPPORTER#${SP}`,
+        SK: `USER#${PU}`,
+        entityType: 'SupportLink',
+        supporterId: SP,
+        primaryUserId: PU,
+        userId: PU,
+        status: 'ACTIVE',
+        createdAt: 'c',
+        updatedAt: 'u',
+      },
+    });
+    const result = (await handler(
+      event('selectPrimaryUser', { input: { primaryUserId: PU } }, caller(['SupportPerson'], SP)),
+    )) as { status: string; supporterId: string };
+
+    const upsert = mockSend.mock.calls[2][0].input;
+    expect(upsert.Key).toEqual({ PK: `SUPPORTER#${SP}`, SK: `USER#${PU}` });
+    expect(upsert.ExpressionAttributeValues[':active']).toBe('ACTIVE');
+    expect(upsert.ExpressionAttributeValues[':supporterId']).toBe(SP); // derived from identity
+    // createdAt preserved on restore (if_not_exists) so a REVOKED→ACTIVE keeps the original.
+    expect(upsert.UpdateExpression).toContain('createdAt = if_not_exists(createdAt, :now)');
+    expect(result.status).toBe('ACTIVE');
+    // The returned link is stripped of storage attributes.
+    expect((result as Record<string, unknown>).PK).toBeUndefined();
+  });
+
+  it('rejects selecting a user outside the caller current organization', async () => {
+    profileReads(
+      { userId: SP, role: 'SUPPORT_PERSON', organizationId: 'org-1' },
+      { userId: PU, role: 'PRIMARY_USER', organizationId: 'org-2' }, // different org
+    );
+    await expect(
+      handler(event('selectPrimaryUser', { input: { primaryUserId: PU } }, caller(['SupportPerson'], SP))),
+    ).rejects.toThrow('not in your organization');
+  });
+
+  it('rejects selecting a non-PRIMARY_USER target', async () => {
+    profileReads(
+      { userId: SP, role: 'SUPPORT_PERSON', organizationId: 'org-1' },
+      { userId: PU, role: 'SUPPORT_PERSON', organizationId: 'org-1' },
+    );
+    await expect(
+      handler(event('selectPrimaryUser', { input: { primaryUserId: PU } }, caller(['SupportPerson'], SP))),
+    ).rejects.toThrow('not a primary user');
+  });
+
+  it('rejects when the caller has no organization', async () => {
+    mockSend.mockResolvedValueOnce({ Item: { userId: SP, role: 'SUPPORT_PERSON' } }); // no org
+    await expect(
+      handler(event('selectPrimaryUser', { input: { primaryUserId: PU } }, caller(['SupportPerson'], SP))),
+    ).rejects.toThrow('must belong to an organization');
+  });
+
+  it('a PRIMARY_USER cannot select (only a SupportPerson may)', async () => {
+    await expect(
+      handler(event('selectPrimaryUser', { input: { primaryUserId: PU } }, caller(['PrimaryUser'], 'p9'))),
+    ).rejects.toThrow('SupportPerson access required');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('unselectPrimaryUser soft-revokes the link (status REVOKED, never a delete)', async () => {
+    mockSend.mockResolvedValueOnce({
+      Attributes: { supporterId: SP, primaryUserId: PU, userId: PU, status: 'REVOKED' },
+    });
+    const result = (await handler(
+      event('unselectPrimaryUser', { input: { primaryUserId: PU } }, caller(['SupportPerson'], SP)),
+    )) as { status: string };
+    const cmd = lastInput();
+    expect(cmd.Key).toEqual({ PK: `SUPPORTER#${SP}`, SK: `USER#${PU}` });
+    expect(cmd.UpdateExpression).toContain('#status = :revoked');
+    expect(cmd.ExpressionAttributeValues[':revoked']).toBe('REVOKED');
+    // Conditioned on the link existing — never an upsert/create.
+    expect(cmd.ConditionExpression).toBe('attribute_exists(PK)');
+    expect(result.status).toBe('REVOKED');
+  });
+
+  it('a PRIMARY_USER cannot unselect', async () => {
+    await expect(
+      handler(event('unselectPrimaryUser', { input: { primaryUserId: PU } }, caller(['PrimaryUser'], 'p9'))),
+    ).rejects.toThrow('SupportPerson access required');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('unselectPrimaryUser 404s when no link exists', async () => {
+    mockSend.mockRejectedValueOnce(
+      Object.assign(new Error('cond'), { name: 'ConditionalCheckFailedException' }),
+    );
+    await expect(
+      handler(event('unselectPrimaryUser', { input: { primaryUserId: PU } }, caller(['SupportPerson'], SP))),
+    ).rejects.toThrow('no support link');
+  });
+});
+
+describe('users handler — createSupportLink (deprecated alias)', () => {
+  const SP = 'support-1';
+  const PU = 'primary-1';
+
+  it('ignores a client-supplied supporterId, deriving the supporter from identity, and writes ACTIVE', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { userId: SP, role: 'SUPPORT_PERSON', organizationId: 'org-1' } })
+      .mockResolvedValueOnce({ Item: { userId: PU, role: 'PRIMARY_USER', organizationId: 'org-1' } })
+      .mockResolvedValueOnce({ Attributes: { supporterId: SP, primaryUserId: PU, status: 'ACTIVE' } });
+    const result = (await handler(
+      event(
+        'createSupportLink',
+        // Attacker tries to set supporterId to a victim; it must be ignored.
+        { input: { supporterId: 'victim', primaryUserId: PU, status: 'PENDING' } },
+        caller(['SupportPerson'], SP),
+      ),
+    )) as { supporterId: string; status: string };
+    const upsert = mockSend.mock.calls[2][0].input;
+    expect(upsert.Key).toEqual({ PK: `SUPPORTER#${SP}`, SK: `USER#${PU}` }); // NOT victim
+    expect(upsert.ExpressionAttributeValues[':supporterId']).toBe(SP);
+    expect(upsert.ExpressionAttributeValues[':active']).toBe('ACTIVE'); // client status ignored
+    expect(result.status).toBe('ACTIVE');
+  });
+});
+
+describe('users handler — support list queries', () => {
+  it('listMySupportList queries supporterIndex by the caller sub (identity-derived)', async () => {
+    mockSend.mockResolvedValueOnce({ Items: [{ supporterId: 'support-1', userId: 'primary-1' }] });
+    const result = (await handler(
+      event('listMySupportList', {}, caller(['SupportPerson'], 'support-1')),
     )) as Connection<unknown>;
     expect(lastInput().IndexName).toBe('supporterIndex');
-    expect(lastInput().ExpressionAttributeValues).toEqual({ ':sup': 's1' });
+    expect(lastInput().ExpressionAttributeValues).toEqual({ ':sup': 'support-1' });
     expect(result.items).toHaveLength(1);
+  });
+
+  it('listPrimaryUsersBySupporter allows the caller to list their OWN support list', async () => {
+    mockSend.mockResolvedValueOnce({ Items: [{ supporterId: 'support-1', userId: 'primary-1' }] });
+    const result = (await handler(
+      event('listPrimaryUsersBySupporter', { supporterId: 'support-1' }, caller(['SupportPerson'], 'support-1')),
+    )) as Connection<unknown>;
+    expect(lastInput().IndexName).toBe('supporterIndex');
+    expect(lastInput().ExpressionAttributeValues).toEqual({ ':sup': 'support-1' });
+    expect(result.items).toHaveLength(1);
+  });
+
+  it('listPrimaryUsersBySupporter rejects listing another supporter list (no arbitrary supporterId)', async () => {
+    await expect(
+      handler(
+        event('listPrimaryUsersBySupporter', { supporterId: 'someone-else' }, caller(['SupportPerson'], 'support-1')),
+      ),
+    ).rejects.toThrow('only list your own support list');
+    expect(mockSend).not.toHaveBeenCalled();
   });
 });
 

@@ -1,7 +1,9 @@
 import { randomUUID } from 'crypto';
 import { GetCommand, PutCommand, TransactWriteCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { requireGroup } from '../../shared/auth';
 import { requireCaller } from '../../shared/authz';
 import { getOwnedCategory } from '../../shared/category';
+import { loadProfile } from '../../shared/delegation';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import {
   categorySk,
@@ -17,8 +19,8 @@ import {
   userPk,
 } from '../../shared/keys';
 import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
-import { NotFoundError, ValidationError } from '../../shared/response';
-import { roleFromIdentity } from '../../shared/roles';
+import { NotFoundError, UnauthorizedError, ValidationError } from '../../shared/response';
+import { roleFromIdentity, SUPPORT_PERSON_GROUP } from '../../shared/roles';
 import type {
   AppSyncEvent,
   AppSyncIdentity,
@@ -26,7 +28,9 @@ import type {
   Connection,
   CreateMyUserProfileInput,
   CreateSupportLinkInput,
+  SelectPrimaryUserInput,
   SupportLink,
+  UnselectPrimaryUserInput,
   UpdateMyUserProfileInput,
   UserProfile,
 } from '../../shared/types';
@@ -41,20 +45,28 @@ export const handler = async (
 ): Promise<
   UserProfile | SupportLink | Connection<UserProfile> | Connection<SupportLink> | null
 > => {
-  const { arguments: args } = event;
+  const { arguments: args, identity } = event;
   switch (event.info?.fieldName) {
     case 'createUserProfile':
-      return createMyUserProfile(event.identity, args.input as CreateMyUserProfileInput);
+      return createMyUserProfile(identity, args.input as CreateMyUserProfileInput);
     case 'updateMyUserProfile':
-      return updateMyUserProfile(event.identity, args.input as UpdateMyUserProfileInput);
+      return updateMyUserProfile(identity, args.input as UpdateMyUserProfileInput);
     case 'getUserProfile':
       return getUserProfile(args.userId as string);
     case 'listUsersByOrganization':
-      return listUsersByOrganization(args.organizationId as string, pageArgs(args));
+      return listUsersByOrganization(identity, args.organizationId as string, pageArgs(args));
+    case 'listMyOrganizationUsers':
+      return listMyOrganizationUsers(identity, pageArgs(args));
     case 'createSupportLink':
-      return createSupportLink(args.input as CreateSupportLinkInput);
+      return createSupportLink(identity, args.input as CreateSupportLinkInput);
+    case 'selectPrimaryUser':
+      return selectPrimaryUser(identity, args.input as SelectPrimaryUserInput);
+    case 'unselectPrimaryUser':
+      return unselectPrimaryUser(identity, args.input as UnselectPrimaryUserInput);
     case 'listPrimaryUsersBySupporter':
-      return listPrimaryUsersBySupporter(args.supporterId as string, pageArgs(args));
+      return listPrimaryUsersBySupporter(identity, args.supporterId as string, pageArgs(args));
+    case 'listMySupportList':
+      return listMySupportList(identity, pageArgs(args));
     default:
       throw new Error(`users handler: unsupported field "${event.info?.fieldName}"`);
   }
@@ -284,14 +296,15 @@ function stripProfile(item: Record<string, unknown>): UserProfile {
  * Cognito `sub` (never a client-supplied userId), so a caller can only edit their own row.
  *
  * Distinct from createUserProfile: this NEVER creates a profile or a default category, NEVER
- * touches role/email/organizationId/defaultCategoryId/createdAt/keys/entityType, and is a
- * targeted UpdateCommand (not a full-item Put) so every untouched field is preserved. Only
- * `displayName` and `accessibilitySettings` are editable:
+ * touches role/email/defaultCategoryId/createdAt/keys/entityType, and is a targeted
+ * UpdateCommand (not a full-item Put) so every untouched field is preserved. Editable fields:
  *  - `displayName`: omitted ⇒ unchanged; otherwise trimmed (null/empty/whitespace rejected).
  *  - `accessibilitySettings`: omitted ⇒ unchanged; explicit `null` ⇒ cleared (REMOVE); a
  *    non-null value ⇒ FULL replacement of the stored value (never deep-merged). It arrives
  *    already parsed from the AWSJSON argument and is stored as-is; AppSync re-serializes it
  *    to an AWSJSON string on the way out.
+ *  - `organizationId` (MVP self-service): omitted ⇒ unchanged; non-empty string ⇒ set; explicit
+ *    `null` ⇒ cleared (REMOVE); a blank string is rejected. Any signed-in user may set their own.
  *
  * At least one editable field must be supplied. The write is conditioned on the profile
  * existing (`attribute_exists(PK)`), so it can never create a new row; a missing profile
@@ -305,9 +318,10 @@ async function updateMyUserProfile(
 
   const displayNameKeyPresent = input?.displayName !== undefined;
   const settingsKeyPresent = input?.accessibilitySettings !== undefined;
-  if (!displayNameKeyPresent && !settingsKeyPresent) {
+  const orgKeyPresent = input?.organizationId !== undefined;
+  if (!displayNameKeyPresent && !settingsKeyPresent && !orgKeyPresent) {
     throw new ValidationError(
-      'at least one of displayName or accessibilitySettings must be supplied',
+      'at least one of displayName, accessibilitySettings, or organizationId must be supplied',
     );
   }
 
@@ -330,6 +344,21 @@ async function updateMyUserProfile(
     } else {
       setParts.push('accessibilitySettings = :settings');
       values[':settings'] = input.accessibilitySettings;
+    }
+  }
+
+  if (orgKeyPresent) {
+    // MVP self-service org membership: explicit null clears it; a non-empty string sets it
+    // (a blank/whitespace string is rejected — use null to clear). role/email/etc. stay locked.
+    if (input.organizationId === null) {
+      removeParts.push('organizationId');
+    } else {
+      const organizationId = input.organizationId?.trim();
+      if (!organizationId) {
+        throw new ValidationError('organizationId cannot be empty; use null to clear it');
+      }
+      setParts.push('organizationId = :organizationId');
+      values[':organizationId'] = organizationId;
     }
   }
 
@@ -365,12 +394,57 @@ async function getUserProfile(userId: string): Promise<UserProfile | null> {
   return (result.Item as UserProfile) ?? null;
 }
 
+/**
+ * listUsersByOrganization — DEPRECATED, now strictly SELF-SCOPED. Prefer listMyOrganizationUsers.
+ * The org argument is no longer trusted to enumerate an arbitrary roster: the caller may only
+ * list THEIR OWN current organization. The supplied organizationId must equal the caller's
+ * current org (else NOT_AUTHORIZED); a caller with no org gets a VALIDATION error. Returns the
+ * lightweight orgIndex projection (userId, displayName, role).
+ */
 async function listUsersByOrganization(
+  identity: AppSyncIdentity | undefined,
   organizationId: string,
   page: PageArgs,
 ): Promise<Connection<UserProfile>> {
-  if (!organizationId?.trim()) throw new ValidationError('organizationId is required');
-  // orgIndex projects displayName + role — a lightweight roster, not the full profile.
+  const requested = organizationId?.trim();
+  if (!requested) throw new ValidationError('organizationId is required');
+  const callerOrg = await requireCallerOrganization(identity);
+  if (requested !== callerOrg) {
+    throw new UnauthorizedError('Unauthorized: you can only list your own organization');
+  }
+  return queryOrgRoster(callerOrg, page);
+}
+
+/**
+ * listMyOrganizationUsers — the roster of users in the AUTHENTICATED caller's OWN current
+ * organization. The org is read from the caller's profile (never a client argument), so a
+ * caller can only ever see their own org — a SupportPerson cannot enumerate another
+ * organization. Errors if the caller has no current organization. Returns the lightweight
+ * orgIndex projection (userId, displayName, role).
+ */
+async function listMyOrganizationUsers(
+  identity: AppSyncIdentity | undefined,
+  page: PageArgs,
+): Promise<Connection<UserProfile>> {
+  const callerOrg = await requireCallerOrganization(identity);
+  return queryOrgRoster(callerOrg, page);
+}
+
+/** The authenticated caller's current organizationId, or a ValidationError if they have none. */
+async function requireCallerOrganization(identity: AppSyncIdentity | undefined): Promise<string> {
+  const caller = requireCaller(identity);
+  const profile = await loadProfile(caller);
+  const organizationId = profile?.organizationId?.trim();
+  if (!organizationId) {
+    throw new ValidationError(
+      'caller has no current organization; set one via updateMyUserProfile first',
+    );
+  }
+  return organizationId;
+}
+
+/** Query the orgIndex roster for one organization (projects userId, displayName, role). */
+function queryOrgRoster(organizationId: string, page: PageArgs): Promise<Connection<UserProfile>> {
   return queryPage<UserProfile>(
     {
       TableName: TABLE_NAME,
@@ -382,44 +456,177 @@ async function listUsersByOrganization(
   );
 }
 
-async function createSupportLink(input: CreateSupportLinkInput): Promise<SupportLink> {
-  const supporterId = input?.supporterId?.trim();
+// ── SupportLink selection (SupportPerson delegated access) ──────────────────────
+
+/**
+ * selectPrimaryUser — a SupportPerson selects a PRIMARY_USER in their OWN organization to
+ * support, writing (or restoring) the SupportLink as ACTIVE. The supporter is ALWAYS the
+ * authenticated caller (never client-supplied). Guard rails:
+ *  - only a SupportPerson may select (a primary user cannot select a supporter);
+ *  - the caller must currently belong to an organization;
+ *  - the target must exist, be a PRIMARY_USER, and currently share the caller's organization.
+ * The write is an idempotent upsert: a brand-new link is created ACTIVE, and a previously
+ * REVOKED link is restored to ACTIVE while preserving its original createdAt.
+ */
+async function selectPrimaryUser(
+  identity: AppSyncIdentity | undefined,
+  input: SelectPrimaryUserInput,
+): Promise<SupportLink> {
+  const supporterId = requireCaller(identity);
+  // Only a SupportPerson may select/unselect — a primary user cannot select a supporter.
+  requireGroup(identity, SUPPORT_PERSON_GROUP);
+
   const primaryUserId = input?.primaryUserId?.trim();
-  if (!supporterId) throw new ValidationError('supporterId is required and cannot be empty');
+  if (!primaryUserId) throw new ValidationError('primaryUserId is required and cannot be empty');
+  if (primaryUserId === supporterId) {
+    throw new ValidationError('cannot select yourself as a primary user');
+  }
+
+  const supporter = await loadProfile(supporterId);
+  const supporterOrg = supporter?.organizationId?.trim();
+  if (!supporterOrg) {
+    throw new ValidationError(
+      'you must belong to an organization to select primary users; set one via updateMyUserProfile',
+    );
+  }
+
+  const target = await loadProfile(primaryUserId);
+  if (!target) throw new NotFoundError(`user ${primaryUserId} not found`);
+  if (target.role !== 'PRIMARY_USER') {
+    throw new ValidationError(`user ${primaryUserId} is not a primary user and cannot be selected`);
+  }
+  if ((target.organizationId?.trim() ?? '') !== supporterOrg) {
+    throw new UnauthorizedError(`Unauthorized: user ${primaryUserId} is not in your organization`);
+  }
+
+  const now = new Date().toISOString();
+  // Upsert: create ACTIVE if absent, or restore a REVOKED link to ACTIVE — preserving its
+  // original createdAt. supporterId/userId are (re)written so the GSIs stay populated.
+  const setParts = [
+    'entityType = :entityType',
+    'supporterId = :supporterId',
+    'primaryUserId = :primaryUserId',
+    // `userId` mirrors primaryUserId — the supporterIndex / primaryUserSupportLinkIndex key.
+    'userId = :primaryUserId',
+    '#status = :active',
+    'createdAt = if_not_exists(createdAt, :now)',
+    'updatedAt = :now',
+  ];
+  const values: Record<string, unknown> = {
+    ':entityType': ENTITY.SUPPORT_LINK,
+    ':supporterId': supporterId,
+    ':primaryUserId': primaryUserId,
+    ':active': 'ACTIVE',
+    ':now': now,
+  };
+  // Permissions: set only when supplied (omitted ⇒ leave any prior value untouched).
+  if (input?.permissions !== undefined) {
+    setParts.push('permissions = :permissions');
+    values[':permissions'] = input.permissions ?? null;
+  }
+
+  const result = await dynamo.send(
+    new UpdateCommand({
+      TableName: TABLE_NAME,
+      Key: { PK: supporterPk(supporterId), SK: userLinkSk(primaryUserId) },
+      UpdateExpression: `SET ${setParts.join(', ')}`,
+      ExpressionAttributeNames: { '#status': 'status' },
+      ExpressionAttributeValues: values,
+      ReturnValues: 'ALL_NEW',
+    }),
+  );
+  return stripSupportLink(result.Attributes as Record<string, unknown>);
+}
+
+/**
+ * unselectPrimaryUser — a SupportPerson un-selects a primary user, SOFT-revoking the SupportLink
+ * (status REVOKED) rather than deleting it, so the original row (and createdAt) survives and a
+ * later selectPrimaryUser restores it. The supporter is the authenticated caller; only a
+ * SupportPerson may unselect. NotFound if no link exists for the (caller, primaryUser) pair.
+ */
+async function unselectPrimaryUser(
+  identity: AppSyncIdentity | undefined,
+  input: UnselectPrimaryUserInput,
+): Promise<SupportLink> {
+  const supporterId = requireCaller(identity);
+  requireGroup(identity, SUPPORT_PERSON_GROUP);
+
+  const primaryUserId = input?.primaryUserId?.trim();
   if (!primaryUserId) throw new ValidationError('primaryUserId is required and cannot be empty');
 
   const now = new Date().toISOString();
-  const link: SupportLink = {
-    supporterId,
-    primaryUserId,
-    // `userId` mirrors primaryUserId so it can serve as the supporterIndex sort key.
-    userId: primaryUserId,
-    status: input.status ?? 'PENDING',
-    permissions: input.permissions,
-    createdAt: now,
-    updatedAt: now,
-  };
-
-  await dynamo.send(
-    new PutCommand({
-      TableName: TABLE_NAME,
-      Item: {
-        PK: supporterPk(supporterId),
-        SK: userLinkSk(primaryUserId),
-        entityType: ENTITY.SUPPORT_LINK,
-        ...link,
-      },
-    }),
-  );
-
-  return link;
+  try {
+    const result = await dynamo.send(
+      new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: { PK: supporterPk(supporterId), SK: userLinkSk(primaryUserId) },
+        UpdateExpression: 'SET #status = :revoked, updatedAt = :now',
+        // Never create a link here — only revoke one that exists.
+        ConditionExpression: 'attribute_exists(PK)',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':revoked': 'REVOKED', ':now': now },
+        ReturnValues: 'ALL_NEW',
+      }),
+    );
+    return stripSupportLink(result.Attributes as Record<string, unknown>);
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
+      throw new NotFoundError(`no support link from ${supporterId} to ${primaryUserId} to unselect`);
+    }
+    throw err;
+  }
 }
 
+/**
+ * createSupportLink — DEPRECATED compatibility alias for selectPrimaryUser. The supporter is the
+ * authenticated caller (the client-supplied supporterId is IGNORED — it must never be trusted),
+ * and the same SupportPerson-only / same-organization / target-is-a-primary-user checks apply.
+ * The client-supplied status is ignored too: the link is always (re)activated as ACTIVE.
+ */
+async function createSupportLink(
+  identity: AppSyncIdentity | undefined,
+  input: CreateSupportLinkInput,
+): Promise<SupportLink> {
+  return selectPrimaryUser(identity, {
+    primaryUserId: input?.primaryUserId,
+    permissions: input?.permissions,
+  });
+}
+
+/**
+ * listMySupportList — the AUTHENTICATED caller's own support list (every primary user they have
+ * selected, ACTIVE and REVOKED), via supporterIndex keyed on the caller's sub.
+ */
+async function listMySupportList(
+  identity: AppSyncIdentity | undefined,
+  page: PageArgs,
+): Promise<Connection<SupportLink>> {
+  const supporterId = requireCaller(identity);
+  return querySupportList(supporterId, page);
+}
+
+/**
+ * listPrimaryUsersBySupporter — DEPRECATED alias for listMySupportList. Now strictly
+ * self-scoped: a caller may only list their OWN support list, so the supplied supporterId must
+ * equal the caller's sub (else NOT_AUTHORIZED) — a client can no longer read an arbitrary
+ * supporter's links.
+ */
 async function listPrimaryUsersBySupporter(
+  identity: AppSyncIdentity | undefined,
   supporterId: string,
   page: PageArgs,
 ): Promise<Connection<SupportLink>> {
-  if (!supporterId?.trim()) throw new ValidationError('supporterId is required');
+  const caller = requireCaller(identity);
+  const requested = supporterId?.trim();
+  if (!requested) throw new ValidationError('supporterId is required');
+  if (requested !== caller) {
+    throw new UnauthorizedError('Unauthorized: you can only list your own support list');
+  }
+  return querySupportList(caller, page);
+}
+
+/** Query a supporter's SupportLinks (supporterIndex), shared by listMySupportList + the alias. */
+function querySupportList(supporterId: string, page: PageArgs): Promise<Connection<SupportLink>> {
   return queryPage<SupportLink>(
     {
       TableName: TABLE_NAME,
@@ -429,4 +636,13 @@ async function listPrimaryUsersBySupporter(
     },
     page,
   );
+}
+
+/** Strip internal storage attributes (PK/SK/entityType) before returning a SupportLink. */
+function stripSupportLink(item: Record<string, unknown>): SupportLink {
+  const out = { ...item };
+  delete out.PK;
+  delete out.SK;
+  delete out.entityType;
+  return out as unknown as SupportLink;
 }

@@ -395,21 +395,44 @@ input CreateMyUserProfileInput {
 }
 
 # Partial update of the signed-in caller's OWN profile. The owner is derived from the
-# Cognito identity — there is no userId. Only displayName and accessibilitySettings may be
-# changed here; userId, email, role, organizationId, defaultCategoryId, and timestamps are
-# not editable. Supply at least one field. displayName: omitted ⇒ unchanged; otherwise
-# trimmed and may not be empty/whitespace. accessibilitySettings: omitted ⇒ unchanged;
-# explicit null ⇒ cleared; a value ⇒ FULL replacement of the stored settings (never merged).
+# Cognito identity — there is no userId. userId, email, role, defaultCategoryId, and
+# timestamps are not editable. Supply at least one field. displayName: omitted ⇒ unchanged;
+# otherwise trimmed and may not be empty/whitespace. accessibilitySettings: omitted ⇒
+# unchanged; explicit null ⇒ cleared; a value ⇒ FULL replacement of the stored settings
+# (never merged). organizationId (MVP self-service org membership): omitted ⇒ unchanged; a
+# non-empty string sets it; explicit null clears it. Any signed-in user may change their own
+# organizationId for this MVP (no org-admin gating yet).
 input UpdateMyUserProfileInput {
   displayName: String
   accessibilitySettings: AWSJSON
+  organizationId: ID
 }
 
+# DEPRECATED — prefer selectPrimaryUser. Retained as a compatibility alias; the supporter is
+# now always the authenticated caller (a client-supplied supporterId is ignored), and the same
+# SupportPerson-only / same-organization / target-is-a-primary-user checks as selectPrimaryUser
+# apply. status is ignored (the link is always (re)activated as ACTIVE).
 input CreateSupportLinkInput {
   supporterId: ID!
   primaryUserId: ID!
   status: SupportLinkStatus
   permissions: AWSJSON
+}
+
+# A SupportPerson selects a PRIMARY_USER in their OWN current organization to support. The
+# supporter is the authenticated caller (never client-supplied). Writes or restores the
+# SupportLink as ACTIVE. Only a SupportPerson may select; the target must be a PRIMARY_USER
+# currently in the caller's organization.
+input SelectPrimaryUserInput {
+  primaryUserId: ID!
+  permissions: AWSJSON
+}
+
+# A SupportPerson un-selects a previously selected PRIMARY_USER. The supporter is the
+# authenticated caller. Soft-revokes the SupportLink (status REVOKED) — it is never hard
+# deleted, so re-selecting restores the original row.
+input UnselectPrimaryUserInput {
+  primaryUserId: ID!
 }
 
 # Create one of the caller's own categories. The owner is derived from the Cognito
@@ -560,9 +583,13 @@ input DeleteTaskStepInput {
 # TaskInstance rows. ONE_TIME requires scheduledFor + timezone; RECURRING requires
 # scheduleRule + startDate + startTime + timezone (endDate optional). The RRULE's FREQ must be
 # DAILY/WEEKLY/MONTHLY/YEARLY — a missing FREQ or HOURLY/MINUTELY/SECONDLY is rejected.
+# Authorization: the caller must own the referenced Task template, and may only target a userId
+# that is themselves OR a primary user they have actively selected (SupportPerson delegation).
 input CreateTaskAssignmentInput {
   taskId: ID!
   userId: ID!
+  # DEPRECATED/IGNORED — assignedBy is always derived from the caller's identity (event sub),
+  # never trusted from input. Retained only so older clients don't break.
   assignedBy: ID
   scheduleType: TaskAssignmentScheduleType!
   scheduledFor: String
@@ -792,8 +819,23 @@ type Query {
   healthCheck: String! @aws_api_key @aws_cognito_user_pools
 
   getUserProfile(userId: ID!): UserProfile
+  # DEPRECATED — prefer listMyOrganizationUsers. Now strictly self-scoped: organizationId must
+  # equal the caller's OWN current organization (else NOT_AUTHORIZED); a caller with no
+  # organization gets VALIDATION. A caller can no longer enumerate an arbitrary org roster.
   listUsersByOrganization(organizationId: ID!, limit: Int, nextToken: String): UserProfileConnection!
+  # DEPRECATED — prefer listMySupportList. Now strictly self-scoped: the caller's sub must
+  # equal supporterId (a caller can only list their own support list), else NOT_AUTHORIZED.
   listPrimaryUsersBySupporter(supporterId: ID!, limit: Int, nextToken: String): SupportLinkConnection!
+
+  # The roster of users in the AUTHENTICATED caller's OWN current organization (orgIndex
+  # projection: userId, displayName, role). The organization is taken from the caller's
+  # profile — there is no organizationId argument, so a caller can only ever see their own
+  # org. A SupportPerson uses this to find PRIMARY_USERs they may select. Errors with
+  # VALIDATION if the caller has no current organization.
+  listMyOrganizationUsers(limit: Int, nextToken: String): UserProfileConnection!
+  # The AUTHENTICATED caller's OWN support list — every primary user they have selected
+  # (supporterIndex, keyed on the caller's sub). Includes ACTIVE and REVOKED links.
+  listMySupportList(limit: Int, nextToken: String): SupportLinkConnection!
 
   # The authenticated caller's own categories (owner derived from the Cognito identity).
   listMyCategories(limit: Int, nextToken: String): CategoryConnection!
@@ -851,11 +893,23 @@ type Mutation {
   # from the Cognito session (role derived from group membership), not the input.
   createUserProfile(input: CreateMyUserProfileInput!): UserProfile
   # Partial update of the caller's OWN profile (owner derived from the Cognito identity).
-  # Only displayName and accessibilitySettings are editable; accessibilitySettings is a full
-  # replacement, not a merge. Errors (NotFound) if the profile doesn't exist — it never
-  # creates one. organizationId, role, email, etc. cannot be changed here.
+  # displayName, accessibilitySettings, and organizationId are editable (accessibilitySettings
+  # is a full replacement, not a merge; organizationId: omitted ⇒ unchanged, value ⇒ set, null
+  # ⇒ clear). Errors (NotFound) if the profile doesn't exist — it never creates one. role,
+  # email, defaultCategoryId, and timestamps cannot be changed here.
   updateMyUserProfile(input: UpdateMyUserProfileInput!): UserProfile!
+  # DEPRECATED — prefer selectPrimaryUser. Compatibility alias that (re)activates a SupportLink
+  # from the AUTHENTICATED caller (supporter) to the given primary user, with the same
+  # SupportPerson-only / same-organization checks; the client-supplied supporterId and status
+  # are ignored.
   createSupportLink(input: CreateSupportLinkInput!): SupportLink
+  # A SupportPerson selects a PRIMARY_USER in their own organization (writes/restores the
+  # SupportLink as ACTIVE). Supporter = the authenticated caller. Only a SupportPerson may
+  # call this; the target must be a PRIMARY_USER currently in the caller's organization.
+  selectPrimaryUser(input: SelectPrimaryUserInput!): SupportLink!
+  # A SupportPerson un-selects a previously selected primary user — soft-revokes the
+  # SupportLink (status REVOKED), never a hard delete. Supporter = the authenticated caller.
+  unselectPrimaryUser(input: UnselectPrimaryUserInput!): SupportLink!
 
   # Create one of the caller's own task categories (owner derived from identity).
   createCategory(input: CreateCategoryInput!): Category

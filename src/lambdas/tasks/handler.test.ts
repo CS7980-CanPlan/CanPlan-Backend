@@ -65,13 +65,37 @@ describe('tasks handler — reads + authorization', () => {
     expect(result).toBeNull();
   });
 
-  it('getTask returns the task to its owner but rejects a non-owner', async () => {
+  it('getTask returns the task to its owner but rejects a non-owner without an assignment', async () => {
     mockSend.mockResolvedValue({ Item: meta() });
     const result = (await handler(event('getTask', { taskId: 't1' }, OWNER))) as Task;
     expect(result.taskId).toBe('t1');
+    // An intruder with no active assignment referencing the task cannot read it.
     await expect(handler(event('getTask', { taskId: 't1' }, 'intruder'))).rejects.toThrow(
-      'does not own this resource',
+      'does not own this task and has no assignment',
     );
+  });
+
+  it('getTask + listTaskSteps allow a non-owner who holds an active assignment referencing the task', async () => {
+    // Meta is owned by OWNER; the assignee reads it via an active assignment (read-only delegation).
+    mockSend.mockImplementation(
+      (cmd: { constructor: { name: string }; input: { ExpressionAttributeValues?: Record<string, unknown> } }) => {
+        if (cmd.constructor.name === 'GetCommand') return Promise.resolve({ Item: meta() });
+        if (cmd.constructor.name === 'QueryCommand') {
+          const prefix = cmd.input.ExpressionAttributeValues?.[':prefix'];
+          if (prefix === 'TASK_ASSIGNMENT#') {
+            return Promise.resolve({ Items: [{ PK: 'USER#assignee', taskId: 't1', active: true }] });
+          }
+          if (prefix === 'MEDIA#') return Promise.resolve({ Items: [] });
+          return Promise.resolve({ Items: [{ stepId: 's1', order: 1, taskId: 't1' }] });
+        }
+        return Promise.resolve({});
+      },
+    );
+
+    const task = (await handler(event('getTask', { taskId: 't1' }, 'assignee'))) as Task;
+    expect(task.taskId).toBe('t1');
+    const steps = (await handler(event('listTaskSteps', { taskId: 't1' }, 'assignee'))) as Connection<TaskStep>;
+    expect(steps.items.map((s) => s.stepId)).toEqual(['s1']);
   });
 
   it('listTaskSteps sorts by numeric order and strips internal fields', async () => {
@@ -130,10 +154,10 @@ describe('tasks handler — reads + authorization', () => {
     expect(page2.nextToken).toBeNull();
   });
 
-  it('listTaskSteps rejects a non-owner and a missing task', async () => {
+  it('listTaskSteps rejects a non-owner without an assignment, and a missing task', async () => {
     mockSend.mockResolvedValue({ Item: meta() });
     await expect(handler(event('listTaskSteps', { taskId: 't1' }, 'intruder'))).rejects.toThrow(
-      'does not own this resource',
+      'does not own this task and has no assignment',
     );
     mockSend.mockResolvedValue({}); // task missing
     await expect(handler(event('listTaskSteps', { taskId: 'gone' }))).rejects.toThrow('task gone not found');

@@ -9,8 +9,9 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import { DateTime } from 'luxon';
 import { presentAssignment } from '../../shared/assignment';
-import { requireCaller } from '../../shared/authz';
+import { assertCallerOwns, requireCaller } from '../../shared/authz';
 import { queryAllItems } from '../../shared/batch';
+import { assertCanActForUser } from '../../shared/delegation';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import {
   ENTITY,
@@ -105,28 +106,29 @@ export const handler = async (
     case 'createTaskAssignment':
       return createTaskAssignment(args.input as CreateTaskAssignmentInput, identity);
     case 'startTaskInstance':
-      return startTaskInstance(args.input as StartTaskInstanceInput);
+      return startTaskInstance(args.input as StartTaskInstanceInput, identity);
     case 'setTaskInstanceStepCompletion':
-      return setTaskInstanceStepCompletion(args.input as SetTaskInstanceStepCompletionInput);
+      return setTaskInstanceStepCompletion(args.input as SetTaskInstanceStepCompletionInput, identity);
     case 'startTaskInstanceStep':
       return startTaskInstanceStep(args.input as StartTaskInstanceStepInput);
     case 'pauseTaskInstanceTimer':
       return pauseTaskInstanceTimer(args.input as PauseTaskInstanceTimerInput);
     case 'updateTaskInstanceStatus':
-      return updateTaskInstanceStatus(args.input as UpdateTaskInstanceStatusInput);
+      return updateTaskInstanceStatus(args.input as UpdateTaskInstanceStatusInput, identity);
     case 'cancelTaskInstance':
-      return cancelTaskInstance(args.input as CancelTaskInstanceInput);
+      return cancelTaskInstance(args.input as CancelTaskInstanceInput, identity);
     case 'endTaskAssignment':
-      return endTaskAssignment(args.input as EndTaskAssignmentInput);
+      return endTaskAssignment(args.input as EndTaskAssignmentInput, identity);
     case 'deleteTaskAssignment':
-      return deleteTaskAssignment(args.input as DeleteTaskAssignmentInput);
+      return deleteTaskAssignment(args.input as DeleteTaskAssignmentInput, identity);
     case 'listTaskAssignmentsForUser':
-      return listTaskAssignmentsForUser(args.userId as string, pageArgs(args));
+      return listTaskAssignmentsForUser(args.userId as string, pageArgs(args), identity);
     case 'getTaskInstanceViews':
       return getTaskInstanceViews(
         args.userId as string,
         args.startDate as string,
         args.endDate as string,
+        identity,
       );
     case 'getTaskInstance':
       return getTaskInstance(identity, args.instanceId as string);
@@ -140,7 +142,12 @@ export const handler = async (
     case 'batchGetTaskInstances':
       return batchGetTaskInstances(identity, args.instanceIds as string[]);
     case 'listTaskInstanceSteps':
-      return listTaskInstanceSteps(args.userId as string, args.instanceId as string, pageArgs(args));
+      return listTaskInstanceSteps(
+        args.userId as string,
+        args.instanceId as string,
+        pageArgs(args),
+        identity,
+      );
     default:
       throw new Error(`scheduling handler: unsupported field "${event.info?.fieldName}"`);
   }
@@ -162,14 +169,21 @@ async function createTaskAssignment(
   if (!taskId) throw new ValidationError('taskId is required and cannot be empty');
   if (!userId) throw new ValidationError('userId is required and cannot be empty');
 
-  // Validate + normalize the schedule before any IO so bad input fails fast.
+  // The caller may only assign to themselves or to a primary user they have actively selected.
+  const caller = requireCaller(identity);
+  await assertCanActForUser(identity, userId);
+
+  // Validate + normalize the schedule before any further IO so bad input fails fast.
   const schedule = normalizeSchedule(input);
 
-  // The referenced template must exist before we bind a schedule to it.
+  // The referenced template must exist AND be owned by the caller — a SupportPerson schedules
+  // their OWN task template for a selected primary user. The assignment references the template
+  // by id; it is never copied into the primary user's account.
   const task = await dynamo.send(
     new GetCommand({ TableName: TABLE_NAME, Key: { PK: taskPk(taskId), SK: META_SK } }),
   );
   if (!task.Item) throw new NotFoundError(`task ${taskId} not found`);
+  assertCallerOwns(identity, (task.Item as { ownerId: string }).ownerId);
 
   const assignmentId = randomUUID();
   const now = new Date().toISOString();
@@ -177,7 +191,8 @@ async function createTaskAssignment(
     assignmentId,
     taskId,
     userId,
-    assignedBy: input.assignedBy?.trim() || identity?.sub?.trim(),
+    // assignedBy is ALWAYS the caller's identity — never trusted from input.
+    assignedBy: caller,
     scheduleType: schedule.scheduleType,
     scheduledFor: schedule.scheduledFor,
     scheduleRule: schedule.scheduleRule,
@@ -217,8 +232,12 @@ async function createTaskAssignment(
  * and snapshots the current TaskSteps into TaskInstanceStep rows in ONE transaction. Idempotent:
  * an already-started instance is returned unchanged (steps are never re-snapshotted).
  */
-async function startTaskInstance(input: StartTaskInstanceInput): Promise<TaskInstance> {
+async function startTaskInstance(
+  input: StartTaskInstanceInput,
+  identity: AppSyncIdentity | undefined,
+): Promise<TaskInstance> {
   const { userId, assignmentId, scheduledDate, scheduledTime } = parseOccurrenceCoords(input);
+  await assertCanActForUser(identity, userId);
 
   const assignment = await loadAssignment(userId, assignmentId);
   const occ = occurrenceFor(assignment, scheduledDate, scheduledTime);
@@ -321,6 +340,7 @@ async function startTaskInstance(input: StartTaskInstanceInput): Promise<TaskIns
 /** Toggle one step's completion on an existing, non-terminal TaskInstance. */
 async function setTaskInstanceStepCompletion(
   input: SetTaskInstanceStepCompletionInput,
+  identity: AppSyncIdentity | undefined,
 ): Promise<TaskInstanceStep> {
   const userId = input?.userId?.trim();
   const instanceId = input?.instanceId?.trim();
@@ -329,6 +349,7 @@ async function setTaskInstanceStepCompletion(
   if (!instanceId) throw new ValidationError('instanceId is required and cannot be empty');
   if (!stepId) throw new ValidationError('stepId is required and cannot be empty');
   if (typeof input.completed !== 'boolean') throw new ValidationError('completed is required');
+  await assertCanActForUser(identity, userId);
 
   const parsed = parseInstanceId(instanceId);
   if (!parsed) throw new ValidationError(`invalid instanceId "${instanceId}"`);
@@ -663,7 +684,10 @@ async function pauseTaskInstanceTimer(
  * complete (a zero-step instance may be completed). SKIPPED may be undone by moving back to
  * IN_PROGRESS; COMPLETED/CANCELLED remain frozen.
  */
-async function updateTaskInstanceStatus(input: UpdateTaskInstanceStatusInput): Promise<TaskInstance> {
+async function updateTaskInstanceStatus(
+  input: UpdateTaskInstanceStatusInput,
+  identity: AppSyncIdentity | undefined,
+): Promise<TaskInstance> {
   const userId = input?.userId?.trim();
   const instanceId = input?.instanceId?.trim();
   if (!userId) throw new ValidationError('userId is required and cannot be empty');
@@ -678,6 +702,7 @@ async function updateTaskInstanceStatus(input: UpdateTaskInstanceStatusInput): P
   if (!SETTABLE_INSTANCE_STATUSES.includes(input.status)) {
     throw new ValidationError(`status must be one of ${SETTABLE_INSTANCE_STATUSES.join(', ')}`);
   }
+  await assertCanActForUser(identity, userId);
   const status = input.status as PersistedTaskInstanceStatus;
   const parsed = parseInstanceId(instanceId);
   if (!parsed) throw new ValidationError(`invalid instanceId "${instanceId}"`);
@@ -867,8 +892,12 @@ async function finalizeInstance(
  * terminal instance (COMPLETED/SKIPPED/CANCELLED) is frozen and cannot be cancelled — that would
  * clobber a finished occurrence and leave stale lifecycle timestamps behind.
  */
-async function cancelTaskInstance(input: CancelTaskInstanceInput): Promise<TaskInstance> {
+async function cancelTaskInstance(
+  input: CancelTaskInstanceInput,
+  identity: AppSyncIdentity | undefined,
+): Promise<TaskInstance> {
   const { userId, assignmentId, scheduledDate, scheduledTime } = parseOccurrenceCoords(input);
+  await assertCanActForUser(identity, userId);
 
   const assignment = await loadAssignment(userId, assignmentId);
   const occ = occurrenceFor(assignment, scheduledDate, scheduledTime);
@@ -998,7 +1027,10 @@ async function cancelTaskInstance(input: CancelTaskInstanceInput): Promise<TaskI
  * occurrences still surface). Otherwise the assignment is fully ended: active=false, endedAt
  * set, and the activeTaskAssignmentTaskId marker removed (unblocking task deletion).
  */
-async function endTaskAssignment(input: EndTaskAssignmentInput): Promise<TaskAssignment> {
+async function endTaskAssignment(
+  input: EndTaskAssignmentInput,
+  identity: AppSyncIdentity | undefined,
+): Promise<TaskAssignment> {
   const userId = input?.userId?.trim();
   const assignmentId = input?.assignmentId?.trim();
   const effectiveDate = input?.effectiveDate?.trim();
@@ -1007,6 +1039,7 @@ async function endTaskAssignment(input: EndTaskAssignmentInput): Promise<TaskAss
   if (!effectiveDate) throw new ValidationError('effectiveDate is required and cannot be empty');
   const eff = DateTime.fromFormat(effectiveDate, 'yyyy-MM-dd', { zone: 'utc' });
   if (!eff.isValid) throw new ValidationError('effectiveDate must be a valid YYYY-MM-DD date');
+  await assertCanActForUser(identity, userId);
 
   const assignment = await loadAssignment(userId, assignmentId);
   const now = new Date().toISOString();
@@ -1054,11 +1087,15 @@ async function endTaskAssignment(input: EndTaskAssignmentInput): Promise<TaskAss
 // ── deleteTaskAssignment ────────────────────────────────────────────────────--
 
 /** Soft-delete an assignment: active=false, endedAt=now, drop the activeTaskAssignmentTaskId marker. */
-async function deleteTaskAssignment(input: DeleteTaskAssignmentInput): Promise<TaskAssignment> {
+async function deleteTaskAssignment(
+  input: DeleteTaskAssignmentInput,
+  identity: AppSyncIdentity | undefined,
+): Promise<TaskAssignment> {
   const userId = input?.userId?.trim();
   const assignmentId = input?.assignmentId?.trim();
   if (!userId) throw new ValidationError('userId is required and cannot be empty');
   if (!assignmentId) throw new ValidationError('assignmentId is required and cannot be empty');
+  await assertCanActForUser(identity, userId);
 
   const now = new Date().toISOString();
   try {
@@ -1087,8 +1124,10 @@ async function deleteTaskAssignment(input: DeleteTaskAssignmentInput): Promise<T
 async function listTaskAssignmentsForUser(
   userId: string,
   page: PageArgs,
+  identity: AppSyncIdentity | undefined,
 ): Promise<Connection<TaskAssignment>> {
   if (!userId?.trim()) throw new ValidationError('userId is required');
+  await assertCanActForUser(identity, userId.trim());
   const result = await queryPage<Record<string, unknown>>(
     {
       TableName: TABLE_NAME,
@@ -1110,9 +1149,11 @@ async function getTaskInstanceViews(
   userId: string,
   startDate: string,
   endDate: string,
+  identity: AppSyncIdentity | undefined,
 ): Promise<Connection<TaskInstanceView>> {
   if (!userId?.trim()) throw new ValidationError('userId is required');
   const id = userId.trim();
+  await assertCanActForUser(identity, id);
   const { start, end } = validateDateRange(startDate, endDate);
 
   // 1) every assignment the user has (active + ended), 3) the real instances in the window.
@@ -1270,9 +1311,11 @@ async function listTaskInstanceSteps(
   userId: string,
   instanceId: string,
   page: PageArgs,
+  identity: AppSyncIdentity | undefined,
 ): Promise<Connection<TaskInstanceStep>> {
   if (!userId?.trim()) throw new ValidationError('userId is required');
   if (!instanceId?.trim()) throw new ValidationError('instanceId is required');
+  await assertCanActForUser(identity, userId.trim());
 
   const result = await queryPage<TaskInstanceStep>(
     {

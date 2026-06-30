@@ -1,6 +1,8 @@
 import { deriveInstanceStatus, handler } from './handler';
 import { dynamo } from '../../shared/dynamodb';
 import { queryAllItems } from '../../shared/batch';
+import { assertCanActForUser } from '../../shared/delegation';
+import { UnauthorizedError } from '../../shared/response';
 import type {
   Connection,
   TaskAssignment,
@@ -14,9 +16,14 @@ jest.mock('../../shared/dynamodb', () => ({
   TABLE_NAME: 'CanPlan-test',
 }));
 jest.mock('../../shared/batch', () => ({ queryAllItems: jest.fn() }));
+// Delegated-access authorization is unit-tested in shared/delegation.test.ts; here it is mocked
+// to resolve by default (caller may act for the target), so each test can exercise the
+// scheduling logic. Specific tests override it to assert it is invoked / that a denial blocks.
+jest.mock('../../shared/delegation', () => ({ assertCanActForUser: jest.fn() }));
 
 const mockSend = dynamo.send as jest.Mock;
 const mockQueryAllItems = queryAllItems as jest.Mock;
+const mockAssertCanAct = assertCanActForUser as jest.Mock;
 
 type Rec = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any -- loose mock helpers
 
@@ -44,6 +51,8 @@ let db: DbState = {};
 beforeEach(() => {
   db = {};
   mockQueryAllItems.mockResolvedValue([]);
+  // Default: the caller is allowed to act for the target user (self or active delegation).
+  mockAssertCanAct.mockResolvedValue('assigner-1');
   mockSend.mockImplementation((command: { constructor: { name: string }; input: Rec }) => {
     const name = command.constructor.name;
     const input = command.input;
@@ -109,7 +118,8 @@ const RECURRING: TaskAssignment = {
 // ── createTaskAssignment ──────────────────────────────────────────────────────
 describe('createTaskAssignment', () => {
   it('writes ONLY a TaskAssignment row (no TaskInstances) with the active GSI marker', async () => {
-    db.taskMeta = { taskId: 't1', title: 'Take meds' };
+    // The caller must own the referenced template (a SupportPerson schedules their own task).
+    db.taskMeta = { taskId: 't1', title: 'Take meds', ownerId: 'assigner-1' };
     const result = (await handler(
       event('createTaskAssignment', {
         input: {
@@ -124,6 +134,8 @@ describe('createTaskAssignment', () => {
       }),
     )) as TaskAssignment;
 
+    // The caller's right to act for the target user was checked.
+    expect(mockAssertCanAct).toHaveBeenCalledWith(expect.objectContaining({ sub: 'assigner-1' }), 'u1');
     // Exactly one Put, and never a TransactWrite (no instances materialized).
     const puts = byCommand('PutCommand');
     expect(puts).toHaveLength(1);
@@ -134,10 +146,53 @@ describe('createTaskAssignment', () => {
     expect(item.active).toBe(true);
     expect(item.activeTaskAssignmentTaskId).toBe('t1'); // sparse GSI marker
     expect(puts[0].ConditionExpression).toBe('attribute_not_exists(PK)');
-    // assignedBy defaults to the caller; the GSI marker is stripped from the response.
+    // assignedBy is the caller's identity; the GSI marker is stripped from the response.
     expect(result.assignedBy).toBe('assigner-1');
     expect((result as Rec).activeTaskAssignmentTaskId).toBeUndefined();
     expect(result.scheduleType).toBe('RECURRING');
+  });
+
+  it('derives assignedBy from the caller identity, ignoring a client-supplied assignedBy', async () => {
+    db.taskMeta = { taskId: 't1', ownerId: 'assigner-1' };
+    const result = (await handler(
+      event('createTaskAssignment', {
+        input: {
+          taskId: 't1',
+          userId: 'u1',
+          assignedBy: 'victim', // must be ignored
+          scheduleType: 'ONE_TIME',
+          scheduledFor: '2099-07-01T09:00:00Z',
+          timezone: 'UTC',
+        },
+      }),
+    )) as TaskAssignment;
+    expect(result.assignedBy).toBe('assigner-1'); // not 'victim'
+    expect(byCommand('PutCommand')[0].Item.assignedBy).toBe('assigner-1');
+  });
+
+  it('rejects creating an assignment with a template the caller does not own', async () => {
+    db.taskMeta = { taskId: 't1', ownerId: 'someone-else' };
+    await expect(
+      handler(
+        event('createTaskAssignment', {
+          input: { taskId: 't1', userId: 'u1', scheduleType: 'ONE_TIME', scheduledFor: '2099-07-01T09:00:00Z', timezone: 'UTC' },
+        }),
+      ),
+    ).rejects.toThrow('does not own this resource');
+    expect(byCommand('PutCommand')).toHaveLength(0);
+  });
+
+  it('rejects when the caller may not act for the target user (delegation denied)', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
+    db.taskMeta = { taskId: 't1', ownerId: 'assigner-1' };
+    await expect(
+      handler(
+        event('createTaskAssignment', {
+          input: { taskId: 't1', userId: 'u1', scheduleType: 'ONE_TIME', scheduledFor: '2099-07-01T09:00:00Z', timezone: 'UTC' },
+        }),
+      ),
+    ).rejects.toThrow('no active support link');
+    expect(byCommand('PutCommand')).toHaveLength(0);
   });
 
   it('rejects when the referenced task does not exist', async () => {
@@ -152,13 +207,41 @@ describe('createTaskAssignment', () => {
   });
 
   it('validates ONE_TIME requires scheduledFor and RECURRING requires a rule', async () => {
-    db.taskMeta = { taskId: 't1' };
+    db.taskMeta = { taskId: 't1', ownerId: 'assigner-1' };
     await expect(
       handler(event('createTaskAssignment', { input: { taskId: 't1', userId: 'u1', scheduleType: 'ONE_TIME', timezone: 'UTC' } })),
     ).rejects.toThrow('scheduledFor is required');
     await expect(
       handler(event('createTaskAssignment', { input: { taskId: 't1', userId: 'u1', scheduleType: 'RECURRING', startDate: '2099-07-01', startTime: '09:00', timezone: 'UTC' } })),
     ).rejects.toThrow('scheduleRule is required');
+  });
+});
+
+describe('delegated authorization on schedule operations', () => {
+  it('blocks startTaskInstance when the caller may not act for the user', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
+    db.assignment = RECURRING;
+    await expect(
+      handler(
+        event('startTaskInstance', {
+          input: { userId: 'u1', assignmentId: 'a1', scheduledDate: '2099-07-02', scheduledTime: '09:00' },
+        }),
+      ),
+    ).rejects.toThrow('no active support link');
+    expect(byCommand('TransactWriteCommand')).toHaveLength(0);
+  });
+
+  it('blocks listTaskAssignmentsForUser when the caller may not act for the user', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
+    await expect(handler(event('listTaskAssignmentsForUser', { userId: 'u1' }))).rejects.toThrow(
+      'no active support link',
+    );
+  });
+
+  it('allows the operations for a selected user (delegation resolves) — getTaskInstanceViews checks the user', async () => {
+    mockQueryAllItems.mockResolvedValue([]);
+    await handler(event('getTaskInstanceViews', { userId: 'u1', startDate: '2099-07-01', endDate: '2099-07-03' }));
+    expect(mockAssertCanAct).toHaveBeenCalledWith(expect.objectContaining({ sub: 'assigner-1' }), 'u1');
   });
 });
 
