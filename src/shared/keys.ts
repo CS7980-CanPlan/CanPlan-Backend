@@ -78,6 +78,9 @@ export const MEDIA_PREFIX = 'MEDIA#';
 // S3 key across retries even after the MediaAsset row has been removed.
 export const TASK_MEDIA_CLEANUP_PREFIX = 'CLEANUP_MEDIA#';
 export const USER_LINK_PREFIX = 'USER#';
+// Report rows (one AI progress report), under USER#<primaryUserId>, chronologically
+// sortable so listReports returns newest-first via the SK.
+export const REPORT_PREFIX = 'REPORT#';
 
 // ── Reserved category ─────────────────────────────────────────────────────────
 /**
@@ -100,7 +103,6 @@ export function isDefaultCategoryName(name: string): boolean {
 export const userPk = (userId: string): string => `USER#${userId}`;
 export const supporterPk = (supporterId: string): string => `SUPPORTER#${supporterId}`;
 export const taskPk = (taskId: string): string => `TASK#${taskId}`;
-export const reportPk = (reportId: string): string => `REPORT#${reportId}`;
 /** Organization #META row — PK = ORG#<organizationId>, SK = #META (entityType = Organization). */
 export const organizationPk = (organizationId: string): string => `ORG#${organizationId}`;
 /** OrganizationMember SK — one row per member under the org partition (PK = ORG#<organizationId>). */
@@ -178,3 +180,6 @@ export const mediaSk = (assetId: string): string => `${MEDIA_PREFIX}${assetId}`;
 /** Task-media cleanup journal SK — retains an S3 key until the binary is deleted. */
 export const taskMediaCleanupSk = (assetId: string): string =>
   `${TASK_MEDIA_CLEANUP_PREFIX}${assetId}`;
+/** Report SK — chronological so a begins_with query lists a user's reports in time order. */
+export const reportSk = (createdAt: string, reportId: string): string =>
+  `${REPORT_PREFIX}${createdAt}#${reportId}`;

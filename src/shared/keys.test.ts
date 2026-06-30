@@ -8,7 +8,8 @@ import {
   META_SK,
   parseInstanceId,
   PROFILE_SK,
-  reportPk,
+  reportSk,
+  REPORT_PREFIX,
   stepSk,
   supporterPk,
   TASK_INSTANCE_PREFIX,
@@ -30,6 +31,15 @@ describe('stepSk', () => {
   });
 });
 
+describe('reportSk', () => {
+  it('builds a chronologically-sortable report sort key', () => {
+    expect(reportSk('2026-06-30T12:00:00.000Z', 'r-1')).toBe(
+      'REPORT#2026-06-30T12:00:00.000Z#r-1',
+    );
+    expect(reportSk('2026-06-30T12:00:00.000Z', 'r-1').startsWith(REPORT_PREFIX)).toBe(true);
+  });
+});
+
 describe('default category name', () => {
   it('matches "No Category" case-insensitively after trimming', () => {
     expect(DEFAULT_CATEGORY_NAME).toBe('No Category');
@@ -46,7 +56,6 @@ describe('partition keys', () => {
     expect(userPk('u1')).toBe('USER#u1');
     expect(supporterPk('s1')).toBe('SUPPORTER#s1');
     expect(taskPk('t1')).toBe('TASK#t1');
-    expect(reportPk('r1')).toBe('REPORT#r1');
   });
 });
 

@@ -919,3 +919,103 @@ export interface RetrievedPassage {
   title: string;
   url?: string;
 }
+
+// ── AI Progress Report ──────────────────────────────────────────────────────
+
+/** Input for generateReport: which user + inclusive date range (YYYY-MM-DD). */
+export interface GenerateReportInput {
+  userId: string;
+  from: string;
+  to: string;
+}
+
+/**
+ * A persisted report's metadata row (the GraphQL Report type). `scope` and `dateRange`
+ * are JSON-encoded strings (the AWSJSON contract): e.g. '{"userId":"u-1"}'.
+ */
+export interface Report {
+  reportId: string;
+  scope: string;
+  dateRange: string;
+  s3Key: string;
+  createdBy: string;
+  createdAt: string;
+}
+
+/** Deterministic statistics computed over a user's task instances in a date range. */
+export interface ReportStats {
+  meta: {
+    userId: string;
+    from: string;
+    to: string;
+    /** Rates cover attempted (acted-on) instances only — recurrence is not expanded. */
+    basis: 'attempted-instances-only';
+    totalInstances: number;
+  };
+  completion: {
+    completed: number;
+    skipped: number;
+    cancelled: number;
+    overdue: number;
+    inProgress: number;
+    toDo: number;
+    completionRate: number;
+  };
+  trend: Array<{ weekStart: string; completed: number; total: number; completionRate: number }>;
+  byCategory: Array<{
+    categoryId: string;
+    categoryName: string;
+    completed: number;
+    total: number;
+    completionRate: number;
+  }>;
+  byTask: Array<{
+    taskId: string;
+    title: string;
+    completed: number;
+    total: number;
+    completionRate: number;
+  }>;
+  stepDwell: Array<{
+    taskId: string;
+    title: string;
+    stepOrder: number;
+    stepText: string;
+    samples: number;
+    avgSeconds: number;
+  }>;
+  skipPatterns: {
+    byTask: Array<{ taskId: string; title: string; skipped: number }>;
+    byHour: number[];
+  };
+  abandonment: Array<{
+    instanceId: string;
+    taskId: string;
+    title: string;
+    stalledAtStepOrder: number | null;
+  }>;
+  timeOfDay: number[];
+}
+
+/** The full report JSON stored in S3: stats + the AI narrative. */
+export interface ReportDocument {
+  reportId: string;
+  scope: { userId: string };
+  dateRange: { from: string; to: string };
+  createdBy: string;
+  createdAt: string;
+  stats: ReportStats;
+  narrative: string;
+}
+
+/** Everything computeReportStats needs, gathered by the storage/metrics query layer. */
+export interface ReportComputeInput {
+  userId: string;
+  from: string;
+  to: string;
+  now: string;
+  instances: TaskInstance[];
+  steps: TaskInstanceStep[];
+  tasks: Task[];
+  categories: Category[];
+}
