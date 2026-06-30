@@ -1,0 +1,28 @@
+{
+  "_doc": [
+    "Labeled query set for calibrating RERANK_SCORE_FLOOR (kb.ts). NOT used at runtime.",
+    "label = what the corpus SHOULD do for this query:",
+    "  'grounded'   -> the corpus covers this; the top rerank score SHOULD clear the floor.",
+    "  'off_corpus' -> the corpus does NOT cover this; the top score SHOULD fall below the floor.",
+    "Fill this against YOUR corpus. The calibration is only as good as this set, so:",
+    "  - Use enough of each label (aim ~15+ per label).",
+    "  - The signal lives in the BORDERLINE queries (e.g. 'make a cup of coffee'): label them by",
+    "    your judgement of whether the corpus is meant to cover them, then see which side of the",
+    "    floor they actually land on.",
+    "  - Run AFTER the corpus is near its final size (a floor tuned on a partial corpus won't hold).",
+    "Entries whose query starts with '<' are placeholders and are skipped by the script."
+  ],
+  "queries": [
+    { "query": "wash my hands", "label": "grounded", "note": "known covered (HealthLink BC handwashing)" },
+    { "query": "write a Python web server", "label": "off_corpus", "note": "clearly out of domain — anchor for the off_corpus cluster" },
+    { "query": "make a cup of coffee", "label": "grounded", "note": "BORDERLINE — set label to what the corpus is MEANT to cover" },
+    { "query": "scramble eggs", "label": "grounded", "note": "BORDERLINE" },
+    { "query": "explain quantum entanglement", "label": "off_corpus", "note": "clearly out of domain" },
+
+    { "query": "<add a grounded query the corpus clearly covers>", "label": "grounded" },
+    { "query": "<add a grounded query>", "label": "grounded" },
+    { "query": "<add a borderline daily-living task and label it grounded/off_corpus by intent>", "label": "grounded" },
+    { "query": "<add an off_corpus query (out of domain)>", "label": "off_corpus" },
+    { "query": "<add an off_corpus query>", "label": "off_corpus" }
+  ]
+}
