@@ -34,6 +34,13 @@ const ADMIN_USER_RESULT_FIELDS = `
   }
 `;
 
+const ORGANIZATION_FIELDS = `
+  organizationId
+  name
+  createdAt
+  updatedAt
+`;
+
 // ── Queries ──────────────────────────────────────────────────────────────────────
 export const LIST_ALL_USERS = /* GraphQL */ `
   query ListAllUsers($limit: Int, $nextToken: String) {
@@ -107,6 +114,28 @@ export const ADMIN_GET_USER_DATA = /* GraphQL */ `
   }
 `;
 
+export const LIST_ALL_ORGANIZATIONS = /* GraphQL */ `
+  query ListAllOrganizations($limit: Int, $nextToken: String) {
+    listAllOrganizations(limit: $limit, nextToken: $nextToken) {
+      items {
+        ${ORGANIZATION_FIELDS}
+      }
+      nextToken
+    }
+  }
+`;
+
+export const ADMIN_LIST_ORGANIZATION_USERS = /* GraphQL */ `
+  query AdminListOrganizationUsers($organizationId: ID!, $limit: Int, $nextToken: String) {
+    adminListOrganizationUsers(organizationId: $organizationId, limit: $limit, nextToken: $nextToken) {
+      items {
+        ${USER_PROFILE_FIELDS}
+      }
+      nextToken
+    }
+  }
+`;
+
 // ── Mutations ────────────────────────────────────────────────────────────────────
 export const INVITE_SUPPORT_PERSON = /* GraphQL */ `
   mutation InviteSupportPerson($input: InviteUserInput!) {
@@ -156,6 +185,41 @@ export const ADMIN_DELETE_USER = /* GraphQL */ `
       deletedUserItems
       deletedSupportLinks
       deletedCognitoUser
+    }
+  }
+`;
+
+export const ADMIN_CREATE_ORGANIZATION = /* GraphQL */ `
+  mutation AdminCreateOrganization($input: CreateOrganizationInput!) {
+    adminCreateOrganization(input: $input) {
+      ${ORGANIZATION_FIELDS}
+    }
+  }
+`;
+
+export const ADMIN_UPDATE_ORGANIZATION = /* GraphQL */ `
+  mutation AdminUpdateOrganization($input: UpdateOrganizationInput!) {
+    adminUpdateOrganization(input: $input) {
+      ${ORGANIZATION_FIELDS}
+    }
+  }
+`;
+
+export const ADMIN_DELETE_ORGANIZATION = /* GraphQL */ `
+  mutation AdminDeleteOrganization($input: DeleteOrganizationInput!) {
+    adminDeleteOrganization(input: $input) {
+      organization {
+        ${ORGANIZATION_FIELDS}
+      }
+      removedUsers
+    }
+  }
+`;
+
+export const ADMIN_SET_USER_ORGANIZATION = /* GraphQL */ `
+  mutation AdminSetUserOrganization($input: AdminSetUserOrganizationInput!) {
+    adminSetUserOrganization(input: $input) {
+      ${USER_PROFILE_FIELDS}
     }
   }
 `;

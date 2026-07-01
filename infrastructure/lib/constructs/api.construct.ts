@@ -162,6 +162,7 @@ export class Api extends Construct {
       { typeName: 'Query', fieldName: 'listAllTasks' },
       { typeName: 'Query', fieldName: 'adminGetUserData' },
       { typeName: 'Query', fieldName: 'listAllOrganizations' },
+      { typeName: 'Query', fieldName: 'adminListOrganizationUsers' },
       { typeName: 'Mutation', fieldName: 'inviteSupportPerson' },
       { typeName: 'Mutation', fieldName: 'inviteOrganizationAdmin' },
       { typeName: 'Mutation', fieldName: 'setUserBaseRole' },
@@ -171,6 +172,7 @@ export class Api extends Construct {
       { typeName: 'Mutation', fieldName: 'adminCreateOrganization' },
       { typeName: 'Mutation', fieldName: 'adminUpdateOrganization' },
       { typeName: 'Mutation', fieldName: 'adminDeleteOrganization' },
+      { typeName: 'Mutation', fieldName: 'adminSetUserOrganization' },
     ]);
 
     // healthCheck query — returns a static string, no data source needed

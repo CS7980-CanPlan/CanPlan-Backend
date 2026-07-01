@@ -1184,13 +1184,37 @@ these are gated to the `SystemAdmin` group at the AppSync edge **and** re-checke
 | Operation | Returns | Effect |
 |---|---|---|
 | `listAllOrganizations(limit, nextToken)` | `OrganizationConnection!` | Every org, newest-first (`entityTypeIndex`; no Scan), paginated. |
+| `adminListOrganizationUsers(organizationId, limit, nextToken)` | `UserProfileConnection!` | The members of **one** org. Pages the `OrganizationMember` rows (`ORG#<id>` / `begins_with(SK, MEMBER#)`, `ConsistentRead` — no Scan) and loads each member's `UserProfile`; a row whose profile is missing is skipped. `nextToken` pages the membership rows. |
 | `adminCreateOrganization(input: CreateOrganizationInput!)` | `Organization!` | Create an org. `name` is required (trimmed, non-empty); `organizationId` is server-generated. |
 | `adminUpdateOrganization(input: UpdateOrganizationInput!)` | `Organization!` | Rename an org. `NOT_FOUND` if it doesn't exist; `VALIDATION` while it is being deleted. |
 | `adminDeleteOrganization(input: DeleteOrganizationInput!)` | `AdminDeleteOrganizationResult!` | Delete an org and **detach every member** (clears each member's `organizationId`). See below. |
+| `adminSetUserOrganization(input: AdminSetUserOrganizationInput!)` | `UserProfile!` | Set or clear **another** user's org membership (admin counterpart of the self-only `updateMyUserProfile`). See below. |
 
 **Inputs:** `CreateOrganizationInput { name: String! }`, `UpdateOrganizationInput { organizationId: ID!, name: String! }`,
-`DeleteOrganizationInput { organizationId: ID! }`. The `Organization` type is
-`{ organizationId, name, createdAt, updatedAt }` (its internal `deleting` marker is never exposed).
+`DeleteOrganizationInput { organizationId: ID! }`, `AdminSetUserOrganizationInput { userId: ID!, organizationId: ID }`.
+The `Organization` type is `{ organizationId, name, createdAt, updatedAt }` (its internal `deleting`
+marker is never exposed).
+
+**`adminSetUserOrganization`** reads the target `UserProfile` first (`NOT_FOUND` if the user has no
+profile) to learn its previous org, then keeps `UserProfile.organizationId` and the
+`OrganizationMember` rows in step **in one transaction**:
+- **joining** (`organizationId` non-null): the org is verified to exist and not be deleting
+  (`NOT_FOUND` / `VALIDATION`, plus a same-transaction `ConditionCheck` closing the race), the
+  profile's `organizationId` is set, the new `ORG#<newOrg>/MEMBER#<userId>` row is written, and the
+  old org's membership row is deleted when the user is **moving**;
+- **clearing** (`organizationId: null`): `organizationId` is removed and the old membership row
+  deleted.
+
+Every profile write is **conditioned on the org seen at the pre-read** (`organizationId = :prevOrg`,
+or `attribute_not_exists(organizationId)` when it had none). If a concurrent request moves or clears
+the user in between, the write is aborted (a retryable `VALIDATION` "changed concurrently" error)
+rather than deleting a now-stale membership row and orphaning the one the user was concurrently moved
+to. Returns the updated `UserProfile`.
+
+`organizationId` is **required**: pass an id to set it, or explicit `null` to clear it. A **blank**
+(non-null) string is rejected, and **omitting** the field entirely is rejected too — so a client that
+forgets to send the variable can never silently wipe a user's organization (only an explicit `null`
+clears).
 
 **`adminDeleteOrganization` order (retryable/idempotent; no Scan):** (1) load the org (`NOT_FOUND`
 if missing); (2) mark it `deleting` so no new member can join mid-removal; (3) find every member

@@ -23,8 +23,8 @@ TaskInstance, TaskInstanceStep, MediaAsset, Report. The item-key conventions liv
 | `getTask`, `listTaskSteps`, `listTasksByOwner`, `listTasksByCategory`, `updateTask`, `createTaskStep`, `updateTaskStep`, `deleteTaskStep`, `reorderTaskSteps`, `deleteTask` | Query/Mutation | `canplan-tasks-<env>` Lambda + DynamoDB + S3 (media cleanup) |
 | `createTaskAssignment`, `startTaskInstance`, `setTaskInstanceStepCompletion`, `updateTaskInstanceStatus`, `cancelTaskInstance`, `endTaskAssignment`, `deleteTaskAssignment`, `listTaskAssignmentsForUser`, `getTaskInstanceViews`, `getTaskInstance`, `listTaskInstances`, `batchGetTaskInstances`, `listTaskInstanceSteps` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB (TaskAssignment schedule rules; lazily-materialized TaskInstances; calendar feed; self-scoped instance reads) |
 | `createMediaUploadUrl`, `createTaskCoverImageUploadUrl`, `createMediaAsset`, `deleteMediaAsset`, `getMediaDownloadUrl`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB + S3 media bucket (presigned upload/download, cover images, cascade delete) |
-| `listAllUsers`, `listAllTasks`, `listAllOrganizations`, `adminGetUserData` | Query | `canplan-admin-<env>` Lambda + DynamoDB `entityTypeIndex`/GSIs (SystemAdmin only, paginated; no Scan) |
-| `inviteSupportPerson`, `inviteOrganizationAdmin`, `setUserBaseRole`, `setSystemAdmin`, `adminDeleteTask`, `adminDeleteUser`, `adminCreateOrganization`, `adminUpdateOrganization`, `adminDeleteOrganization` | Mutation | `canplan-admin-<env>` Lambda + Cognito + DynamoDB + S3 (SystemAdmin only — manage Cognito roles, organizations, delete any task, full user deletion) |
+| `listAllUsers`, `listAllTasks`, `listAllOrganizations`, `adminListOrganizationUsers`, `adminGetUserData` | Query | `canplan-admin-<env>` Lambda + DynamoDB `entityTypeIndex`/GSIs (SystemAdmin only, paginated; no Scan) |
+| `inviteSupportPerson`, `inviteOrganizationAdmin`, `setUserBaseRole`, `setSystemAdmin`, `adminDeleteTask`, `adminDeleteUser`, `adminCreateOrganization`, `adminUpdateOrganization`, `adminDeleteOrganization`, `adminSetUserOrganization` | Mutation | `canplan-admin-<env>` Lambda + Cognito + DynamoDB + S3 (SystemAdmin only — manage Cognito roles, organizations & membership, delete any task, full user deletion) |
 | `generateTaskSteps` | Mutation | `canplan-generateTaskSteps-<env>` Lambda + Bedrock KB RAG |
 | `createAiTask` | Mutation | `canplan-createAiTask-<env>` Lambda + Bedrock KB RAG (generate a title + steps preview; persists nothing) |
 
@@ -62,8 +62,8 @@ The only fields with auth directives:
 | Field | Auth |
 | ----- | ---- |
 | `healthCheck` | `@aws_api_key @aws_cognito_user_pools` — the API key **or** any signed-in user |
-| `listAllUsers`, `listAllTasks`, `listAllOrganizations`, `adminGetUserData` | `@aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])` — SystemAdmin group only |
-| `inviteSupportPerson`, `inviteOrganizationAdmin`, `setUserBaseRole`, `setSystemAdmin`, `adminDeleteTask`, `adminDeleteUser`, `adminCreateOrganization`, `adminUpdateOrganization`, `adminDeleteOrganization` | `@aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])` — SystemAdmin group only (re-checked in the Lambda) |
+| `listAllUsers`, `listAllTasks`, `listAllOrganizations`, `adminListOrganizationUsers`, `adminGetUserData` | `@aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])` — SystemAdmin group only |
+| `inviteSupportPerson`, `inviteOrganizationAdmin`, `setUserBaseRole`, `setSystemAdmin`, `adminDeleteTask`, `adminDeleteUser`, `adminCreateOrganization`, `adminUpdateOrganization`, `adminDeleteOrganization`, `adminSetUserOrganization` | `@aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])` — SystemAdmin group only (re-checked in the Lambda) |
 | everything else | default Cognito User Pool (any signed-in user) |
 
 The frontend needs the `UserPoolId` and `UserPoolClientId` deploy outputs to run the
@@ -96,11 +96,13 @@ is required.
 ### SystemAdmin APIs
 
 SystemAdmin-only operations (in the `canplan-admin-<env>` Lambda) cover read-only listings
-(`listAllUsers`, `listAllTasks`, `listAllOrganizations`, `adminGetUserData` — all
-`entityTypeIndex`/GSI reads, no Scan) plus the mutations below (Cognito roles, organizations,
-and destructive data cleanup). Each is gated to the `SystemAdmin` group at the AppSync edge
-**and** re-checks the group inside the Lambda, with Cognito remaining the authorization
-source of truth:
+(`listAllUsers`, `listAllTasks`, `listAllOrganizations`, `adminListOrganizationUsers`,
+`adminGetUserData` — all PK/GSI reads, no Scan) plus the mutations below (Cognito roles,
+organizations & membership, and destructive data cleanup). Each is gated to the `SystemAdmin`
+group at the AppSync edge **and** re-checks the group inside the Lambda, with Cognito remaining the
+authorization source of truth. `adminListOrganizationUsers(organizationId, limit, nextToken)`
+returns one org's members by paging its `OrganizationMember` rows and loading each `UserProfile`
+(rows with a missing profile are skipped):
 
 | Mutation | Effect |
 | -------- | ------ |
@@ -113,6 +115,7 @@ source of truth:
 | `adminCreateOrganization(input)` | Create an `Organization` row (`ORG#<id>`/`#META`) with a generated id and trimmed name. |
 | `adminUpdateOrganization(input)` | Rename an organization. `NOT_FOUND` if missing; rejected while it is being deleted. |
 | `adminDeleteOrganization(input)` | Mark the org `deleting`, then detach every member found via the **strongly-consistent `OrganizationMember` rows** under the org partition (`ConsistentRead` Query, paginated — no Scan; **not** the eventually-consistent `orgIndex`), each in a transaction that conditionally clears the member's `organizationId` and deletes the membership row, then delete the org row **last**. Idempotent/retryable; returns the org + `removedUsers` count. |
+| `adminSetUserOrganization(input)` | Set or clear **another** user's org membership (admin counterpart of the self-only `updateMyUserProfile`). Reads the target profile first (`NOT_FOUND` if none); joining verifies the org exists/isn't deleting, sets `organizationId`, writes the new `MEMBER#` row and deletes the old one on a move; clearing (`organizationId: null`) removes `organizationId` and the old row — all in one transaction. Returns the updated `UserProfile`. |
 
 > **Membership rows & backfill:** every non-null `organizationId` write (`createUserProfile` /
 > `updateMyUserProfile`) transactionally maintains an `OrganizationMember` row

@@ -813,6 +813,17 @@ export interface DeleteOrganizationInput {
   organizationId: string;
 }
 
+/**
+ * Admin sets/clears ANOTHER user's organization membership (SystemAdmin-only — distinct from the
+ * self-only updateMyUserProfile). `organizationId`: a non-null id joins that org (must exist and not
+ * be deleting); explicit `null` clears membership. The field is required at runtime so omitted values
+ * cannot accidentally clear a user's org. Membership rows are kept in step atomically.
+ */
+export interface AdminSetUserOrganizationInput {
+  userId: string;
+  organizationId: string | null;
+}
+
 /** Result of adminDeleteOrganization: the removed org plus how many members were detached. */
 export interface AdminDeleteOrganizationResult {
   organization: Organization;

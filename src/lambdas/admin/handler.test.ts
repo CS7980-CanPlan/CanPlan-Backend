@@ -118,6 +118,8 @@ describe('admin handler — SystemAdmin authorization', () => {
       ['adminCreateOrganization', { input: { name: 'Acme' } }],
       ['adminUpdateOrganization', { input: { organizationId: 'o1', name: 'Acme' } }],
       ['adminDeleteOrganization', { input: { organizationId: 'o1' } }],
+      ['adminListOrganizationUsers', { organizationId: 'o1' }],
+      ['adminSetUserOrganization', { input: { userId: 'u1', organizationId: 'o1' } }],
     ];
     for (const [field, args] of orgFields) {
       await expect(handler(event(field, args, { groups: ['OrganizationAdmin'] }))).rejects.toThrow(
@@ -398,6 +400,194 @@ describe('admin handler — adminDeleteOrganization', () => {
     ).rejects.toThrow('conflict');
     // No membership row dropped on its own, and the org #META row was NOT deleted (aborted for retry).
     expect(dynamoCalls().some((c) => c.constructor.name === 'DeleteCommand')).toBe(false);
+  });
+});
+
+// ── adminListOrganizationUsers ────────────────────────────────────────────────────
+describe('admin handler — adminListOrganizationUsers', () => {
+  it('pages ORG#<id>/MEMBER# rows (no Scan), loads profiles, skips missing, passes nextToken', async () => {
+    const lek = { PK: 'ORG#o1', SK: 'MEMBER#u2' };
+    mockSend.mockImplementation((cmd: { constructor: { name: string }; input: Rec }) => {
+      if (cmd.constructor.name === 'QueryCommand') {
+        return Promise.resolve({
+          Items: [{ userId: 'u1' }, { userId: 'u2' }, { userId: 'gone' }],
+          LastEvaluatedKey: lek,
+        });
+      }
+      if (cmd.constructor.name === 'GetCommand') {
+        const pk = cmd.input.Key.PK as string;
+        if (pk === 'USER#gone') return Promise.resolve({}); // membership row → missing profile
+        return Promise.resolve({
+          Item: { PK: pk, SK: '#PROFILE', entityType: 'UserProfile', userId: pk.replace('USER#', ''), role: 'PRIMARY_USER' },
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    const result = (await handler(
+      event('adminListOrganizationUsers', { organizationId: 'o1', limit: 3 }),
+    )) as Connection<{ userId: string }>;
+
+    // Base-table MEMBER# query — no GSI, no Scan, strongly consistent.
+    const query = dynamoCalls().find((c) => c.constructor.name === 'QueryCommand').input;
+    expect(query.IndexName).toBeUndefined();
+    expect(query.KeyConditionExpression).toBe('PK = :pk AND begins_with(SK, :member)');
+    expect(query.ExpressionAttributeValues).toEqual({ ':pk': 'ORG#o1', ':member': 'MEMBER#' });
+    expect(query.ConsistentRead).toBe(true);
+    expect(query.Limit).toBe(3);
+    expect(dynamoCalls().some((c) => c.constructor.name === 'ScanCommand')).toBe(false);
+    // The missing profile is skipped; only the two real profiles come back.
+    expect(result.items.map((p) => p.userId).sort()).toEqual(['u1', 'u2']);
+    // Storage attributes are stripped from the returned profiles.
+    expect((result.items[0] as Record<string, unknown>).PK).toBeUndefined();
+    // nextToken passes through and decodes to the member-row LastEvaluatedKey.
+    expect(decodeNextToken(result.nextToken!)).toEqual(lek);
+  });
+
+  it('threads an incoming nextToken as the ExclusiveStartKey', async () => {
+    const start = { PK: 'ORG#o1', SK: 'MEMBER#u5' };
+    mockSend.mockResolvedValue({ Items: [], LastEvaluatedKey: undefined });
+    await handler(
+      event('adminListOrganizationUsers', { organizationId: 'o1', nextToken: encodeNextToken(start)! }),
+    );
+    expect(dynamoCalls()[0].input.ExclusiveStartKey).toEqual(start);
+  });
+
+  it('rejects a blank organizationId', async () => {
+    await expect(
+      handler(event('adminListOrganizationUsers', { organizationId: '  ' })),
+    ).rejects.toThrow('organizationId is required');
+  });
+});
+
+// ── adminSetUserOrganization ──────────────────────────────────────────────────────
+describe('admin handler — adminSetUserOrganization', () => {
+  const tx = () => dynamoCalls().find((c) => c.constructor.name === 'TransactWriteCommand').input.TransactItems;
+
+  it('adds a user to an org: pre-reads, verifies the org, transacts profile update + member put', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER' } }) // pre-read: no org
+      .mockResolvedValueOnce({ Item: { organizationId: 'o1', name: 'Acme', createdAt: 'c', updatedAt: 'u' } }) // assertUsableOrganization
+      .mockResolvedValueOnce({}) // TransactWrite
+      .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER', organizationId: 'o1' } }); // read-back
+    const result = (await handler(
+      event('adminSetUserOrganization', { input: { userId: 'target', organizationId: 'o1' } }),
+    )) as { organizationId?: string };
+
+    const items = tx();
+    const update = items.find((t: Rec) => t.Update).Update;
+    expect(update.Key).toEqual({ PK: 'USER#target', SK: '#PROFILE' });
+    expect(update.UpdateExpression).toBe('SET organizationId = :org, updatedAt = :now');
+    expect(update.ExpressionAttributeValues[':org']).toBe('o1');
+    // Bound to the pre-read state (no org) so a concurrent move can't leave a stale membership row.
+    expect(update.ConditionExpression).toBe('attribute_exists(PK) AND attribute_not_exists(organizationId)');
+    const orgCheck = items.find((t: Rec) => t.ConditionCheck).ConditionCheck;
+    expect(orgCheck.Key).toEqual({ PK: 'ORG#o1', SK: '#META' });
+    expect(orgCheck.ConditionExpression).toBe('attribute_exists(PK) AND attribute_not_exists(deleting)');
+    const put = items.find((t: Rec) => t.Put).Put.Item;
+    expect(put).toMatchObject({ PK: 'ORG#o1', SK: 'MEMBER#target', entityType: 'OrganizationMember', userId: 'target' });
+    expect(items.some((t: Rec) => t.Delete)).toBe(false); // no previous org ⇒ no delete
+    expect(result.organizationId).toBe('o1');
+  });
+
+  it('removes a user from their org with organizationId: null (transaction deletes the membership row)', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER', organizationId: 'o1' } }) // pre-read: in o1
+      .mockResolvedValueOnce({}) // TransactWrite
+      .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER' } }); // read-back: no org
+    const result = (await handler(
+      event('adminSetUserOrganization', { input: { userId: 'target', organizationId: null } as Record<string, unknown> }),
+    )) as { organizationId?: string };
+
+    const items = tx();
+    const update = items.find((t: Rec) => t.Update).Update;
+    expect(update.UpdateExpression).toBe('SET updatedAt = :now REMOVE organizationId');
+    // Bound to the pre-read org so a concurrent move can't orphan the new org's membership row.
+    expect(update.ConditionExpression).toBe('attribute_exists(PK) AND organizationId = :prevOrg');
+    expect(update.ExpressionAttributeValues[':prevOrg']).toBe('o1');
+    const del = items.find((t: Rec) => t.Delete).Delete;
+    expect(del.Key).toEqual({ PK: 'ORG#o1', SK: 'MEMBER#target' });
+    // Clearing needs no org existence check or member put — and never reads an ORG# row.
+    expect(items.some((t: Rec) => t.ConditionCheck)).toBe(false);
+    expect(items.some((t: Rec) => t.Put)).toBe(false);
+    expect(dynamoCalls().some((c) => c.constructor.name === 'GetCommand' && String(c.input.Key.PK).startsWith('ORG#'))).toBe(false);
+    expect(result.organizationId).toBeUndefined();
+  });
+
+  it('moving a user to a different org deletes the old membership row', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER', organizationId: 'o1' } }) // pre-read: in o1
+      .mockResolvedValueOnce({ Item: { organizationId: 'o2', name: 'New', createdAt: 'c', updatedAt: 'u' } }) // assertUsable o2
+      .mockResolvedValueOnce({}) // TransactWrite
+      .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER', organizationId: 'o2' } }); // read-back
+    await handler(event('adminSetUserOrganization', { input: { userId: 'target', organizationId: 'o2' } }));
+
+    const items = tx();
+    const update = items.find((t: Rec) => t.Update).Update;
+    // The profile write is bound to the pre-read org (o1), so a concurrent move aborts this one.
+    expect(update.ConditionExpression).toBe('attribute_exists(PK) AND organizationId = :prevOrg');
+    expect(update.ExpressionAttributeValues[':prevOrg']).toBe('o1');
+    expect(items.find((t: Rec) => t.Put).Put.Item.PK).toBe('ORG#o2');
+    expect(items.find((t: Rec) => t.Delete).Delete.Key).toEqual({ PK: 'ORG#o1', SK: 'MEMBER#target' });
+  });
+
+  it('aborts with a conflict error when the profile moved orgs concurrently (item-0 guard fails)', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER', organizationId: 'o1' } }) // pre-read: in o1
+      .mockResolvedValueOnce({ Item: { organizationId: 'o2', name: 'New', createdAt: 'c', updatedAt: 'u' } }) // assertUsable o2
+      .mockRejectedValueOnce(
+        Object.assign(new Error('canceled'), {
+          name: 'TransactionCanceledException',
+          // item 0 = profile guard (organizationId = :prevOrg) failed: the user moved since pre-read.
+          CancellationReasons: [{ Code: 'ConditionalCheckFailed' }, { Code: 'None' }, { Code: 'None' }],
+        }),
+      );
+    await expect(
+      handler(event('adminSetUserOrganization', { input: { userId: 'target', organizationId: 'o2' } })),
+    ).rejects.toThrow('changed concurrently');
+    // The transaction is atomic: nothing (including the stale o1 delete) was committed.
+    expect(dynamoCalls().filter((c) => c.constructor.name === 'TransactWriteCommand')).toHaveLength(1);
+  });
+
+  it('rejects an OMITTED organizationId (only null clears), so a dropped variable cannot wipe an org', async () => {
+    await expect(
+      handler(event('adminSetUserOrganization', { input: { userId: 'target' } })),
+    ).rejects.toThrow('organizationId is required');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('rejects adding a user to a missing org (NotFound), writing nothing', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER' } }) // pre-read
+      .mockResolvedValueOnce({}); // assertUsableOrganization GET → no Item
+    await expect(
+      handler(event('adminSetUserOrganization', { input: { userId: 'target', organizationId: 'gone' } })),
+    ).rejects.toThrow('organization gone not found');
+    expect(dynamoCalls().some((c) => c.constructor.name === 'TransactWriteCommand')).toBe(false);
+  });
+
+  it('rejects adding a user to a deleting org (VALIDATION)', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER' } }) // pre-read
+      .mockResolvedValueOnce({ Item: { organizationId: 'o1', name: 'X', deleting: true, createdAt: 'c', updatedAt: 'u' } }); // deleting
+    await expect(
+      handler(event('adminSetUserOrganization', { input: { userId: 'target', organizationId: 'o1' } })),
+    ).rejects.toThrow('being deleted');
+    expect(dynamoCalls().some((c) => c.constructor.name === 'TransactWriteCommand')).toBe(false);
+  });
+
+  it('rejects when the target user has no profile (NotFound)', async () => {
+    mockSend.mockResolvedValueOnce({}); // pre-read → no profile
+    await expect(
+      handler(event('adminSetUserOrganization', { input: { userId: 'ghost', organizationId: 'o1' } })),
+    ).rejects.toThrow('user ghost not found');
+    expect(dynamoCalls().some((c) => c.constructor.name === 'TransactWriteCommand')).toBe(false);
+  });
+
+  it('rejects a blank userId', async () => {
+    await expect(
+      handler(event('adminSetUserOrganization', { input: { userId: '  ', organizationId: 'o1' } })),
+    ).rejects.toThrow('userId is required');
   });
 });
 
