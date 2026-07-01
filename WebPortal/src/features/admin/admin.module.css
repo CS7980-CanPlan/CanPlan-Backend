@@ -161,6 +161,10 @@
   flex-direction: column;
   gap: 0.85rem;
 }
+.mutedText {
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+}
 .formRow {
   display: grid;
   gap: 0.85rem;
