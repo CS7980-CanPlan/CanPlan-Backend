@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom';
-import { ListChecks, ShieldCheck, TriangleAlert, UserCog, Users } from 'lucide-react';
+import { Building2, ListChecks, ShieldCheck, TriangleAlert, UserCog, Users } from 'lucide-react';
 import { useTasksPage, useUsersPage } from '../../api/adminHooks';
 import { Alert } from '../../components/ui/Alert';
 import { Spinner } from '../../components/ui/Spinner';
@@ -71,6 +71,15 @@ export default function AdminHomePage() {
           <div>
             <div className={sharedStyles.tileTitle}>Tasks</div>
             <div className={sharedStyles.tileDesc}>Browse all tasks and remove any task by id.</div>
+          </div>
+        </Link>
+        <Link to="/admin/organizations" className={sharedStyles.tile}>
+          <span className={sharedStyles.tileIcon} aria-hidden="true"><Building2 size={22} /></span>
+          <div>
+            <div className={sharedStyles.tileTitle}>Organizations</div>
+            <div className={sharedStyles.tileDesc}>
+              Create organizations, manage members, rename, and delete.
+            </div>
           </div>
         </Link>
         <Link to="/admin/danger" className={`${sharedStyles.tile} ${sharedStyles.tileDanger}`}>

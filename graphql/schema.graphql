@@ -76,13 +76,16 @@ type UserProfile {
   role: UserRole!
   displayName: String
   email: String
+  # The id of an existing Organization this user belongs to (or null if none). No longer
+  # free-form: setting it via createUserProfile/updateMyUserProfile validates the org exists
+  # and is not being deleted. SystemAdmin manages organizations (see listAllOrganizations).
   organizationId: ID
   accessibilitySettings: AWSJSON
   # Id of this user's mandatory default Category (a real Category row with isDefault:true),
   # created atomically with the profile. Tasks created without an explicit category fall
   # into it. Server-managed; never client-supplied.
   defaultCategoryId: ID
-  # Nullable: the orgIndex roster projection (listUsersByOrganization) omits it.
+  # Nullable: the orgIndex roster projection (listMyOrganizationUsers) omits it.
   createdAt: String
   updatedAt: String
 }
@@ -96,6 +99,16 @@ type SupportLink {
   permissions: AWSJSON
   createdAt: String!
   updatedAt: String
+}
+
+# An organization a UserProfile.organizationId references. Created/managed only by SystemAdmin
+# admin APIs; a user joins one by setting organizationId to an existing org's id (validated
+# server-side). The internal `deleting` marker is never exposed here.
+type Organization {
+  organizationId: ID!
+  name: String!
+  createdAt: String!
+  updatedAt: String!
 }
 
 # A user-owned grouping for tasks (folder-like). PRIVATE to its owner: every category
@@ -366,21 +379,44 @@ input CreateMyUserProfileInput {
 }
 
 # Partial update of the signed-in caller's OWN profile. The owner is derived from the
-# Cognito identity — there is no userId. Only displayName and accessibilitySettings may be
-# changed here; userId, email, role, organizationId, defaultCategoryId, and timestamps are
-# not editable. Supply at least one field. displayName: omitted ⇒ unchanged; otherwise
-# trimmed and may not be empty/whitespace. accessibilitySettings: omitted ⇒ unchanged;
-# explicit null ⇒ cleared; a value ⇒ FULL replacement of the stored settings (never merged).
+# Cognito identity — there is no userId. userId, email, role, defaultCategoryId, and
+# timestamps are not editable. Supply at least one field. displayName: omitted ⇒ unchanged;
+# otherwise trimmed and may not be empty/whitespace. accessibilitySettings: omitted ⇒
+# unchanged; explicit null ⇒ cleared; a value ⇒ FULL replacement of the stored settings
+# (never merged). organizationId (MVP self-service org membership): omitted ⇒ unchanged; a
+# non-empty string sets it; explicit null clears it. Any signed-in user may change their own
+# organizationId for this MVP (no org-admin gating yet).
 input UpdateMyUserProfileInput {
   displayName: String
   accessibilitySettings: AWSJSON
+  organizationId: ID
 }
 
+# DEPRECATED — prefer selectPrimaryUser. Retained as a compatibility alias; the supporter is
+# now always the authenticated caller (a client-supplied supporterId is ignored), and the same
+# SupportPerson-only / same-organization / target-is-a-primary-user checks as selectPrimaryUser
+# apply. status is ignored (the link is always (re)activated as ACTIVE).
 input CreateSupportLinkInput {
   supporterId: ID!
   primaryUserId: ID!
   status: SupportLinkStatus
   permissions: AWSJSON
+}
+
+# A SupportPerson selects a PRIMARY_USER in their OWN current organization to support. The
+# supporter is the authenticated caller (never client-supplied). Writes or restores the
+# SupportLink as ACTIVE. Only a SupportPerson may select; the target must be a PRIMARY_USER
+# currently in the caller's organization.
+input SelectPrimaryUserInput {
+  primaryUserId: ID!
+  permissions: AWSJSON
+}
+
+# A SupportPerson un-selects a previously selected PRIMARY_USER. The supporter is the
+# authenticated caller. Soft-revokes the SupportLink (status REVOKED) — it is never hard
+# deleted, so re-selecting restores the original row.
+input UnselectPrimaryUserInput {
+  primaryUserId: ID!
 }
 
 # Create one of the caller's own categories. The owner is derived from the Cognito
@@ -531,9 +567,13 @@ input DeleteTaskStepInput {
 # TaskInstance rows. ONE_TIME requires scheduledFor + timezone; RECURRING requires
 # scheduleRule + startDate + startTime + timezone (endDate optional). The RRULE's FREQ must be
 # DAILY/WEEKLY/MONTHLY/YEARLY — a missing FREQ or HOURLY/MINUTELY/SECONDLY is rejected.
+# Authorization: the caller must own the referenced Task template, and may only target a userId
+# that is themselves OR a primary user they have actively selected (SupportPerson delegation).
 input CreateTaskAssignmentInput {
   taskId: ID!
   userId: ID!
+  # DEPRECATED/IGNORED — assignedBy is always derived from the caller's identity (event sub),
+  # never trusted from input. Retained only so older clients don't break.
   assignedBy: ID
   scheduleType: TaskAssignmentScheduleType!
   scheduledFor: String
@@ -656,6 +696,38 @@ input AdminDeleteUserInput {
   disableFirst: Boolean = true
 }
 
+# ─── Admin organization inputs (SystemAdmin-only) ─────────────────────────────--
+
+input CreateOrganizationInput {
+  name: String!
+}
+
+input UpdateOrganizationInput {
+  organizationId: ID!
+  name: String!
+}
+
+input DeleteOrganizationInput {
+  organizationId: ID!
+}
+
+# Admin sets/clears ANOTHER user's org membership (SystemAdmin-only; distinct from the self-only
+# updateMyUserProfile). organizationId: a non-null id joins that org (must exist and not be
+# deleting); explicit null clears membership. The resolver rejects omitted organizationId because
+# GraphQL input objects cannot express "nullable but required". OrganizationMember rows are kept in
+# step atomically.
+input AdminSetUserOrganizationInput {
+  userId: ID!
+  organizationId: ID
+}
+
+# Result of adminDeleteOrganization: the removed organization plus how many member
+# UserProfiles had their organizationId reference cleared.
+type AdminDeleteOrganizationResult {
+  organization: Organization!
+  removedUsers: Int!
+}
+
 # AI step generation
 input QueryContext {
   role: String
@@ -675,6 +747,11 @@ input GenerateTaskStepsInput {
 
 type UserProfileConnection {
   items: [UserProfile!]!
+  nextToken: String
+}
+
+type OrganizationConnection {
+  items: [Organization!]!
   nextToken: String
 }
 
@@ -728,8 +805,19 @@ type Query {
   healthCheck: String! @aws_api_key @aws_cognito_user_pools
 
   getUserProfile(userId: ID!): UserProfile
-  listUsersByOrganization(organizationId: ID!, limit: Int, nextToken: String): UserProfileConnection!
+  # DEPRECATED — prefer listMySupportList. Now strictly self-scoped: the caller's sub must
+  # equal supporterId (a caller can only list their own support list), else NOT_AUTHORIZED.
   listPrimaryUsersBySupporter(supporterId: ID!, limit: Int, nextToken: String): SupportLinkConnection!
+
+  # The roster of users in the AUTHENTICATED caller's OWN current organization (orgIndex
+  # projection: userId, displayName, role). The organization is taken from the caller's
+  # profile — there is no organizationId argument, so a caller can only ever see their own
+  # org. A SupportPerson uses this to find PRIMARY_USERs they may select. Errors with
+  # VALIDATION if the caller has no current organization.
+  listMyOrganizationUsers(limit: Int, nextToken: String): UserProfileConnection!
+  # The AUTHENTICATED caller's OWN support list — every primary user they have selected
+  # (supporterIndex, keyed on the caller's sub). Includes ACTIVE and REVOKED links.
+  listMySupportList(limit: Int, nextToken: String): SupportLinkConnection!
 
   # The authenticated caller's own categories (owner derived from the Cognito identity).
   listMyCategories(limit: Int, nextToken: String): CategoryConnection!
@@ -762,6 +850,14 @@ type Query {
   # support links) for the admin user-detail view. PK queries + GSIs only (no Scan).
   adminGetUserData(userId: ID!): AdminUserData!
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Every Organization, newest-first (entityTypeIndex; no Scan), paginated.
+  listAllOrganizations(limit: Int, nextToken: String): OrganizationConnection!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # The members of ONE organization: pages the strongly-consistent OrganizationMember rows under
+  # the org partition (PK = ORG#<id>, SK begins_with MEMBER#; no Scan) and returns their
+  # UserProfiles. A membership row whose profile is missing is skipped. Paginated by nextToken.
+  adminListOrganizationUsers(organizationId: ID!, limit: Int, nextToken: String): UserProfileConnection!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 }
 
 type Mutation {
@@ -769,11 +865,23 @@ type Mutation {
   # from the Cognito session (role derived from group membership), not the input.
   createUserProfile(input: CreateMyUserProfileInput!): UserProfile
   # Partial update of the caller's OWN profile (owner derived from the Cognito identity).
-  # Only displayName and accessibilitySettings are editable; accessibilitySettings is a full
-  # replacement, not a merge. Errors (NotFound) if the profile doesn't exist — it never
-  # creates one. organizationId, role, email, etc. cannot be changed here.
+  # displayName, accessibilitySettings, and organizationId are editable (accessibilitySettings
+  # is a full replacement, not a merge; organizationId: omitted ⇒ unchanged, value ⇒ set, null
+  # ⇒ clear). Errors (NotFound) if the profile doesn't exist — it never creates one. role,
+  # email, defaultCategoryId, and timestamps cannot be changed here.
   updateMyUserProfile(input: UpdateMyUserProfileInput!): UserProfile!
+  # DEPRECATED — prefer selectPrimaryUser. Compatibility alias that (re)activates a SupportLink
+  # from the AUTHENTICATED caller (supporter) to the given primary user, with the same
+  # SupportPerson-only / same-organization checks; the client-supplied supporterId and status
+  # are ignored.
   createSupportLink(input: CreateSupportLinkInput!): SupportLink
+  # A SupportPerson selects a PRIMARY_USER in their own organization (writes/restores the
+  # SupportLink as ACTIVE). Supporter = the authenticated caller. Only a SupportPerson may
+  # call this; the target must be a PRIMARY_USER currently in the caller's organization.
+  selectPrimaryUser(input: SelectPrimaryUserInput!): SupportLink!
+  # A SupportPerson un-selects a previously selected primary user — soft-revokes the
+  # SupportLink (status REVOKED), never a hard delete. Supporter = the authenticated caller.
+  unselectPrimaryUser(input: UnselectPrimaryUserInput!): SupportLink!
 
   # Create one of the caller's own task categories (owner derived from identity).
   createCategory(input: CreateCategoryInput!): Category
@@ -874,6 +982,27 @@ type Mutation {
   # Fully delete a user: owned tasks, their USER# partition rows, SupportLinks (both sides),
   # and the Cognito login (last). Deleting yourself is rejected.
   adminDeleteUser(input: AdminDeleteUserInput!): AdminDeleteUserResult!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+
+  # ─── Admin organization management (SystemAdmin-only) ────────────────────────
+  # Create an Organization. name is required (trimmed, non-empty); organizationId is generated.
+  adminCreateOrganization(input: CreateOrganizationInput!): Organization!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Rename an Organization. NotFound if it doesn't exist; rejected while it is being deleted.
+  adminUpdateOrganization(input: UpdateOrganizationInput!): Organization!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Delete an Organization: mark it deleting, then detach every member found via the
+  # strongly-consistent OrganizationMember rows under the org partition (ConsistentRead query,
+  # paginated — no Scan; NOT the eventually-consistent orgIndex), clearing each member's
+  # organizationId and deleting the membership row together, then delete the org row last.
+  # Idempotent/retryable.
+  adminDeleteOrganization(input: DeleteOrganizationInput!): AdminDeleteOrganizationResult!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Set or clear ANOTHER user's organization membership (SystemAdmin-only; updateMyUserProfile is
+  # self-only). A non-null organizationId joins that org (verified to exist and not be deleting) and
+  # writes the new OrganizationMember row (deleting the old one on a move); null clears membership
+  # and deletes the old row. Both happen in one transaction. Returns the updated UserProfile.
+  adminSetUserOrganization(input: AdminSetUserOrganizationInput!): UserProfile!
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 }
 

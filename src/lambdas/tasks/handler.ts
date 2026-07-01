@@ -10,6 +10,7 @@ import { assertNoActiveAssignmentsForTask } from '../../shared/assignment';
 import { queryAll, queryAllItems } from '../../shared/batch';
 import { assertCallerOwns, requireCaller } from '../../shared/authz';
 import { assertUsableCategory, categoryCountDelta } from '../../shared/category';
+import { assertCanReadTask } from '../../shared/delegation';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import { MAX_TASKS_PER_OWNER } from '../../shared/task';
 import {
@@ -128,7 +129,9 @@ async function getTask(
   if (!taskId?.trim()) throw new ValidationError('taskId is required');
   const task = await readTaskMeta(taskId.trim());
   if (!task) return null;
-  assertCallerOwns(identity, task.ownerId);
+  // Read access: the owner, OR a user holding an active assignment that references this task
+  // (an assigned primary user may read a SupportPerson's template). Mutations stay owner-only.
+  await assertCanReadTask(identity, task);
   return task;
 }
 
@@ -147,7 +150,10 @@ async function listTaskSteps(
 ): Promise<Connection<TaskStep>> {
   if (!taskId?.trim()) throw new ValidationError('taskId is required');
   const id = taskId.trim();
-  await loadOwnedTask(identity, id); // existence + ownership
+  // Read access: the owner, OR a user holding an active assignment referencing this task.
+  const task = await readTaskMeta(id);
+  if (!task) throw new NotFoundError(`task ${id} not found`);
+  await assertCanReadTask(identity, task);
 
   const all = await queryAllItems<TaskStep>(taskPk(id), STEP_PREFIX);
   const allMedia = await queryAllItems<MediaAsset>(taskPk(id), MEDIA_PREFIX);

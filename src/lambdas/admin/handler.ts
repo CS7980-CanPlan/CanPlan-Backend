@@ -7,7 +7,15 @@ import {
   AdminGetUserCommand,
   AdminRemoveUserFromGroupCommand,
 } from '@aws-sdk/client-cognito-identity-provider';
-import { GetCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { randomUUID } from 'crypto';
+import {
+  DeleteCommand,
+  GetCommand,
+  PutCommand,
+  QueryCommand,
+  TransactWriteCommand,
+  UpdateCommand,
+} from '@aws-sdk/lib-dynamodb';
 import {
   assertNoActiveAssignmentsForTask,
   queryActiveAssignmentKeysForTask,
@@ -30,6 +38,10 @@ import {
   ENTITY,
   ENTITY_TYPE_INDEX,
   type EntityType,
+  META_SK,
+  ORG_MEMBER_PREFIX,
+  organizationMemberSk,
+  organizationPk,
   PRIMARY_USER_SUPPORT_LINK_INDEX,
   PROFILE_SK,
   supporterPk,
@@ -38,24 +50,39 @@ import {
   USER_LINK_PREFIX,
   userPk,
 } from '../../shared/keys';
+import {
+  assertUsableOrganization,
+  getOrganization,
+  isTransactConditionCheckFailure,
+  organizationConditionCheck,
+  organizationMemberDelete,
+  organizationMemberPut,
+  stripOrganization,
+} from '../../shared/organization';
 import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
 import { NotFoundError, ValidationError } from '../../shared/response';
 import { deleteTaskCascade } from '../../shared/taskCascade';
 import type {
+  AdminDeleteOrganizationResult,
   AdminDeleteUserInput,
   AdminDeleteUserResult,
+  AdminSetUserOrganizationInput,
   AdminUserData,
   AdminUserResult,
   AppSyncEvent,
   AppSyncIdentity,
   Category,
   Connection,
+  CreateOrganizationInput,
+  DeleteOrganizationInput,
   InviteUserInput,
+  Organization,
   SetSystemAdminInput,
   SetUserBaseRoleInput,
   SupportLink,
   Task,
   TaskAssignment,
+  UpdateOrganizationInput,
   UserProfile,
 } from '../../shared/types';
 
@@ -65,9 +92,13 @@ const ADMIN_GROUP = SYSTEM_ADMIN_GROUP;
 type AdminResult =
   | Connection<UserProfile>
   | Connection<Task>
+  | Connection<Organization>
   | AdminUserResult
   | AdminUserData
   | AdminDeleteUserResult
+  | AdminDeleteOrganizationResult
+  | Organization
+  | UserProfile
   | Task
   | null;
 
@@ -95,6 +126,19 @@ export const handler = async (
       return listByEntityType<Task>(ENTITY.TASK, pageArgs(args));
     case 'adminGetUserData':
       return adminGetUserData(args.userId as string);
+    case 'listAllOrganizations':
+      return listByEntityType<Organization>(ENTITY.ORGANIZATION, pageArgs(args));
+    case 'adminListOrganizationUsers':
+      return adminListOrganizationUsers(args.organizationId as string, pageArgs(args));
+    // ── Organization management ─────────────────────────────────────────────────
+    case 'adminCreateOrganization':
+      return adminCreateOrganization(args.input as CreateOrganizationInput);
+    case 'adminUpdateOrganization':
+      return adminUpdateOrganization(args.input as UpdateOrganizationInput);
+    case 'adminDeleteOrganization':
+      return adminDeleteOrganization(args.input as DeleteOrganizationInput);
+    case 'adminSetUserOrganization':
+      return adminSetUserOrganization(args.input as AdminSetUserOrganizationInput);
     // ── Cognito role management ─────────────────────────────────────────────────
     case 'inviteSupportPerson':
       return inviteUser(args.input as InviteUserInput, BASE_ROLE_TO_GROUP.SUPPORT_PERSON);
@@ -190,6 +234,395 @@ async function queryAllPrimaryUserSupportLinks(userId: string): Promise<SupportL
     startKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
   } while (startKey);
   return items;
+}
+
+// ── Organization management ───────────────────────────────────────────────────────
+
+/**
+ * Create an Organization. `name` is required (trimmed, non-empty); the id is server-generated.
+ * The Put is guarded by attribute_not_exists(PK) so a UUID collision can never overwrite a row.
+ * Returns the Organization without internal storage attributes.
+ */
+async function adminCreateOrganization(input: CreateOrganizationInput): Promise<Organization> {
+  const name = input?.name?.trim();
+  if (!name) throw new ValidationError('name is required and cannot be empty');
+
+  const organizationId = randomUUID();
+  const now = new Date().toISOString();
+  const organization: Organization = { organizationId, name, createdAt: now, updatedAt: now };
+  await dynamo.send(
+    new PutCommand({
+      TableName: TABLE_NAME,
+      Item: {
+        PK: organizationPk(organizationId),
+        SK: META_SK,
+        entityType: ENTITY.ORGANIZATION,
+        ...organization,
+      },
+      ConditionExpression: 'attribute_not_exists(PK)',
+    }),
+  );
+  return organization;
+}
+
+/**
+ * Rename an Organization. A pre-read (assertUsableOrganization) gives clear errors — NotFound
+ * for a missing org, ValidationError for one mid-deletion — and the conditional update guards
+ * against a concurrent delete racing between the read and the write (mapped to NotFound).
+ */
+async function adminUpdateOrganization(input: UpdateOrganizationInput): Promise<Organization> {
+  const organizationId = input?.organizationId?.trim();
+  if (!organizationId) throw new ValidationError('organizationId is required and cannot be empty');
+  const name = input?.name?.trim();
+  if (!name) throw new ValidationError('name is required and cannot be empty');
+
+  await assertUsableOrganization(organizationId);
+
+  const now = new Date().toISOString();
+  try {
+    const result = await dynamo.send(
+      new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: { PK: organizationPk(organizationId), SK: META_SK },
+        UpdateExpression: 'SET #name = :name, updatedAt = :now',
+        // `name` is a DynamoDB reserved word — alias it. Re-assert existence + not-deleting.
+        ConditionExpression: 'attribute_exists(PK) AND attribute_not_exists(deleting)',
+        ExpressionAttributeNames: { '#name': 'name' },
+        ExpressionAttributeValues: { ':name': name, ':now': now },
+        ReturnValues: 'ALL_NEW',
+      }),
+    );
+    return stripOrganization(result.Attributes as Record<string, unknown>);
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
+      throw new NotFoundError(`organization ${organizationId} not found`);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Delete an Organization, detaching every member first. Order: (1) load the org (NotFound if
+ * gone); (2) mark it `deleting` so no new membership can join mid-removal; (3) detach every member
+ * found via the STRONGLY-CONSISTENT OrganizationMember rows under the org partition (a consistent
+ * Query, paginated, never a Scan) — each member is its own transaction that clears the profile's
+ * organizationId and deletes the membership row together; (4) delete the org #META row LAST.
+ *
+ * Membership rows (not the eventually-consistent orgIndex) are the source of truth here: a user
+ * who joined moments before step 2 is guaranteed visible to a consistent read of the org
+ * partition, so this can never miss a member and leave their profile pointing at a deleted org.
+ * Idempotent/retryable: re-marking an already-`deleting` org is harmless and a retry resumes from
+ * whatever membership rows remain.
+ */
+async function adminDeleteOrganization(
+  input: DeleteOrganizationInput,
+): Promise<AdminDeleteOrganizationResult> {
+  const organizationId = input?.organizationId?.trim();
+  if (!organizationId) throw new ValidationError('organizationId is required and cannot be empty');
+
+  const existing = await getOrganization(organizationId);
+  if (!existing) throw new NotFoundError(`organization ${organizationId} not found`);
+
+  // 1) Mark deleting (idempotent — fine if already set on a retry).
+  await dynamo.send(
+    new UpdateCommand({
+      TableName: TABLE_NAME,
+      Key: { PK: organizationPk(organizationId), SK: META_SK },
+      UpdateExpression: 'SET deleting = :true, updatedAt = :now',
+      ConditionExpression: 'attribute_exists(PK)',
+      ExpressionAttributeValues: { ':true': true, ':now': new Date().toISOString() },
+    }),
+  );
+
+  // 2) Detach every member (strongly-consistent membership rows, paginated).
+  const removedUsers = await detachOrganizationMembers(organizationId);
+
+  // 3) Remove the org row only after members are detached.
+  await dynamo.send(
+    new DeleteCommand({
+      TableName: TABLE_NAME,
+      Key: { PK: organizationPk(organizationId), SK: META_SK },
+    }),
+  );
+
+  return { organization: stripOrganization(existing), removedUsers };
+}
+
+/**
+ * Detach every member of `organizationId`, found via the OrganizationMember rows under the org
+ * partition (PK = ORG#<id>, SK begins_with MEMBER#) read with ConsistentRead so a just-joined
+ * member is never missed. The base-table Query is followed to completion (no Scan) and each member
+ * is detached in its own transaction. Returns how many member profiles were actually detached in
+ * this run (stale rows whose profile had already moved are cleaned up but not counted).
+ */
+async function detachOrganizationMembers(organizationId: string): Promise<number> {
+  let removed = 0;
+  let startKey: Record<string, unknown> | undefined;
+  do {
+    const result = await dynamo.send(
+      new QueryCommand({
+        TableName: TABLE_NAME,
+        KeyConditionExpression: 'PK = :pk AND begins_with(SK, :member)',
+        ExpressionAttributeValues: {
+          ':pk': organizationPk(organizationId),
+          ':member': ORG_MEMBER_PREFIX,
+        },
+        // Strongly consistent: a member who joined just before the org was marked deleting must be
+        // visible here — the eventually-consistent orgIndex GSI could miss them (the bug we fix).
+        ConsistentRead: true,
+        ExclusiveStartKey: startKey,
+      }),
+    );
+    for (const member of (result.Items as Array<{ userId: string }>) ?? []) {
+      if (await detachOrganizationMember(organizationId, member.userId)) removed += 1;
+    }
+    startKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+  } while (startKey);
+  return removed;
+}
+
+/**
+ * Detach ONE member in a single transaction: conditionally REMOVE organizationId from their
+ * UserProfile (only while it still equals this org) AND delete the OrganizationMember row, so
+ * profile and membership cleanup stay together. Returns true when the profile was detached.
+ *
+ * If the member had already moved to a different org, the conditional profile update fails and
+ * cancels the transaction; the membership row is now stale, so delete it on its own (leaving the
+ * moved profile untouched) and return false — this keeps org deletion able to complete and remain
+ * idempotent on retry.
+ */
+async function detachOrganizationMember(organizationId: string, userId: string): Promise<boolean> {
+  try {
+    await dynamo.send(
+      new TransactWriteCommand({
+        TransactItems: [
+          {
+            Update: {
+              TableName: TABLE_NAME,
+              Key: { PK: userPk(userId), SK: PROFILE_SK },
+              UpdateExpression: 'SET updatedAt = :now REMOVE organizationId',
+              ConditionExpression: 'organizationId = :org',
+              ExpressionAttributeValues: { ':org': organizationId, ':now': new Date().toISOString() },
+            },
+          },
+          organizationMemberDelete(organizationId, userId),
+        ],
+      }),
+    );
+    return true;
+  } catch (err) {
+    // ONLY transact-item 0 (the profile update's `organizationId = :org` guard) failing means the
+    // member moved/gone and the membership row is stale — then drop it alone so deletion completes.
+    // Any OTHER cancellation (TransactionConflict, throttling, …) is transient: rethrow so a retry
+    // re-attempts the whole detach. Silently deleting the row here would orphan a profile that still
+    // points at this org (the row would be gone, so no retry could ever find that member again).
+    if (!isTransactConditionCheckFailure(err, 0)) throw err;
+    await dynamo.send(
+      new DeleteCommand({
+        TableName: TABLE_NAME,
+        Key: { PK: organizationPk(organizationId), SK: organizationMemberSk(userId) },
+      }),
+    );
+    return false;
+  }
+}
+
+/**
+ * The roster of ONE organization's members, for the admin org-detail view. Pages the
+ * strongly-consistent OrganizationMember rows under the org partition (PK = ORG#<id>, SK
+ * begins_with MEMBER#) — a base-table Query, never a Scan — then loads each member's UserProfile.
+ * A membership row whose profile is missing (a rare inconsistency) is skipped rather than crashing.
+ * Pagination is on the membership rows: `nextToken` advances the row page, so a page can return
+ * fewer profiles than the limit when some are skipped, but never loses its place.
+ */
+async function adminListOrganizationUsers(
+  organizationId: string,
+  page: PageArgs,
+): Promise<Connection<UserProfile>> {
+  const id = organizationId?.trim();
+  if (!id) throw new ValidationError('organizationId is required and cannot be empty');
+
+  const memberPage = await queryPage<{ userId: string }>(
+    {
+      TableName: TABLE_NAME,
+      KeyConditionExpression: 'PK = :pk AND begins_with(SK, :member)',
+      ExpressionAttributeValues: { ':pk': organizationPk(id), ':member': ORG_MEMBER_PREFIX },
+      // Strongly consistent so the admin UI reflects a just-added/removed member immediately (it
+      // typically refetches right after adminSetUserOrganization) rather than a stale GSI-like view.
+      ConsistentRead: true,
+    },
+    page,
+  );
+
+  const profiles = await Promise.all(memberPage.items.map((m) => readProfile(m.userId)));
+  const items = profiles.filter((p): p is UserProfile => p !== null);
+  return { items, nextToken: memberPage.nextToken };
+}
+
+/**
+ * Set or clear ANOTHER user's organization membership (SystemAdmin-only; updateMyUserProfile is
+ * self-only). Reads the target profile first (NotFound if none) to learn its previous org, then in
+ * ONE transaction keeps the UserProfile.organizationId and the OrganizationMember rows in step:
+ *  - joining a non-null org: verify it exists + isn't deleting (a pre-read for a clear error, plus a
+ *    ConditionCheck in the transaction to close the race), set organizationId, put the new membership
+ *    row, and delete the old org's row when moving;
+ *  - clearing (null): remove organizationId and delete the old membership row.
+ * TransactWrite returns no attributes, so the updated profile is read back and returned.
+ */
+async function adminSetUserOrganization(
+  input: AdminSetUserOrganizationInput,
+): Promise<UserProfile> {
+  const userId = input?.userId?.trim();
+  if (!userId) throw new ValidationError('userId is required and cannot be empty');
+
+  // organizationId MUST be present: a non-null value sets it (blank rejected), explicit null clears
+  // it. Omitting the field is rejected so a client that forgets to pass the variable can't silently
+  // wipe a user's organization.
+  const raw = input?.organizationId;
+  if (raw === undefined) {
+    throw new ValidationError(
+      'organizationId is required: pass an id to set the organization, or null to clear it',
+    );
+  }
+  let newOrg: string | undefined;
+  if (raw !== null) {
+    newOrg = raw.trim();
+    if (!newOrg) throw new ValidationError('organizationId cannot be blank; pass null to clear it');
+  }
+
+  const existing = await readProfile(userId);
+  if (!existing) throw new NotFoundError(`user ${userId} not found`);
+  const previousOrg = existing.organizationId?.trim() || undefined;
+
+  const now = new Date().toISOString();
+  const profileKey = { PK: userPk(userId), SK: PROFILE_SK };
+  // Bind the profile write to the org state seen at pre-read (item 0 of every path below). If a
+  // concurrent request moves/clears the user's org in between, this condition fails and cancels the
+  // write instead of deleting a now-stale membership row (which would orphan the row for the org the
+  // profile was concurrently moved to).
+  const guard = profileOrgGuard(previousOrg);
+
+  if (newOrg) {
+    // Clear pre-read error (NotFound / being-deleted), then the same check rides the transaction.
+    await assertUsableOrganization(newOrg);
+    const transactItems: Array<Record<string, unknown>> = [
+      {
+        Update: {
+          TableName: TABLE_NAME,
+          Key: profileKey,
+          UpdateExpression: 'SET organizationId = :org, updatedAt = :now',
+          ConditionExpression: guard.ConditionExpression,
+          ExpressionAttributeValues: { ':org': newOrg, ':now': now, ...guard.values },
+        },
+      },
+      organizationConditionCheck(newOrg),
+      organizationMemberPut(newOrg, userId),
+    ];
+    if (previousOrg && previousOrg !== newOrg) {
+      transactItems.push(organizationMemberDelete(previousOrg, userId));
+    }
+    try {
+      await dynamo.send(new TransactWriteCommand({ TransactItems: transactItems }));
+    } catch (err) {
+      // Item 1 = org ConditionCheck (target org vanished); item 0 = profile guard (the user was
+      // moved/removed since the pre-read). Anything else (e.g. TransactionConflict) is rethrown.
+      if (isTransactConditionCheckFailure(err, 1)) {
+        throw new ValidationError(
+          `organization ${newOrg} is no longer available (it was deleted or is being deleted)`,
+        );
+      }
+      if (isTransactConditionCheckFailure(err, 0)) throw profileOrgConflictError(userId);
+      throw err;
+    }
+    return readBackProfile(userId);
+  }
+
+  // Clearing with a current org: remove organizationId and drop that membership row in one
+  // transaction, guarded so a concurrent move can't leave the new org's membership row orphaned.
+  if (previousOrg) {
+    try {
+      await dynamo.send(
+        new TransactWriteCommand({
+          TransactItems: [
+            {
+              Update: {
+                TableName: TABLE_NAME,
+                Key: profileKey,
+                UpdateExpression: 'SET updatedAt = :now REMOVE organizationId',
+                ConditionExpression: guard.ConditionExpression,
+                ExpressionAttributeValues: { ':now': now, ...guard.values },
+              },
+            },
+            organizationMemberDelete(previousOrg, userId),
+          ],
+        }),
+      );
+    } catch (err) {
+      if (isTransactConditionCheckFailure(err, 0)) throw profileOrgConflictError(userId);
+      throw err;
+    }
+    return readBackProfile(userId);
+  }
+
+  // Clearing when the profile had no org: a plain conditional REMOVE, guarded so a concurrent add
+  // (which would have created a membership row) can't be silently wiped without dropping that row.
+  try {
+    await dynamo.send(
+      new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: profileKey,
+        UpdateExpression: 'SET updatedAt = :now REMOVE organizationId',
+        ConditionExpression: guard.ConditionExpression,
+        ExpressionAttributeValues: { ':now': now, ...guard.values },
+      }),
+    );
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
+      throw profileOrgConflictError(userId);
+    }
+    throw err;
+  }
+  return readBackProfile(userId);
+}
+
+/**
+ * A conditional guard binding a UserProfile write to the org it had at pre-read: it had a specific
+ * org (`organizationId = :prevOrg`) or none (`attribute_not_exists(organizationId)`). Included on
+ * every adminSetUserOrganization write so a concurrent org change cancels the write rather than
+ * letting it delete a stale membership row and orphan the concurrently-set org's row.
+ */
+function profileOrgGuard(previousOrg: string | undefined): {
+  ConditionExpression: string;
+  values: Record<string, unknown>;
+} {
+  return previousOrg
+    ? {
+        ConditionExpression: 'attribute_exists(PK) AND organizationId = :prevOrg',
+        values: { ':prevOrg': previousOrg },
+      }
+    : {
+        ConditionExpression: 'attribute_exists(PK) AND attribute_not_exists(organizationId)',
+        values: {},
+      };
+}
+
+/**
+ * The target profile's org changed (or the profile was removed) between the pre-read and the write,
+ * so the operation was aborted rather than risk orphaning a membership row. Retrying re-reads the
+ * now-current state and applies the change to it.
+ */
+function profileOrgConflictError(userId: string): ValidationError {
+  return new ValidationError(
+    `user ${userId}'s organization changed concurrently (they were moved to a different ` +
+      'organization, or their profile was removed); re-read and retry',
+  );
+}
+
+/** Read a UserProfile back after a TransactWrite (which returns no attributes); NotFound if gone. */
+async function readBackProfile(userId: string): Promise<UserProfile> {
+  const updated = await readProfile(userId);
+  if (!updated) throw new NotFoundError(`user ${userId} not found`);
+  return updated;
 }
 
 // ── Cognito role management ──────────────────────────────────────────────────────
@@ -376,18 +809,31 @@ async function adminDeleteUser(
     await deleteTaskCascade(task.taskId, { task });
   }
 
-  // 2) Every row in the user's own partition (UserProfile, Category, TaskAssignment,
-  //    TaskInstance, TaskInstanceStep, …) — one PK query, no Scan.
+  // 2) Delete the UserProfile row and its OrganizationMember row atomically. The membership row
+  //    lives under ORG#<org>, so a USER# partition batch cannot catch it. Deleting both in one
+  //    TransactWrite avoids both bad partial states:
+  //      - profile gone, membership row still present (retry cannot rediscover the org);
+  //      - membership row gone, profile still pointing at the org (org deletion could miss it).
+  const profile = await readProfile(userId);
+  const memberOrgId = profile?.organizationId?.trim() || undefined;
   const userRows = await queryAllKeys(userPk(userId));
-  await batchDelete(userRows);
+  const profileKeyInUserRows = userRows.some((row) => row.SK === PROFILE_SK);
+  if (profile || profileKeyInUserRows) {
+    await deleteProfileAndMembership(userId, memberOrgId);
+  }
 
-  // 3) SupportLinks where the user is the SUPPORTER (PK = SUPPORTER#<userId>) and …
+  // 3) Delete the remaining USER# partition rows (Category, TaskAssignment, TaskInstance,
+  //    TaskInstanceStep, …). The profile was handled transactionally above.
+  const remainingUserRows = userRows.filter((row) => row.SK !== PROFILE_SK);
+  await batchDelete(remainingUserRows);
+
+  // 4) SupportLinks where the user is the SUPPORTER (PK = SUPPORTER#<userId>) and …
   const supporterRows = await queryAllKeys(supporterPk(userId));
-  // 4) … where the user is the PRIMARY user (primaryUserSupportLinkIndex, userId = target).
+  // 5) … where the user is the PRIMARY user (primaryUserSupportLinkIndex, userId = target).
   const primaryLinkKeys = await queryPrimaryUserSupportLinkKeys(userId);
   await batchDelete([...supporterRows, ...primaryLinkKeys]);
 
-  // 5) Cognito user LAST — only after all data cleanup above succeeded.
+  // 6) Cognito user LAST — only after all data cleanup above succeeded.
   let deletedCognitoUser = false;
   if (deleteCognitoUser) {
     if (username) {
@@ -406,6 +852,37 @@ async function adminDeleteUser(
     deletedSupportLinks: supporterRows.length + primaryLinkKeys.length,
     deletedCognitoUser,
   };
+}
+
+/**
+ * Delete the profile and its org-membership mirror together. The profile condition makes the
+ * pre-read race-safe: if the user joins/moves orgs between readProfile and this transaction, abort
+ * so a retry can read the new org and delete the correct OrganizationMember row.
+ */
+async function deleteProfileAndMembership(
+  userId: string,
+  organizationId: string | undefined,
+): Promise<void> {
+  const profileDelete = organizationId
+    ? {
+        Delete: {
+          TableName: TABLE_NAME,
+          Key: { PK: userPk(userId), SK: PROFILE_SK },
+          ConditionExpression: 'attribute_not_exists(PK) OR organizationId = :org',
+          ExpressionAttributeValues: { ':org': organizationId },
+        },
+      }
+    : {
+        Delete: {
+          TableName: TABLE_NAME,
+          Key: { PK: userPk(userId), SK: PROFILE_SK },
+          ConditionExpression: 'attribute_not_exists(PK) OR attribute_not_exists(organizationId)',
+        },
+      };
+
+  const transactItems: Array<Record<string, unknown>> = [profileDelete];
+  if (organizationId) transactItems.push(organizationMemberDelete(organizationId, userId));
+  await dynamo.send(new TransactWriteCommand({ TransactItems: transactItems }));
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────────
@@ -440,7 +917,11 @@ function attrValue(attrs: AttributeType[] | undefined, name: string): string | u
 /** Read a user's UserProfile (internal storage attributes stripped), or null if absent. */
 async function readProfile(userId: string): Promise<UserProfile | null> {
   const result = await dynamo.send(
-    new GetCommand({ TableName: TABLE_NAME, Key: { PK: userPk(userId), SK: PROFILE_SK } }),
+    new GetCommand({
+      TableName: TABLE_NAME,
+      Key: { PK: userPk(userId), SK: PROFILE_SK },
+      ConsistentRead: true,
+    }),
   );
   const item = result.Item as Record<string, unknown> | undefined;
   if (!item) return null;
