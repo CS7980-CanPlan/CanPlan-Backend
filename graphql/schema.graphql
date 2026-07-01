@@ -711,6 +711,16 @@ input DeleteOrganizationInput {
   organizationId: ID!
 }
 
+# Admin sets/clears ANOTHER user's org membership (SystemAdmin-only; distinct from the self-only
+# updateMyUserProfile). organizationId: a non-null id joins that org (must exist and not be
+# deleting); explicit null clears membership. The resolver rejects omitted organizationId because
+# GraphQL input objects cannot express "nullable but required". OrganizationMember rows are kept in
+# step atomically.
+input AdminSetUserOrganizationInput {
+  userId: ID!
+  organizationId: ID
+}
+
 # Result of adminDeleteOrganization: the removed organization plus how many member
 # UserProfiles had their organizationId reference cleared.
 type AdminDeleteOrganizationResult {
@@ -842,6 +852,11 @@ type Query {
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
   # Every Organization, newest-first (entityTypeIndex; no Scan), paginated.
   listAllOrganizations(limit: Int, nextToken: String): OrganizationConnection!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # The members of ONE organization: pages the strongly-consistent OrganizationMember rows under
+  # the org partition (PK = ORG#<id>, SK begins_with MEMBER#; no Scan) and returns their
+  # UserProfiles. A membership row whose profile is missing is skipped. Paginated by nextToken.
+  adminListOrganizationUsers(organizationId: ID!, limit: Int, nextToken: String): UserProfileConnection!
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 }
 
@@ -982,6 +997,12 @@ type Mutation {
   # organizationId and deleting the membership row together, then delete the org row last.
   # Idempotent/retryable.
   adminDeleteOrganization(input: DeleteOrganizationInput!): AdminDeleteOrganizationResult!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Set or clear ANOTHER user's organization membership (SystemAdmin-only; updateMyUserProfile is
+  # self-only). A non-null organizationId joins that org (verified to exist and not be deleting) and
+  # writes the new OrganizationMember row (deleting the old one on a move); null clears membership
+  # and deletes the old row. Both happen in one transaction. Returns the updated UserProfile.
+  adminSetUserOrganization(input: AdminSetUserOrganizationInput!): UserProfile!
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 }
 

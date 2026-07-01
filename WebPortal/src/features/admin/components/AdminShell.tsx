@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react';
 import { NavLink } from 'react-router-dom';
-import { LayoutDashboard, ListChecks, LogOut, ShieldCheck, TriangleAlert, Users } from 'lucide-react';
+import { Building2, LayoutDashboard, ListChecks, LogOut, ShieldCheck, TriangleAlert, Users } from 'lucide-react';
 import { useAuth } from '../../../auth/useAuth';
 import { Button } from '../../../components/ui/Button';
 import { Badge } from '../../../components/ui/Badge';
@@ -17,6 +17,7 @@ const TABS: TabDef[] = [
   { to: '/admin', label: 'Overview', icon: <LayoutDashboard size={16} />, end: true },
   { to: '/admin/users', label: 'Users', icon: <Users size={16} /> },
   { to: '/admin/tasks', label: 'Tasks', icon: <ListChecks size={16} /> },
+  { to: '/admin/organizations', label: 'Organizations', icon: <Building2 size={16} /> },
   { to: '/admin/danger', label: 'Dangerous Actions', icon: <TriangleAlert size={16} /> },
 ];
 

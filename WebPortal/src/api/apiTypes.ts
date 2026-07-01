@@ -84,6 +84,14 @@ export interface AdminUserData {
   supportLinks: SupportLink[];
 }
 
+/** An organization users can belong to (managed only by SystemAdmin). */
+export interface Organization {
+  organizationId: string;
+  name: string;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
 export interface UserProfileConnection {
   items: UserProfile[];
   nextToken: string | null;
@@ -91,6 +99,11 @@ export interface UserProfileConnection {
 
 export interface TaskConnection {
   items: Task[];
+  nextToken: string | null;
+}
+
+export interface OrganizationConnection {
+  items: Organization[];
   nextToken: string | null;
 }
 
@@ -108,6 +121,12 @@ export interface AdminDeleteUserResult {
   deletedUserItems: number;
   deletedSupportLinks: number;
   deletedCognitoUser: boolean;
+}
+
+/** Result of adminDeleteOrganization: the removed org plus how many members were detached. */
+export interface AdminDeleteOrganizationResult {
+  organization: Organization;
+  removedUsers: number;
 }
 
 // ── Mutation inputs ──────────────────────────────────────────────────────────────
@@ -131,6 +150,25 @@ export interface AdminDeleteUserInput {
   userId: string;
   deleteCognitoUser?: boolean;
   disableFirst?: boolean;
+}
+
+export interface CreateOrganizationInput {
+  name: string;
+}
+
+export interface UpdateOrganizationInput {
+  organizationId: string;
+  name: string;
+}
+
+export interface DeleteOrganizationInput {
+  organizationId: string;
+}
+
+/** Admin sets/clears another user's org: a non-null id joins that org; explicit null clears it. */
+export interface AdminSetUserOrganizationInput {
+  userId: string;
+  organizationId: string | null;
 }
 
 // ── Pagination args ──────────────────────────────────────────────────────────────

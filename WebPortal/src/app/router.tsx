@@ -7,6 +7,7 @@ import AdminHomePage from '../features/admin/AdminHomePage';
 import UsersPage from '../features/admin/users/UsersPage';
 import UserDetailPage from '../features/admin/users/UserDetailPage';
 import TasksPage from '../features/admin/tasks/TasksPage';
+import OrganizationsPage from '../features/admin/organizations/OrganizationsPage';
 import DangerZonePage from '../features/admin/DangerZonePage';
 
 /** Route table. `/` is the login gate; `/admin/*` is guarded by RequireSystemAdmin. */
@@ -27,6 +28,7 @@ export function AppRoutes() {
         <Route path="users" element={<UsersPage />} />
         <Route path="users/:userId" element={<UserDetailPage />} />
         <Route path="tasks" element={<TasksPage />} />
+        <Route path="organizations" element={<OrganizationsPage />} />
         <Route path="danger" element={<DangerZonePage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
