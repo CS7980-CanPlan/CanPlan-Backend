@@ -16,7 +16,8 @@ export const reportS3Key = (userId: string, reportId: string): string =>
 /**
  * Persist a report: write the JSON to S3 FIRST, then the DynamoDB index row. This order
  * means the index never points at a missing object (a failed S3 write throws before any
- * row is written). Returns the metadata row (scope/dateRange JSON-encoded for AWSJSON).
+ * row is written). Returns the metadata row (scope/dateRange as plain objects; AppSync
+ * serializes them to AWSJSON).
  */
 export async function writeReport(doc: ReportDocument): Promise<Report> {
   const s3Key = reportS3Key(doc.scope.userId, doc.reportId);
@@ -31,8 +32,8 @@ export async function writeReport(doc: ReportDocument): Promise<Report> {
 
   const report: Report = {
     reportId: doc.reportId,
-    scope: JSON.stringify(doc.scope),
-    dateRange: JSON.stringify(doc.dateRange),
+    scope: doc.scope,
+    dateRange: doc.dateRange,
     s3Key,
     createdBy: doc.createdBy,
     createdAt: doc.createdAt,

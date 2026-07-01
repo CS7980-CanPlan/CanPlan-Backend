@@ -43,8 +43,8 @@ describe('writeReport', () => {
     expect(mockDynamo).toHaveBeenCalledTimes(1);
     expect(report).toEqual({
       reportId: 'r-1',
-      scope: JSON.stringify({ userId: 'u1' }),
-      dateRange: JSON.stringify({ from: '2026-06-01', to: '2026-06-30' }),
+      scope: { userId: 'u1' },
+      dateRange: { from: '2026-06-01', to: '2026-06-30' },
       s3Key: 'reports/u1/r-1.json',
       createdBy: 'sup-1',
       createdAt: '2026-06-30T12:00:00.000Z',
@@ -63,7 +63,11 @@ describe('getReportDownloadUrl', () => {
     });
     mockSign.mockResolvedValue('https://signed');
     const out = await getReportDownloadUrl('u1', 'r-1');
-    expect(out).toEqual({ downloadUrl: 'https://signed', s3Key: 'reports/u1/r-1.json', expiresIn: 900 });
+    expect(out).toEqual({
+      downloadUrl: 'https://signed',
+      s3Key: 'reports/u1/r-1.json',
+      expiresIn: 900,
+    });
   });
 
   it('throws NotFound when the report does not exist', async () => {

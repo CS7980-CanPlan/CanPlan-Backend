@@ -1,5 +1,22 @@
 import { DateTime } from 'luxon';
-import type { TaskInstance, Task, Category, ReportStats, TaskInstanceStep, ReportComputeInput } from './types';
+import { queryAll, queryAllItems } from './batch';
+import { TABLE_NAME } from './dynamodb';
+import {
+  ENTITY,
+  CATEGORY_PREFIX,
+  TASK_INSTANCE_PREFIX,
+  TASK_INSTANCE_STEP_PREFIX,
+  TASK_OWNER_INDEX,
+  userPk,
+} from './keys';
+import type {
+  TaskInstance,
+  Task,
+  Category,
+  ReportStats,
+  TaskInstanceStep,
+  ReportComputeInput,
+} from './types';
 
 /** Round to 4 decimals so completionRate is stable for assertions and JSON. */
 function rate(completed: number, total: number): number {
@@ -40,10 +57,7 @@ export function aggregateCompletion(
   };
 }
 
-export function aggregateByTask(
-  instances: TaskInstance[],
-  tasks: Task[],
-): ReportStats['byTask'] {
+export function aggregateByTask(instances: TaskInstance[], tasks: Task[]): ReportStats['byTask'] {
   const titleOf = new Map(tasks.map((t) => [t.taskId, t.title]));
   const acc = new Map<string, { completed: number; total: number }>();
   for (const inst of instances) {
@@ -141,16 +155,20 @@ export function aggregateStepDwell(
         const seconds = (Date.parse(s.completedAt) - Date.parse(prev)) / 1000;
         if (seconds >= 0) {
           const key = `${s.taskId}#${s.order}`;
-          const a =
-            acc.get(key) ??
-            { taskId: s.taskId, stepOrder: s.order, stepText: s.text, totalSeconds: 0, samples: 0 };
+          const a = acc.get(key) ?? {
+            taskId: s.taskId,
+            stepOrder: s.order,
+            stepText: s.text,
+            totalSeconds: 0,
+            samples: 0,
+          };
           a.totalSeconds += seconds;
           a.samples++;
           acc.set(key, a);
         }
       }
-      // Advance the cursor only when this step has a timestamp; a gap breaks the chain.
-      if (s.completedAt) prev = s.completedAt;
+      // Advance the cursor only when this step has a timestamp and is not out-of-order.
+      if (s.completedAt && (!prev || s.completedAt >= prev)) prev = s.completedAt;
     }
   }
 
@@ -246,17 +264,6 @@ export function computeReportStats(input: ReportComputeInput): ReportStats {
   };
 }
 
-import { queryAll, queryAllItems } from './batch';
-import { TABLE_NAME } from './dynamodb';
-import {
-  ENTITY,
-  CATEGORY_PREFIX,
-  TASK_INSTANCE_PREFIX,
-  TASK_INSTANCE_STEP_PREFIX,
-  TASK_OWNER_INDEX,
-  userPk,
-} from './keys';
-
 /**
  * Gather a user's task data for the range and compute the deterministic stats.
  * Instances use a single BETWEEN on the date-sorted SK; steps/categories are prefix
@@ -279,6 +286,9 @@ export async function buildReportStats(
         ':to': `${TASK_INSTANCE_PREFIX}${to}￿`,
       },
     }),
+    // v1 scale limit: step rows aren't date-keyed, so this reads ALL of the user's step
+    // rows and filters to the range in memory. Fine at current scale; the first scale
+    // follow-up is to date-key steps (or add a GSI).
     queryAllItems<TaskInstanceStep>(pk, TASK_INSTANCE_STEP_PREFIX),
     queryAll<Task>({
       TableName: TABLE_NAME,

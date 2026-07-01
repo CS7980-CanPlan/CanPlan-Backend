@@ -931,12 +931,13 @@ export interface GenerateReportInput {
 
 /**
  * A persisted report's metadata row (the GraphQL Report type). `scope` and `dateRange`
- * are JSON-encoded strings (the AWSJSON contract): e.g. '{"userId":"u-1"}'.
+ * are plain objects — AppSync serializes them to AWSJSON on the way out, the same
+ * convention used for accessibilitySettings (UserProfile) and permissions (SupportLink).
  */
 export interface Report {
   reportId: string;
-  scope: string;
-  dateRange: string;
+  scope: { userId: string };
+  dateRange: { from: string; to: string };
   s3Key: string;
   createdBy: string;
   createdAt: string;
