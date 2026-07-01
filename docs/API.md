@@ -179,6 +179,8 @@ GraphQL types below. The key layout (for reference):
 | Entity | PK | SK |
 |---|---|---|
 | UserProfile | `USER#<userId>` | `#PROFILE` |
+| Organization | `ORG#<organizationId>` | `#META` |
+| OrganizationMember | `ORG#<organizationId>` | `MEMBER#<userId>` (internal; strongly-consistent membership row, never exposed in GraphQL) |
 | SupportLink | `SUPPORTER#<supporterId>` | `USER#<primaryUserId>` |
 | Category | `USER#<ownerId>` | `CATEGORY#<categoryId>` |
 | Task (template) | `TASK#<taskId>` | `#META` |
@@ -191,7 +193,10 @@ GraphQL types below. The key layout (for reference):
 Seven GSIs serve the cross-cutting lists: `supporterIndex` (users managed by a
 supporter), `primaryUserSupportLinkIndex` (`SupportLink`s by primary user — keyed on
 `userId`/`supporterId`, the inverse of `supporterIndex`; sparse to `SupportLink`,
-used by `adminDeleteUser`), `orgIndex` (users in an organization), `taskOwnerIndex`
+used by `adminDeleteUser`), `orgIndex` (users in an organization — backs the
+`listMyOrganizationUsers` roster; `OrganizationMember` rows co-tenant it, so the roster
+query filters to `SK = #PROFILE`. **It is only eventually consistent, so it is NOT used to
+find members for org deletion** — see `adminDeleteOrganization`), `taskOwnerIndex`
 (task templates by owner), `taskCategoryIndex` (tasks within one owner's category —
 keyed on a denormalized `<ownerId>#<categoryId>`, newest-first), `entityTypeIndex`
 (every item of one `entityType`, newest-first — backs the SystemAdmin list-all APIs
@@ -412,11 +417,10 @@ fields are marked `!` and everything else is optional; see
 
 | Operation | Input | Returns |
 |---|---|---|
-| `createUserProfile` | `input: { displayName!, organizationId, accessibilitySettings }` (`CreateMyUserProfileInput`) | `UserProfile` — creates the **caller's own** profile **and its default category** atomically; `displayName` is required, while `userId` (Cognito `sub`), `email`, `role`, and `defaultCategoryId` are derived server-side and cannot be supplied by the client |
-| `updateMyUserProfile` | `input: { displayName, accessibilitySettings, organizationId }` (`UpdateMyUserProfileInput`) | `UserProfile!` — **partial** update of the **caller's own** profile; `organizationId` is now editable (MVP self-service); see below |
+| `createUserProfile` | `input: { displayName!, organizationId, accessibilitySettings }` (`CreateMyUserProfileInput`) | `UserProfile` — creates the **caller's own** profile **and its default category** atomically; `displayName` is required, while `userId` (Cognito `sub`), `email`, `role`, and `defaultCategoryId` are derived server-side and cannot be supplied by the client. A supplied `organizationId` must reference an **existing, non-deleting Organization** (`NOT_FOUND`/`VALIDATION` otherwise) |
+| `updateMyUserProfile` | `input: { displayName, accessibilitySettings, organizationId }` (`UpdateMyUserProfileInput`) | `UserProfile!` — **partial** update of the **caller's own** profile; `organizationId` is editable but must reference an **existing, non-deleting Organization** (or `null` to clear); see below |
 | `getUserProfile` | `userId!` | `UserProfile` · `null` if not found |
-| `listUsersByOrganization` | `organizationId!, limit, nextToken` | `UserProfileConnection!` · **DEPRECATED** — prefer `listMyOrganizationUsers`. Now **strictly self-scoped**: `organizationId` must equal the **caller's own** current org (else `NOT_AUTHORIZED`); a caller with no org gets `VALIDATION`. **Roster only**: just `userId`, `displayName`, `role` are populated (orgIndex projection) |
-| `listMyOrganizationUsers` | `limit, nextToken` | `UserProfileConnection!` — **the caller's OWN** org roster (same projection). The org is read from the caller's profile (no `organizationId` argument), so a SupportPerson can only ever list their own org. `VALIDATION` if the caller has no current org |
+| `listMyOrganizationUsers` | `limit, nextToken` | `UserProfileConnection!` — **the caller's OWN** org roster (orgIndex projection: `userId`, `displayName`, `role`). The org is read from the caller's profile (no `organizationId` argument), so a SupportPerson can only ever list their own org. `VALIDATION` if the caller has no current org |
 | `selectPrimaryUser` | `input: { primaryUserId!, permissions }` (`SelectPrimaryUserInput`) | `SupportLink!` — a **SupportPerson** selects an in-org `PRIMARY_USER` (supporter = caller); writes/restores the link **ACTIVE**; see below |
 | `unselectPrimaryUser` | `input: { primaryUserId! }` (`UnselectPrimaryUserInput`) | `SupportLink!` — soft-revokes the link (**REVOKED**, never deleted); see below |
 | `listMySupportList` | `limit, nextToken` | `SupportLinkConnection!` — the caller's OWN support list (every primary user they selected, ACTIVE + REVOKED), via supporterIndex on the caller's sub |
@@ -461,12 +465,22 @@ fields are marked `!` and everything else is optional; see
 >   **not** deep-merged with the previous value. As elsewhere, this is an `AWSJSON` field:
 >   send `JSON.stringify(settings)` and `JSON.parse` it back off the returned profile (see
 >   [AWSJSON fields](#awsjson-fields--encoding-foot-gun)).
-> - **`organizationId`** (MVP self-service org membership) — the key **omitted** ⇒ unchanged;
->   a **non-empty string** ⇒ set it (trimmed); explicit **`null`** ⇒ clear it; a blank/whitespace
->   string is rejected (use `null` to clear). **Any signed-in user may change their own**
->   `organizationId` in this MVP — there is no org-admin gating yet. Changing it moves you in
->   `listMyOrganizationUsers`/`orgIndex` and **affects SupportPerson delegation**: a supporter
->   only keeps delegated access while you still share their org (see the authorization model).
+> - **`organizationId`** (org membership) — the key **omitted** ⇒ unchanged; a **non-empty
+>   string** ⇒ set it, but it must **reference an existing, non-deleting `Organization`** (a
+>   missing org is `NOT_FOUND`, a deleting org is `VALIDATION`); explicit **`null`** ⇒ clear it;
+>   a blank/whitespace string is rejected (use `null` to clear). Organizations are created and
+>   managed by SystemAdmin (see [Admin organizations](#admin-organizations--queries--mutations-systemadmin-only)).
+>   **Any signed-in user may set their own** `organizationId` to a valid org in this MVP — there
+>   is no org-admin-approved join flow yet. Changing it moves you in `listMyOrganizationUsers`/
+>   `orgIndex` and **affects SupportPerson delegation**: a supporter only keeps delegated access
+>   while you still share their org (see the authorization model).
+>
+> Setting/moving/clearing `organizationId` is **transactional and keeps a strongly-consistent
+> `OrganizationMember` row** (`ORG#<org>`/`MEMBER#<user>`) in lockstep: setting reads the current
+> profile first, then in one transaction updates the profile, re-checks the target org exists and
+> isn't deleting, writes the new membership row, and (when moving) deletes the old one; clearing
+> deletes the membership row in the same transaction. This membership row — not the eventually
+> consistent `orgIndex` — is what `adminDeleteOrganization` relies on to detach members safely.
 >
 > The server also stamps a fresh `updatedAt`. Use this for ordinary profile edits; use
 > `createUserProfile` only for first-run creation (or a deliberate full replace).
@@ -1016,9 +1030,10 @@ and re-checked in the resolver. A non-SystemAdmin caller gets an authorization e
 |---|---|
 | `listAllUsers(limit, nextToken)` | `UserProfileConnection` |
 | `listAllTasks(limit, nextToken)` | `TaskConnection` |
+| `listAllOrganizations(limit, nextToken)` | `OrganizationConnection` — every `Organization`, newest-first |
 | `adminGetUserData(userId!)` | `AdminUserData!` — full read-only snapshot of one user; see below |
 
-`listAllUsers`/`listAllTasks` take an optional `limit` (page size) and `nextToken`, and
+`listAllUsers`/`listAllTasks`/`listAllOrganizations` take an optional `limit` (page size) and `nextToken`, and
 return `{ items, nextToken }`. `nextToken` is an **opaque, base64-encoded** cursor — pass
 the value you got back to fetch the next page; it's `null` on the last page.
 
@@ -1127,11 +1142,13 @@ otherwise — invites don't create a profile).
 1. If `deleteCognitoUser` and `disableFirst`, `AdminDisableUser` first (so an in-flight
    session can't race the cleanup).
 2. Delete every **owned task** via `taskOwnerIndex` → the shared cascade each.
-3. Delete every row in the **`USER#<userId>` partition** (profile, categories, task
+3. Delete `USER#<userId>/#PROFILE` and the matching
+   `ORG#<organizationId>/MEMBER#<userId>` row, if any, in **one TransactWrite**.
+4. Delete the remaining rows in the **`USER#<userId>` partition** (categories, task
    assignments, task instances, task-instance steps, …) with one PK query + batch delete.
-4. Delete every `SupportLink` where the user is the **supporter** (`SUPPORTER#<userId>`
+5. Delete every `SupportLink` where the user is the **supporter** (`SUPPORTER#<userId>`
    partition) **and** where they are the **primary user** (`primaryUserSupportLinkIndex`).
-5. **Last**, if `deleteCognitoUser`, `AdminDeleteUser`. Any DynamoDB/S3 failure above throws
+6. **Last**, if `deleteCognitoUser`, `AdminDeleteUser`. Any DynamoDB/S3 failure above throws
    before this step, so the login is never removed while data remains; an already-missing
    user counts as success once data cleanup completes.
 
@@ -1150,6 +1167,64 @@ mutation PromoteToAdmin($input: SetSystemAdminInput!) {
 mutation DeleteUser($input: AdminDeleteUserInput!) {
   adminDeleteUser(input: $input) {
     userId deletedTasks deletedUserItems deletedSupportLinks deletedCognitoUser
+  }
+}
+```
+
+---
+
+### Admin organizations — queries & mutations (SystemAdmin only)
+
+An **`Organization`** is a real row (`PK = ORG#<organizationId>`, `SK = #META`) that a
+`UserProfile.organizationId` references. Organizations are created and managed **only** by
+SystemAdmin; a user joins one by setting their own `organizationId` to an existing org's id
+(validated server-side — see `createUserProfile`/`updateMyUserProfile`). Like every admin API,
+these are gated to the `SystemAdmin` group at the AppSync edge **and** re-checked in the Lambda.
+
+| Operation | Returns | Effect |
+|---|---|---|
+| `listAllOrganizations(limit, nextToken)` | `OrganizationConnection!` | Every org, newest-first (`entityTypeIndex`; no Scan), paginated. |
+| `adminCreateOrganization(input: CreateOrganizationInput!)` | `Organization!` | Create an org. `name` is required (trimmed, non-empty); `organizationId` is server-generated. |
+| `adminUpdateOrganization(input: UpdateOrganizationInput!)` | `Organization!` | Rename an org. `NOT_FOUND` if it doesn't exist; `VALIDATION` while it is being deleted. |
+| `adminDeleteOrganization(input: DeleteOrganizationInput!)` | `AdminDeleteOrganizationResult!` | Delete an org and **detach every member** (clears each member's `organizationId`). See below. |
+
+**Inputs:** `CreateOrganizationInput { name: String! }`, `UpdateOrganizationInput { organizationId: ID!, name: String! }`,
+`DeleteOrganizationInput { organizationId: ID! }`. The `Organization` type is
+`{ organizationId, name, createdAt, updatedAt }` (its internal `deleting` marker is never exposed).
+
+**`adminDeleteOrganization` order (retryable/idempotent; no Scan):** (1) load the org (`NOT_FOUND`
+if missing); (2) mark it `deleting` so no new member can join mid-removal; (3) find every member
+via the **strongly-consistent `OrganizationMember` rows** under the org partition (`ORG#<id>` /
+`begins_with(SK, MEMBER#)`, `ConsistentRead: true`, paginated to completion) and detach each in its
+own transaction that **conditionally `REMOVE`s `organizationId` from the member `UserProfile`
+(only while it still equals this org) and deletes the membership row together**; (4) delete the org
+`#META` row **last**. Returns `AdminDeleteOrganizationResult { organization, removedUsers }` — the
+removed org plus how many member profiles were detached in this run. Safe to retry on partial
+failure (an already-`deleting` org resumes removal, and a member who has since moved orgs has only
+their stale membership row cleaned up — their new profile is left untouched).
+
+> **Why membership rows, not `orgIndex`:** `orgIndex` is a GSI and only *eventually* consistent, so
+> a member who joined moments before step 2 might not appear in it yet — deletion could miss them and
+> leave a `UserProfile.organizationId` pointing at a deleted org. The `OrganizationMember` rows are
+> written in the **same transaction** as every `organizationId` set (see `createUserProfile` /
+> `updateMyUserProfile`), and a `ConsistentRead` of the org partition is guaranteed to see them.
+>
+> **Migration / backfill (existing environments):** environments created before `OrganizationMember`
+> rows existed may have `UserProfile.organizationId` values with **no matching membership row**.
+> Those members are invisible to `adminDeleteOrganization` (which reads only membership rows), so run
+> a **one-time backfill** that writes an `OrganizationMember` row (`ORG#<org>`/`MEMBER#<user>`) for
+> every profile with a non-null `organizationId` **before** deleting any pre-existing org. New
+> memberships created after this change need no backfill.
+
+```graphql
+mutation CreateOrg($input: CreateOrganizationInput!) {
+  adminCreateOrganization(input: $input) { organizationId name createdAt }
+}
+
+mutation DeleteOrg($input: DeleteOrganizationInput!) {
+  adminDeleteOrganization(input: $input) {
+    organization { organizationId name }
+    removedUsers
   }
 }
 ```
@@ -1277,11 +1352,14 @@ Planned but not implemented — don't build against them:
   `getTaskInstanceViews` expands occurrences on read, but **nothing fires reminders yet**.
   There is no delivery engine (EventBridge), no device-token registration, and no
   push-notification Lambda in this phase.
-- **Org-admin gating of organization membership** — in this MVP **any signed-in user may set
-  their own `organizationId`** via `updateMyUserProfile` (self-service). There is no
-  `OrganizationAdmin`-approved join/invite flow, and no admin API to move another user between
-  organizations. This is expected to tighten later (an org-admin-gated membership model), at
-  which point unrestricted self-service org changes may be removed.
+- **Org-admin gating of organization membership** — Organizations themselves are now real,
+  SystemAdmin-managed rows (`adminCreateOrganization`/`adminUpdateOrganization`/
+  `adminDeleteOrganization`/`listAllOrganizations`), and `organizationId` must reference an
+  existing org. But in this MVP **any signed-in user may set their own `organizationId`** to any
+  valid org via `updateMyUserProfile` (self-service join). There is no `OrganizationAdmin`-approved
+  join/invite flow, and no admin API to move **another** user between organizations. This is
+  expected to tighten later (an org-admin-gated membership model), at which point unrestricted
+  self-service joins may be removed.
 - **PENDING / invite-style SupportLinks** — selection is immediate: `selectPrimaryUser` writes
   an **ACTIVE** link with no primary-user acceptance step. The `PENDING` `SupportLinkStatus`
   exists in the schema but no operation produces it (an invite/accept handshake is not built).

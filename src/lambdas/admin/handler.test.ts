@@ -41,6 +41,8 @@ const mockBatchDelete = batchDelete as jest.Mock;
 const mockQueryAllKeys = queryAllKeys as jest.Mock;
 const mockQueryAllItems = queryAllItems as jest.Mock;
 
+type Rec = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any -- loose command/transact-item mock helpers
+
 /** Default Cognito responses keyed by command type (overridable per test). */
 function defaultCognito(command: { constructor: { name: string }; input: Record<string, unknown> }) {
   switch (command.constructor.name) {
@@ -109,6 +111,21 @@ describe('admin handler — SystemAdmin authorization', () => {
     expect(mockCognito).not.toHaveBeenCalled();
     expect(mockCascade).not.toHaveBeenCalled();
   });
+
+  it('admin organization APIs reject a non-SystemAdmin before any side effect', async () => {
+    const orgFields: Array<[string, Record<string, unknown>]> = [
+      ['listAllOrganizations', {}],
+      ['adminCreateOrganization', { input: { name: 'Acme' } }],
+      ['adminUpdateOrganization', { input: { organizationId: 'o1', name: 'Acme' } }],
+      ['adminDeleteOrganization', { input: { organizationId: 'o1' } }],
+    ];
+    for (const [field, args] of orgFields) {
+      await expect(handler(event(field, args, { groups: ['OrganizationAdmin'] }))).rejects.toThrow(
+        'SystemAdmin',
+      );
+    }
+    expect(mockSend).not.toHaveBeenCalled();
+  });
 });
 
 // ── Listings (unchanged) ──────────────────────────────────────────────────────────
@@ -131,6 +148,256 @@ describe('admin handler — entityTypeIndex listings', () => {
 
     await handler(event('listAllUsers', { nextToken: encodeNextToken(lek)! }));
     expect(dynamoCalls().at(-1).input.ExclusiveStartKey).toEqual(lek);
+  });
+
+  it('listAllOrganizations queries entityTypeIndex for Organization, newest-first', async () => {
+    mockSend.mockResolvedValueOnce({ Items: [{ organizationId: 'o1', name: 'Acme' }] });
+    const result = (await handler(event('listAllOrganizations', {}))) as Connection<unknown>;
+    const input = dynamoCalls()[0].input;
+    expect(dynamoCalls()[0].constructor.name).toBe('QueryCommand');
+    expect(input.IndexName).toBe('entityTypeIndex');
+    expect(input.ExpressionAttributeValues).toEqual({ ':et': 'Organization' });
+    expect(input.ScanIndexForward).toBe(false);
+    expect(result.items).toHaveLength(1);
+  });
+});
+
+// ── Organization management ─────────────────────────────────────────────────────--
+describe('admin handler — adminCreateOrganization', () => {
+  it('writes ORG#<id>/#META with a generated id, trimmed name, and an existence guard', async () => {
+    const result = (await handler(
+      event('adminCreateOrganization', { input: { name: '  Acme Inc  ' } }),
+    )) as { organizationId: string; name: string };
+
+    const put = dynamoCalls().find((c) => c.constructor.name === 'PutCommand').input;
+    expect(put.Item.PK).toBe(`ORG#${result.organizationId}`);
+    expect(put.Item.SK).toBe('#META');
+    expect(put.Item.entityType).toBe('Organization');
+    expect(put.Item.name).toBe('Acme Inc'); // trimmed
+    expect(put.ConditionExpression).toBe('attribute_not_exists(PK)');
+    // Response is the clean Organization (no PK/SK/entityType).
+    expect(typeof result.organizationId).toBe('string');
+    expect(result.name).toBe('Acme Inc');
+    expect((result as Record<string, unknown>).PK).toBeUndefined();
+  });
+
+  it('rejects a blank name before any write', async () => {
+    await expect(
+      handler(event('adminCreateOrganization', { input: { name: '   ' } })),
+    ).rejects.toThrow('name is required');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+});
+
+describe('admin handler — adminUpdateOrganization', () => {
+  it('renames an existing org (aliases the reserved word name), returning the clean row', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { organizationId: 'o1', name: 'Old', createdAt: 'c', updatedAt: 'u' } }) // existence check
+      .mockResolvedValueOnce({
+        Attributes: { PK: 'ORG#o1', SK: '#META', entityType: 'Organization', organizationId: 'o1', name: 'New', createdAt: 'c', updatedAt: 'u2' },
+      });
+    const result = (await handler(
+      event('adminUpdateOrganization', { input: { organizationId: 'o1', name: '  New  ' } }),
+    )) as { name: string };
+
+    const upd = dynamoCalls().find((c) => c.constructor.name === 'UpdateCommand').input;
+    expect(upd.Key).toEqual({ PK: 'ORG#o1', SK: '#META' });
+    expect(upd.UpdateExpression).toBe('SET #name = :name, updatedAt = :now');
+    expect(upd.ExpressionAttributeNames).toEqual({ '#name': 'name' });
+    expect(upd.ExpressionAttributeValues[':name']).toBe('New'); // trimmed
+    expect(upd.ConditionExpression).toBe('attribute_exists(PK) AND attribute_not_exists(deleting)');
+    expect(result.name).toBe('New');
+    expect((result as Record<string, unknown>).PK).toBeUndefined();
+  });
+
+  it('404s for a missing org and issues no update', async () => {
+    mockSend.mockResolvedValueOnce({}); // existence check → no Item
+    await expect(
+      handler(event('adminUpdateOrganization', { input: { organizationId: 'gone', name: 'X' } })),
+    ).rejects.toThrow('organization gone not found');
+    expect(dynamoCalls().some((c) => c.constructor.name === 'UpdateCommand')).toBe(false);
+  });
+
+  it('rejects renaming a deleting org (VALIDATION)', async () => {
+    mockSend.mockResolvedValueOnce({
+      Item: { organizationId: 'o1', name: 'Old', deleting: true, createdAt: 'c', updatedAt: 'u' },
+    });
+    await expect(
+      handler(event('adminUpdateOrganization', { input: { organizationId: 'o1', name: 'X' } })),
+    ).rejects.toThrow('being deleted');
+    expect(dynamoCalls().some((c) => c.constructor.name === 'UpdateCommand')).toBe(false);
+  });
+
+  it('rejects a blank name before any read', async () => {
+    await expect(
+      handler(event('adminUpdateOrganization', { input: { organizationId: 'o1', name: '  ' } })),
+    ).rejects.toThrow('name is required');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+});
+
+describe('admin handler — adminDeleteOrganization', () => {
+  const ORG = { organizationId: 'o1', name: 'Acme', createdAt: 'c', updatedAt: 'u' };
+
+  /** Route dynamo.send: org #META GET, MEMBER# query pages, per-member transactions + org writes. */
+  function routeDelete(opts: { org?: Record<string, unknown>; memberPages?: Array<Array<{ userId: string }>> }) {
+    const pages = opts.memberPages ?? [[]];
+    let queryIdx = 0;
+    mockSend.mockImplementation((cmd: { constructor: { name: string }; input: Rec }) => {
+      const name = cmd.constructor.name;
+      if (name === 'GetCommand') return Promise.resolve({ Item: opts.org });
+      if (name === 'QueryCommand') {
+        const page = pages[queryIdx] ?? [];
+        const more = queryIdx < pages.length - 1;
+        queryIdx += 1;
+        return Promise.resolve({ Items: page, LastEvaluatedKey: more ? { k: queryIdx } : undefined });
+      }
+      return Promise.resolve({}); // UpdateCommand (mark deleting) + TransactWriteCommand (detach) + DeleteCommand
+    });
+  }
+
+  it('404s for a missing org without marking or deleting anything', async () => {
+    routeDelete({ org: undefined });
+    await expect(
+      handler(event('adminDeleteOrganization', { input: { organizationId: 'gone' } })),
+    ).rejects.toThrow('organization gone not found');
+    expect(
+      dynamoCalls().some((c) =>
+        ['UpdateCommand', 'TransactWriteCommand', 'DeleteCommand'].includes(c.constructor.name),
+      ),
+    ).toBe(false);
+  });
+
+  it('marks deleting, detaches every member via consistent MEMBER# rows, deletes the org row last, no Scan', async () => {
+    routeDelete({ org: ORG, memberPages: [[{ userId: 'u1' }, { userId: 'u2' }], [{ userId: 'u3' }]] });
+    const result = (await handler(
+      event('adminDeleteOrganization', { input: { organizationId: 'o1' } }),
+    )) as { organization: { organizationId: string }; removedUsers: number };
+
+    // 1) Org marked deleting (the only standalone UpdateCommand — member updates ride transactions).
+    const mark = dynamoCalls()
+      .filter((c) => c.constructor.name === 'UpdateCommand')
+      .map((c) => c.input)
+      .find((u: Rec) => u.Key.PK === 'ORG#o1');
+    expect(mark.UpdateExpression).toContain('deleting = :true');
+
+    // 2) Every member detached in its OWN transaction: conditional profile REMOVE + membership Delete.
+    const memberTx = dynamoCalls()
+      .filter((c) => c.constructor.name === 'TransactWriteCommand')
+      .map((c) => c.input.TransactItems);
+    const profileUpdates = memberTx.map((items: Rec[]) => items.find((t: Rec) => t.Update)!.Update);
+    expect(profileUpdates.map((u: Rec) => u.Key.PK).sort()).toEqual(['USER#u1', 'USER#u2', 'USER#u3']);
+    for (const u of profileUpdates) {
+      expect(u.Key.SK).toBe('#PROFILE');
+      expect(u.UpdateExpression).toBe('SET updatedAt = :now REMOVE organizationId');
+      expect(u.ConditionExpression).toBe('organizationId = :org');
+      expect(u.ExpressionAttributeValues[':org']).toBe('o1');
+    }
+    // …and the same transaction deletes that member's row under the org partition.
+    const memberDeletes = memberTx.map((items: Rec[]) => items.find((t: Rec) => t.Delete)!.Delete);
+    expect(memberDeletes.map((d: Rec) => d.Key.SK).sort()).toEqual(['MEMBER#u1', 'MEMBER#u2', 'MEMBER#u3']);
+    for (const d of memberDeletes) expect(d.Key.PK).toBe('ORG#o1');
+
+    // 3) Members found via a STRONGLY-CONSISTENT base-table Query of ORG#o1 / begins_with MEMBER#
+    //    (not orgIndex), followed to completion — never a Scan.
+    const query = dynamoCalls().find((c) => c.constructor.name === 'QueryCommand').input;
+    expect(query.IndexName).toBeUndefined();
+    expect(query.ConsistentRead).toBe(true);
+    expect(query.KeyConditionExpression).toBe('PK = :pk AND begins_with(SK, :member)');
+    expect(query.ExpressionAttributeValues).toEqual({ ':pk': 'ORG#o1', ':member': 'MEMBER#' });
+    expect(dynamoCalls().some((c) => c.constructor.name === 'ScanCommand')).toBe(false);
+
+    // 4) Org #META row deleted AFTER the last member transaction.
+    const del = dynamoCalls().find((c) => c.constructor.name === 'DeleteCommand');
+    expect(del.input.Key).toEqual({ PK: 'ORG#o1', SK: '#META' });
+    const delIdx = dynamoCalls().findIndex((c) => c.constructor.name === 'DeleteCommand');
+    const lastTxIdx = dynamoCalls().reduce(
+      (acc, c, i) => (c.constructor.name === 'TransactWriteCommand' ? i : acc),
+      -1,
+    );
+    expect(delIdx).toBeGreaterThan(lastTxIdx);
+
+    // 5) Result.
+    expect(result.removedUsers).toBe(3);
+    expect(result.organization.organizationId).toBe('o1');
+  });
+
+  it('handles an empty org: marks deleting, deletes the row, removedUsers = 0, no member transactions', async () => {
+    routeDelete({ org: ORG, memberPages: [[]] });
+    const result = (await handler(
+      event('adminDeleteOrganization', { input: { organizationId: 'o1' } }),
+    )) as { removedUsers: number };
+    expect(result.removedUsers).toBe(0);
+    expect(dynamoCalls().some((c) => c.constructor.name === 'DeleteCommand')).toBe(true);
+    expect(dynamoCalls().some((c) => c.constructor.name === 'TransactWriteCommand')).toBe(false);
+  });
+
+  it('drops a stale membership row (member already moved) without clearing the moved profile, not counted', async () => {
+    // The member's conditional profile update fails (they had moved orgs), canceling the transaction.
+    // The now-stale membership row is deleted on its own so org deletion still completes.
+    let queryIdx = 0;
+    mockSend.mockImplementation((cmd: { constructor: { name: string }; input: Rec }) => {
+      const name = cmd.constructor.name;
+      if (name === 'GetCommand') return Promise.resolve({ Item: ORG });
+      if (name === 'QueryCommand') {
+        const page = queryIdx === 0 ? [{ userId: 'moved' }] : [];
+        queryIdx += 1;
+        return Promise.resolve({ Items: page, LastEvaluatedKey: undefined });
+      }
+      if (name === 'TransactWriteCommand') {
+        return Promise.reject(
+          Object.assign(new Error('canceled'), {
+            name: 'TransactionCanceledException',
+            CancellationReasons: [{ Code: 'ConditionalCheckFailed' }, { Code: 'None' }],
+          }),
+        );
+      }
+      return Promise.resolve({}); // UpdateCommand (mark) + DeleteCommand (stale member row / org row)
+    });
+    const result = (await handler(
+      event('adminDeleteOrganization', { input: { organizationId: 'o1' } }),
+    )) as { removedUsers: number };
+
+    // The stale membership row was deleted on its own (standalone DeleteCommand, ORG#o1 / MEMBER#moved).
+    const staleDelete = dynamoCalls().find(
+      (c) => c.constructor.name === 'DeleteCommand' && c.input.Key.SK === 'MEMBER#moved',
+    );
+    expect(staleDelete.input.Key).toEqual({ PK: 'ORG#o1', SK: 'MEMBER#moved' });
+    // The moved profile was NOT counted as detached, and the org #META row is still deleted.
+    expect(result.removedUsers).toBe(0);
+    expect(
+      dynamoCalls().some((c) => c.constructor.name === 'DeleteCommand' && c.input.Key.SK === '#META'),
+    ).toBe(true);
+  });
+
+  it('rethrows a transient per-member cancellation (e.g. TransactionConflict) instead of dropping the row', async () => {
+    // A transient transaction conflict is NOT a ConditionalCheckFailed on the profile guard (item 0),
+    // so the membership row is still valid — it must be left intact and the whole operation aborted
+    // for a retry (dropping the row now would orphan a profile still pointing at this org).
+    let queryIdx = 0;
+    mockSend.mockImplementation((cmd: { constructor: { name: string }; input: Rec }) => {
+      const name = cmd.constructor.name;
+      if (name === 'GetCommand') return Promise.resolve({ Item: ORG });
+      if (name === 'QueryCommand') {
+        const page = queryIdx === 0 ? [{ userId: 'u1' }] : [];
+        queryIdx += 1;
+        return Promise.resolve({ Items: page, LastEvaluatedKey: undefined });
+      }
+      if (name === 'TransactWriteCommand') {
+        return Promise.reject(
+          Object.assign(new Error('conflict'), {
+            name: 'TransactionCanceledException',
+            CancellationReasons: [{ Code: 'TransactionConflict' }, { Code: 'None' }],
+          }),
+        );
+      }
+      return Promise.resolve({});
+    });
+    await expect(
+      handler(event('adminDeleteOrganization', { input: { organizationId: 'o1' } })),
+    ).rejects.toThrow('conflict');
+    // No membership row dropped on its own, and the org #META row was NOT deleted (aborted for retry).
+    expect(dynamoCalls().some((c) => c.constructor.name === 'DeleteCommand')).toBe(false);
   });
 });
 
@@ -384,6 +651,51 @@ describe('admin handler — adminDeleteUser', () => {
     )) as { deletedCognitoUser: boolean };
     expect(result.deletedCognitoUser).toBe(false);
     expect(cognitoNames()).not.toContain('AdminDeleteUserCommand');
+  });
+
+  it("deletes the user's profile and OrganizationMember row in one transaction before remaining USER# rows", async () => {
+    mockFindUsername.mockResolvedValue('target@e.com');
+    // The profile read up front reports the user's org; everything else is empty.
+    mockSend.mockImplementation((command: { constructor: { name: string }; input?: Rec }) => {
+      if (command.constructor.name === 'GetCommand') {
+        return Promise.resolve({ Item: { userId: 'target', organizationId: 'org-9' } });
+      }
+      return Promise.resolve({});
+    });
+    mockQueryAllKeys
+      .mockResolvedValueOnce([
+        { PK: 'USER#target', SK: '#PROFILE' },
+        { PK: 'USER#target', SK: 'CATEGORY#c1' },
+      ]) // USER# partition rows
+      .mockResolvedValueOnce([]); // supporter-side links
+    await handler(event('adminDeleteUser', { input: { userId: 'target' } }));
+
+    const txCallIndex = dynamoCalls().findIndex((c) => c.constructor.name === 'TransactWriteCommand');
+    expect(txCallIndex).toBeGreaterThanOrEqual(0);
+    const txItems = dynamoCalls()[txCallIndex].input.TransactItems;
+    expect(txItems).toContainEqual({
+      Delete: {
+        TableName: 'CanPlan-test',
+        Key: { PK: 'USER#target', SK: '#PROFILE' },
+        ConditionExpression: 'attribute_not_exists(PK) OR organizationId = :org',
+        ExpressionAttributeValues: { ':org': 'org-9' },
+      },
+    });
+    expect(txItems).toContainEqual({
+      Delete: {
+        TableName: 'CanPlan-test',
+        Key: { PK: 'ORG#org-9', SK: 'MEMBER#target' },
+      },
+    });
+
+    const calls = mockBatchDelete.mock.calls.map((c) => c[0] as Array<{ PK: string; SK: string }>);
+    // The remaining USER# partition batch excludes #PROFILE; the profile was handled atomically
+    // with the org membership row above.
+    const partitionIdx = calls.findIndex((keys) => keys.some((k) => k.PK === 'USER#target'));
+    expect(calls[partitionIdx]).toEqual([{ PK: 'USER#target', SK: 'CATEGORY#c1' }]);
+    expect(mockBatchDelete.mock.invocationCallOrder[partitionIdx]).toBeGreaterThan(
+      mockSend.mock.invocationCallOrder[txCallIndex],
+    );
   });
 });
 

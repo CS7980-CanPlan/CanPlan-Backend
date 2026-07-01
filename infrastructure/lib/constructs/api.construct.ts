@@ -96,7 +96,6 @@ export class Api extends Construct {
       { typeName: 'Mutation', fieldName: 'selectPrimaryUser' },
       { typeName: 'Mutation', fieldName: 'unselectPrimaryUser' },
       { typeName: 'Query', fieldName: 'getUserProfile' },
-      { typeName: 'Query', fieldName: 'listUsersByOrganization' },
       { typeName: 'Query', fieldName: 'listMyOrganizationUsers' },
       { typeName: 'Query', fieldName: 'listPrimaryUsersBySupporter' },
       { typeName: 'Query', fieldName: 'listMySupportList' },
@@ -162,12 +161,16 @@ export class Api extends Construct {
       { typeName: 'Query', fieldName: 'listAllUsers' },
       { typeName: 'Query', fieldName: 'listAllTasks' },
       { typeName: 'Query', fieldName: 'adminGetUserData' },
+      { typeName: 'Query', fieldName: 'listAllOrganizations' },
       { typeName: 'Mutation', fieldName: 'inviteSupportPerson' },
       { typeName: 'Mutation', fieldName: 'inviteOrganizationAdmin' },
       { typeName: 'Mutation', fieldName: 'setUserBaseRole' },
       { typeName: 'Mutation', fieldName: 'setSystemAdmin' },
       { typeName: 'Mutation', fieldName: 'adminDeleteTask' },
       { typeName: 'Mutation', fieldName: 'adminDeleteUser' },
+      { typeName: 'Mutation', fieldName: 'adminCreateOrganization' },
+      { typeName: 'Mutation', fieldName: 'adminUpdateOrganization' },
+      { typeName: 'Mutation', fieldName: 'adminDeleteOrganization' },
     ]);
 
     // healthCheck query — returns a static string, no data source needed

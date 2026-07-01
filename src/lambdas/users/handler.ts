@@ -6,6 +6,13 @@ import { getOwnedCategory } from '../../shared/category';
 import { loadProfile } from '../../shared/delegation';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import {
+  assertUsableOrganization,
+  isTransactConditionCheckFailure,
+  organizationConditionCheck,
+  organizationMemberDelete,
+  organizationMemberPut,
+} from '../../shared/organization';
+import {
   categorySk,
   DEFAULT_CATEGORY_COLOR,
   DEFAULT_CATEGORY_NAME,
@@ -53,8 +60,6 @@ export const handler = async (
       return updateMyUserProfile(identity, args.input as UpdateMyUserProfileInput);
     case 'getUserProfile':
       return getUserProfile(args.userId as string);
-    case 'listUsersByOrganization':
-      return listUsersByOrganization(identity, args.organizationId as string, pageArgs(args));
     case 'listMyOrganizationUsers':
       return listMyOrganizationUsers(identity, pageArgs(args));
     case 'createSupportLink':
@@ -102,11 +107,15 @@ async function createMyUserProfile(
   const displayName = input?.displayName?.trim();
   if (!displayName) throw new ValidationError('displayName is required and cannot be empty');
 
+  // organizationId references a real Organization now: omitted ⇒ none; a non-empty value must
+  // name an existing, non-deleting org (validated before any profile work); blank ⇒ rejected.
+  const organizationId = await resolveCreateOrganization(input?.organizationId);
+
   const editable = {
     role,
     displayName,
     email,
-    organizationId: input?.organizationId?.trim(),
+    organizationId,
     accessibilitySettings: input?.accessibilitySettings,
   };
 
@@ -116,10 +125,14 @@ async function createMyUserProfile(
   // (carrying the existing task counters forward so a re-create never resets them).
   if (existing?.defaultCategoryId) {
     await assertValidDefaultCategory(userId, existing.defaultCategoryId);
-    return putProfile(userId, editable, existing.defaultCategoryId, existing.createdAt, {
-      taskCount: existing.taskCount,
-      nextTaskOrder: existing.nextTaskOrder,
-    });
+    return putProfile(
+      userId,
+      editable,
+      existing.defaultCategoryId,
+      existing.createdAt,
+      { taskCount: existing.taskCount, nextTaskOrder: existing.nextTaskOrder },
+      existing.organizationId,
+    );
   }
 
   // No valid default yet → create the default category alongside the profile, atomically.
@@ -174,39 +187,72 @@ async function createMyUserProfile(
     updatedAt: now,
   };
 
+  const transactItems: Array<Record<string, unknown>> = [
+    profileWrite,
+    {
+      Put: {
+        TableName: TABLE_NAME,
+        Item: {
+          PK: userPk(userId),
+          SK: categorySk(defaultCategoryId),
+          entityType: ENTITY.CATEGORY,
+          ...defaultCategory,
+        },
+        ConditionExpression: 'attribute_not_exists(PK)',
+      },
+    },
+  ];
+  // When joining an org, atomically re-verify it still exists and isn't deleting — closing the
+  // race where adminDeleteOrganization removes it between the pre-read and this write — and write
+  // the strongly-consistent OrganizationMember row in the SAME transaction so the org partition
+  // always reflects this new member.
+  const orgCheckIndex = organizationId ? transactItems.length : -1;
+  if (organizationId) {
+    transactItems.push(organizationConditionCheck(organizationId));
+    transactItems.push(organizationMemberPut(organizationId, userId));
+  }
+  // A legacy profile that was in a DIFFERENT org (or is being cleared here) must drop its stale
+  // membership row in the same transaction. Unconditional delete → harmless no-op if none exists.
+  const previousOrg = existing?.organizationId?.trim() || undefined;
+  if (previousOrg && previousOrg !== organizationId) {
+    transactItems.push(organizationMemberDelete(previousOrg, userId));
+  }
+
   try {
-    await dynamo.send(
-      new TransactWriteCommand({
-        TransactItems: [
-          profileWrite,
-          {
-            Put: {
-              TableName: TABLE_NAME,
-              Item: {
-                PK: userPk(userId),
-                SK: categorySk(defaultCategoryId),
-                entityType: ENTITY.CATEGORY,
-                ...defaultCategory,
-              },
-              ConditionExpression: 'attribute_not_exists(PK)',
-            },
-          },
-        ],
-      }),
-    );
+    await dynamo.send(new TransactWriteCommand({ TransactItems: transactItems }));
     return profile;
   } catch (err) {
+    // The org was deleted/began deleting between the pre-read and the write.
+    if (organizationId && isTransactConditionCheckFailure(err, orgCheckIndex)) {
+      throw organizationUnavailableError(organizationId);
+    }
     // A concurrent first call already created the profile + default (or set the default on
     // a legacy row). Reread and reuse it rather than minting a second default category.
     if ((err as { name?: string }).name !== 'TransactionCanceledException') throw err;
     const reread = await getProfile(userId);
     if (!reread?.defaultCategoryId) throw err;
     await assertValidDefaultCategory(userId, reread.defaultCategoryId);
-    return putProfile(userId, editable, reread.defaultCategoryId, reread.createdAt, {
-      taskCount: reread.taskCount,
-      nextTaskOrder: reread.nextTaskOrder,
-    });
+    return putProfile(
+      userId,
+      editable,
+      reread.defaultCategoryId,
+      reread.createdAt,
+      { taskCount: reread.taskCount, nextTaskOrder: reread.nextTaskOrder },
+      reread.organizationId,
+    );
   }
+}
+
+/**
+ * The organization named by a membership write vanished or began deleting between the pre-read
+ * (assertUsableOrganization) and the atomic ConditionCheck — a clear, client-handleable error
+ * rather than a raw TransactionCanceledException surfacing as an internal failure.
+ */
+function organizationUnavailableError(organizationId: string): ValidationError {
+  return new ValidationError(
+    `organization ${organizationId} is no longer available (it was deleted or is being deleted) ` +
+      'and cannot be joined',
+  );
 }
 
 /** Read the caller's profile row (undefined if it doesn't exist). */
@@ -215,6 +261,19 @@ async function getProfile(userId: string): Promise<UserProfile | undefined> {
     new GetCommand({ TableName: TABLE_NAME, Key: { PK: userPk(userId), SK: PROFILE_SK } }),
   );
   return result.Item as UserProfile | undefined;
+}
+
+/**
+ * Validate a create-time organizationId reference. Omitted (undefined) ⇒ the profile joins no
+ * org; a blank string ⇒ ValidationError; otherwise the id must name an existing, non-deleting
+ * Organization (else NotFound/Validation from assertUsableOrganization). Returns the trimmed id.
+ */
+async function resolveCreateOrganization(raw: string | undefined): Promise<string | undefined> {
+  if (raw === undefined) return undefined;
+  const organizationId = raw.trim();
+  if (!organizationId) throw new ValidationError('organizationId cannot be empty');
+  await assertUsableOrganization(organizationId);
+  return organizationId;
 }
 
 /** The profile's editable, server-derived fields (everything except id/keys/default/timestamps). */
@@ -240,6 +299,12 @@ function buildProfile(
 /**
  * Overwrite the editable profile fields, preserving the existing default + createdAt + task
  * counters (a full Put replaces the item, so the counters must be re-supplied or they'd drop).
+ *
+ * `previousOrg` is the org the profile belonged to BEFORE this write (undefined if none). Because a
+ * full Put also rewrites organizationId, membership rows must be kept in step: setting an org writes
+ * its OrganizationMember row (guarded by an org existence/not-deleting ConditionCheck), and any
+ * change that MOVES to a different org or CLEARS it deletes the previous org's membership row — all
+ * atomically with the profile Put.
  */
 async function putProfile(
   userId: string,
@@ -247,6 +312,7 @@ async function putProfile(
   defaultCategoryId: string,
   createdAt: string,
   counters: TaskCounters,
+  previousOrg?: string,
 ): Promise<UserProfile> {
   const profile = buildProfile(
     userId,
@@ -256,12 +322,46 @@ async function putProfile(
     new Date().toISOString(),
     counters,
   );
-  await dynamo.send(
-    new PutCommand({
-      TableName: TABLE_NAME,
-      Item: { PK: userPk(userId), SK: PROFILE_SK, entityType: ENTITY.USER_PROFILE, ...profile },
-    }),
-  );
+  const item = { PK: userPk(userId), SK: PROFILE_SK, entityType: ENTITY.USER_PROFILE, ...profile };
+  const newOrg = editable.organizationId;
+  const prevOrg = previousOrg?.trim() || undefined;
+
+  // Setting organizationId? The Put must be atomic with an org existence/not-deleting check so a
+  // profile rewrite can't join an org that adminDeleteOrganization is concurrently removing, and it
+  // must write the OrganizationMember row (and drop the old org's row when moving) in one transaction.
+  if (newOrg) {
+    const transactItems: Array<Record<string, unknown>> = [
+      { Put: { TableName: TABLE_NAME, Item: item } },
+      organizationConditionCheck(newOrg),
+      organizationMemberPut(newOrg, userId),
+    ];
+    if (prevOrg && prevOrg !== newOrg) {
+      transactItems.push(organizationMemberDelete(prevOrg, userId));
+    }
+    try {
+      await dynamo.send(new TransactWriteCommand({ TransactItems: transactItems }));
+    } catch (err) {
+      if (isTransactConditionCheckFailure(err, 1)) throw organizationUnavailableError(newOrg);
+      throw err;
+    }
+    return profile;
+  }
+
+  // Not setting an org, but the profile previously had one: the full Put clears organizationId, so
+  // delete the now-stale membership row in the same transaction (no org check needed to clear).
+  if (prevOrg) {
+    await dynamo.send(
+      new TransactWriteCommand({
+        TransactItems: [
+          { Put: { TableName: TABLE_NAME, Item: item } },
+          organizationMemberDelete(prevOrg, userId),
+        ],
+      }),
+    );
+    return profile;
+  }
+
+  await dynamo.send(new PutCommand({ TableName: TABLE_NAME, Item: item }));
   return profile;
 }
 
@@ -347,9 +447,12 @@ async function updateMyUserProfile(
     }
   }
 
+  // The org id being SET (a non-null string), if any — drives the atomic org ConditionCheck.
+  let orgToSet: string | undefined;
   if (orgKeyPresent) {
-    // MVP self-service org membership: explicit null clears it; a non-empty string sets it
-    // (a blank/whitespace string is rejected — use null to clear). role/email/etc. stay locked.
+    // Self-service org membership: explicit null clears it; a non-empty string sets it but must
+    // name an existing, non-deleting Organization (validated here — no longer free-form). A
+    // blank/whitespace string is rejected (use null to clear). role/email/etc. stay locked.
     if (input.organizationId === null) {
       removeParts.push('organizationId');
     } else {
@@ -357,6 +460,8 @@ async function updateMyUserProfile(
       if (!organizationId) {
         throw new ValidationError('organizationId cannot be empty; use null to clear it');
       }
+      await assertUsableOrganization(organizationId);
+      orgToSet = organizationId;
       setParts.push('organizationId = :organizationId');
       values[':organizationId'] = organizationId;
     }
@@ -365,18 +470,45 @@ async function updateMyUserProfile(
   let updateExpression = `SET ${setParts.join(', ')}`;
   if (removeParts.length) updateExpression += ` REMOVE ${removeParts.join(', ')}`;
 
+  const profileUpdate: ProfileUpdate = {
+    TableName: TABLE_NAME,
+    Key: { PK: userPk(userId), SK: PROFILE_SK },
+    UpdateExpression: updateExpression,
+    // Never create a profile row — the update only applies to an existing one.
+    ConditionExpression: 'attribute_exists(PK)',
+    ExpressionAttributeValues: values,
+  };
+
+  // Any change to organizationId must keep the strongly-consistent OrganizationMember rows (under
+  // the org partition) in lockstep with UserProfile.organizationId. To drop the row for the org
+  // the caller is LEAVING we need their PREVIOUS org id, so read the profile first. (A missing
+  // profile is NotFound — the same result the update's attribute_exists(PK) guard would give.)
+  if (orgKeyPresent) {
+    const current = await getProfile(userId);
+    if (!current) throw new NotFoundError(`profile for user ${userId} not found`);
+    const previousOrg = current.organizationId?.trim() || undefined;
+    return orgToSet
+      ? setProfileOrganization(userId, profileUpdate, orgToSet, previousOrg)
+      : clearProfileOrganization(userId, profileUpdate, previousOrg);
+  }
+
+  // No organizationId change (only displayName/accessibilitySettings): one conditional update.
+  return runProfileUpdate(userId, profileUpdate);
+}
+
+/** The conditional profile UpdateCommand shape shared by the update paths below. */
+interface ProfileUpdate {
+  TableName: string;
+  Key: Record<string, string>;
+  UpdateExpression: string;
+  ConditionExpression: string;
+  ExpressionAttributeValues: Record<string, unknown>;
+}
+
+/** Run the profile update as a single conditional UpdateCommand, returning the stored row (ALL_NEW). */
+async function runProfileUpdate(userId: string, profileUpdate: ProfileUpdate): Promise<UserProfile> {
   try {
-    const result = await dynamo.send(
-      new UpdateCommand({
-        TableName: TABLE_NAME,
-        Key: { PK: userPk(userId), SK: PROFILE_SK },
-        UpdateExpression: updateExpression,
-        // Never create a profile row — the update only applies to an existing one.
-        ConditionExpression: 'attribute_exists(PK)',
-        ExpressionAttributeValues: values,
-        ReturnValues: 'ALL_NEW',
-      }),
-    );
+    const result = await dynamo.send(new UpdateCommand({ ...profileUpdate, ReturnValues: 'ALL_NEW' }));
     return stripProfile(result.Attributes as Record<string, unknown>);
   } catch (err) {
     if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
@@ -386,33 +518,81 @@ async function updateMyUserProfile(
   }
 }
 
+/** Read the profile back after a TransactWrite (which returns no attributes) and strip it. */
+async function readBackProfile(userId: string): Promise<UserProfile> {
+  const updated = await getProfile(userId);
+  if (!updated) throw new NotFoundError(`profile for user ${userId} not found`);
+  return stripProfile(updated as unknown as Record<string, unknown>);
+}
+
+/**
+ * SET the caller's organizationId in ONE transaction: the profile update + an org
+ * existence/not-deleting ConditionCheck (so a concurrent adminDeleteOrganization can't slip a
+ * membership onto a deleting/deleted org) + a Put of the new OrganizationMember row, and — when
+ * MOVING from a different org — a Delete of the old membership row. TransactWrite returns no
+ * attributes, so read the updated profile back.
+ */
+async function setProfileOrganization(
+  userId: string,
+  profileUpdate: ProfileUpdate,
+  orgToSet: string,
+  previousOrg: string | undefined,
+): Promise<UserProfile> {
+  const transactItems: Array<Record<string, unknown>> = [
+    { Update: profileUpdate },
+    organizationConditionCheck(orgToSet),
+    organizationMemberPut(orgToSet, userId),
+  ];
+  if (previousOrg && previousOrg !== orgToSet) {
+    transactItems.push(organizationMemberDelete(previousOrg, userId));
+  }
+  try {
+    await dynamo.send(new TransactWriteCommand({ TransactItems: transactItems }));
+  } catch (err) {
+    // The org ConditionCheck is transact-item index 1.
+    if (isTransactConditionCheckFailure(err, 1)) throw organizationUnavailableError(orgToSet);
+    // The only other conditional item is the profile Update's attribute_exists(PK).
+    if ((err as { name?: string }).name === 'TransactionCanceledException') {
+      throw new NotFoundError(`profile for user ${userId} not found`);
+    }
+    throw err;
+  }
+  return readBackProfile(userId);
+}
+
+/**
+ * CLEAR the caller's organizationId. When they currently belong to an org, REMOVE the attribute
+ * AND delete that OrganizationMember row in ONE transaction (then read back). With no current org
+ * there is no membership row to drop, so a single conditional update suffices. Idempotent.
+ */
+async function clearProfileOrganization(
+  userId: string,
+  profileUpdate: ProfileUpdate,
+  previousOrg: string | undefined,
+): Promise<UserProfile> {
+  if (!previousOrg) return runProfileUpdate(userId, profileUpdate);
+  try {
+    await dynamo.send(
+      new TransactWriteCommand({
+        TransactItems: [{ Update: profileUpdate }, organizationMemberDelete(previousOrg, userId)],
+      }),
+    );
+  } catch (err) {
+    // The only conditional item is the profile Update's attribute_exists(PK).
+    if ((err as { name?: string }).name === 'TransactionCanceledException') {
+      throw new NotFoundError(`profile for user ${userId} not found`);
+    }
+    throw err;
+  }
+  return readBackProfile(userId);
+}
+
 async function getUserProfile(userId: string): Promise<UserProfile | null> {
   if (!userId?.trim()) throw new ValidationError('userId is required');
   const result = await dynamo.send(
     new GetCommand({ TableName: TABLE_NAME, Key: { PK: userPk(userId), SK: PROFILE_SK } }),
   );
   return (result.Item as UserProfile) ?? null;
-}
-
-/**
- * listUsersByOrganization — DEPRECATED, now strictly SELF-SCOPED. Prefer listMyOrganizationUsers.
- * The org argument is no longer trusted to enumerate an arbitrary roster: the caller may only
- * list THEIR OWN current organization. The supplied organizationId must equal the caller's
- * current org (else NOT_AUTHORIZED); a caller with no org gets a VALIDATION error. Returns the
- * lightweight orgIndex projection (userId, displayName, role).
- */
-async function listUsersByOrganization(
-  identity: AppSyncIdentity | undefined,
-  organizationId: string,
-  page: PageArgs,
-): Promise<Connection<UserProfile>> {
-  const requested = organizationId?.trim();
-  if (!requested) throw new ValidationError('organizationId is required');
-  const callerOrg = await requireCallerOrganization(identity);
-  if (requested !== callerOrg) {
-    throw new UnauthorizedError('Unauthorized: you can only list your own organization');
-  }
-  return queryOrgRoster(callerOrg, page);
 }
 
 /**
@@ -450,7 +630,11 @@ function queryOrgRoster(organizationId: string, page: PageArgs): Promise<Connect
       TableName: TABLE_NAME,
       IndexName: ORG_INDEX,
       KeyConditionExpression: 'organizationId = :org',
-      ExpressionAttributeValues: { ':org': organizationId },
+      // OrganizationMember rows also carry organizationId + userId, so they co-tenant this GSI.
+      // Their SK is MEMBER#<userId>, not #PROFILE — restrict the roster to real UserProfile rows.
+      // (PK/SK are the base-table key, always present in a GSI result regardless of projection.)
+      FilterExpression: 'SK = :profileSk',
+      ExpressionAttributeValues: { ':org': organizationId, ':profileSk': PROFILE_SK },
     },
     page,
   );

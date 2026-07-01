@@ -76,13 +76,16 @@ type UserProfile {
   role: UserRole!
   displayName: String
   email: String
+  # The id of an existing Organization this user belongs to (or null if none). No longer
+  # free-form: setting it via createUserProfile/updateMyUserProfile validates the org exists
+  # and is not being deleted. SystemAdmin manages organizations (see listAllOrganizations).
   organizationId: ID
   accessibilitySettings: AWSJSON
   # Id of this user's mandatory default Category (a real Category row with isDefault:true),
   # created atomically with the profile. Tasks created without an explicit category fall
   # into it. Server-managed; never client-supplied.
   defaultCategoryId: ID
-  # Nullable: the orgIndex roster projection (listUsersByOrganization) omits it.
+  # Nullable: the orgIndex roster projection (listMyOrganizationUsers) omits it.
   createdAt: String
   updatedAt: String
 }
@@ -96,6 +99,16 @@ type SupportLink {
   permissions: AWSJSON
   createdAt: String!
   updatedAt: String
+}
+
+# An organization a UserProfile.organizationId references. Created/managed only by SystemAdmin
+# admin APIs; a user joins one by setting organizationId to an existing org's id (validated
+# server-side). The internal `deleting` marker is never exposed here.
+type Organization {
+  organizationId: ID!
+  name: String!
+  createdAt: String!
+  updatedAt: String!
 }
 
 # A user-owned grouping for tasks (folder-like). PRIVATE to its owner: every category
@@ -731,6 +744,28 @@ input AdminDeleteUserInput {
   disableFirst: Boolean = true
 }
 
+# ─── Admin organization inputs (SystemAdmin-only) ─────────────────────────────--
+
+input CreateOrganizationInput {
+  name: String!
+}
+
+input UpdateOrganizationInput {
+  organizationId: ID!
+  name: String!
+}
+
+input DeleteOrganizationInput {
+  organizationId: ID!
+}
+
+# Result of adminDeleteOrganization: the removed organization plus how many member
+# UserProfiles had their organizationId reference cleared.
+type AdminDeleteOrganizationResult {
+  organization: Organization!
+  removedUsers: Int!
+}
+
 # AI step generation
 input QueryContext {
   role: String
@@ -750,6 +785,11 @@ input GenerateTaskStepsInput {
 
 type UserProfileConnection {
   items: [UserProfile!]!
+  nextToken: String
+}
+
+type OrganizationConnection {
+  items: [Organization!]!
   nextToken: String
 }
 
@@ -819,10 +859,6 @@ type Query {
   healthCheck: String! @aws_api_key @aws_cognito_user_pools
 
   getUserProfile(userId: ID!): UserProfile
-  # DEPRECATED — prefer listMyOrganizationUsers. Now strictly self-scoped: organizationId must
-  # equal the caller's OWN current organization (else NOT_AUTHORIZED); a caller with no
-  # organization gets VALIDATION. A caller can no longer enumerate an arbitrary org roster.
-  listUsersByOrganization(organizationId: ID!, limit: Int, nextToken: String): UserProfileConnection!
   # DEPRECATED — prefer listMySupportList. Now strictly self-scoped: the caller's sub must
   # equal supporterId (a caller can only list their own support list), else NOT_AUTHORIZED.
   listPrimaryUsersBySupporter(supporterId: ID!, limit: Int, nextToken: String): SupportLinkConnection!
@@ -885,6 +921,9 @@ type Query {
   # Full read-only snapshot of one user's data (profile, tasks, categories, assignments,
   # support links) for the admin user-detail view. PK queries + GSIs only (no Scan).
   adminGetUserData(userId: ID!): AdminUserData!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Every Organization, newest-first (entityTypeIndex; no Scan), paginated.
+  listAllOrganizations(limit: Int, nextToken: String): OrganizationConnection!
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 }
 
@@ -1019,6 +1058,21 @@ type Mutation {
   # Fully delete a user: owned tasks, their USER# partition rows, SupportLinks (both sides),
   # and the Cognito login (last). Deleting yourself is rejected.
   adminDeleteUser(input: AdminDeleteUserInput!): AdminDeleteUserResult!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+
+  # ─── Admin organization management (SystemAdmin-only) ────────────────────────
+  # Create an Organization. name is required (trimmed, non-empty); organizationId is generated.
+  adminCreateOrganization(input: CreateOrganizationInput!): Organization!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Rename an Organization. NotFound if it doesn't exist; rejected while it is being deleted.
+  adminUpdateOrganization(input: UpdateOrganizationInput!): Organization!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Delete an Organization: mark it deleting, then detach every member found via the
+  # strongly-consistent OrganizationMember rows under the org partition (ConsistentRead query,
+  # paginated — no Scan; NOT the eventually-consistent orgIndex), clearing each member's
+  # organizationId and deleting the membership row together, then delete the org row last.
+  # Idempotent/retryable.
+  adminDeleteOrganization(input: DeleteOrganizationInput!): AdminDeleteOrganizationResult!
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 }
 
