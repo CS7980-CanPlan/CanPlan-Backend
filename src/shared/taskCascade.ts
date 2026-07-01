@@ -13,8 +13,10 @@
 // go first; journal rows drive idempotent S3 deletion; the journal and #META are removed
 // only after every binary delete succeeds. Thus an interruption keeps the Task + journal
 // retryable even if some MediaAsset metadata was already removed. Children are read with
-// full Query pagination (any count). Historical Assignments/AssignmentSteps snapshotted
-// from this task (under USER#<userId> partitions) are intentionally NEVER deleted here.
+// full Query pagination (any count). TaskAssignments/TaskInstances/TaskInstanceSteps
+// (under USER#<userId> partitions) are intentionally NEVER deleted here. (Callers reject a
+// deleteTask while an active TaskAssignment still references the task — see the tasks/admin
+// handlers — so the cascade itself stays a pure children-of-the-task delete.)
 
 import { DeleteCommand, GetCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { batchDelete, batchPut, type ItemKey, queryAllItems, queryAllKeys } from './batch';

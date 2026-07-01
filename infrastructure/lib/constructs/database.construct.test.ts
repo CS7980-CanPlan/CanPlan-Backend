@@ -64,6 +64,21 @@ describe('Database construct — DynamoDB single table', () => {
     });
   });
 
+  it('defines the activeTaskAssignmentTaskIndex GSI with activeTaskAssignmentTaskId (HASH) + createdAt (RANGE), KEYS_ONLY', () => {
+    synth().hasResourceProperties('AWS::DynamoDB::Table', {
+      GlobalSecondaryIndexes: Match.arrayWith([
+        Match.objectLike({
+          IndexName: 'activeTaskAssignmentTaskIndex',
+          KeySchema: [
+            { AttributeName: 'activeTaskAssignmentTaskId', KeyType: 'HASH' },
+            { AttributeName: 'createdAt', KeyType: 'RANGE' },
+          ],
+          Projection: { ProjectionType: 'KEYS_ONLY' },
+        }),
+      ]),
+    });
+  });
+
   it('still defines the original GSIs alongside taskCategoryIndex', () => {
     const template = synth();
     const table = Object.values(template.findResources('AWS::DynamoDB::Table'))[0];

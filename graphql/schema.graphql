@@ -19,29 +19,28 @@ enum SupportLinkStatus {
   REVOKED
 }
 
-# Assignment lifecycle. Only TO_DO, COMPLETED, and SKIPPED are ever persisted.
-# OVERDUE is a derived, read-only status: returned when a TO_DO assignment has a
-# dueDate in the past. Clients must never send OVERDUE to a mutation.
-enum AssignmentStatus {
-  TO_DO
-  OVERDUE
-  COMPLETED
-  SKIPPED
-}
-
 enum MediaType {
   IMAGE
   AUDIO
   VIDEO
 }
 
-# Unit a task schedule repeats on (repeatEvery × repeatUnit, e.g. every 2 WEEKs).
-enum RepeatUnit {
-  MINUTE
-  HOUR
-  DAY
-  WEEK
-  MONTH
+# How a TaskAssignment recurs: a single occurrence, or a recurrence rule.
+enum TaskAssignmentScheduleType {
+  ONE_TIME
+  RECURRING
+}
+
+# A TaskInstance's lifecycle. TO_DO, IN_PROGRESS, COMPLETED, SKIPPED, and CANCELLED are
+# persisted; OVERDUE is a derived, read-only status (a non-terminal occurrence whose
+# scheduledFor is in the past). Clients must never send OVERDUE to a mutation.
+enum TaskInstanceStatus {
+  TO_DO
+  IN_PROGRESS
+  OVERDUE
+  COMPLETED
+  SKIPPED
+  CANCELLED
 }
 
 # The mutually-exclusive base business role a SystemAdmin assigns. Values mirror UserRole;
@@ -117,16 +116,8 @@ type Category {
   updatedAt: String!
 }
 
-# Recurring-schedule metadata stored on a Task. Phase 1 persists this only — reminder
-# delivery (EventBridge / push) is not implemented yet.
-type TaskSchedule {
-  repeatEvery: Int!
-  repeatUnit: RepeatUnit!
-  firstOccurrenceAt: String!
-  timezone: String!
-  enabled: Boolean
-}
-
+# A reusable task template. It carries NO scheduling data — scheduling lives on
+# TaskAssignment, and per-occurrence status/completion on TaskInstance / TaskInstanceStep.
 type Task {
   taskId: ID!
   ownerId: ID!
@@ -139,13 +130,6 @@ type Task {
   # whole set with updateTaskOrder. Null only on un-migrated legacy rows.
   order: Int
   description: String
-  scheduleRule: String
-  # Recurring-schedule metadata; null unless the task was created with a schedule.
-  schedule: TaskSchedule
-  # First/next fire time — equals schedule.firstOccurrenceAt at creation.
-  nextOccurrenceAt: String
-  # Whether reminders are enabled; defaults to true when a schedule is provided.
-  notificationEnabled: Boolean
   # Optional single cover image — the id of an IMAGE MediaAsset under this task. Null
   # when the task has no cover. Fetch a viewable URL via getMediaDownloadUrl(taskId,
   # coverImageAssetId); no cover URL is exposed directly on the Task.
@@ -170,27 +154,61 @@ type TaskStep {
   updatedAt: String
 }
 
-type Assignment {
+# The schedule rule binding a Task template to a user. Carries NO status or step completion
+# (those live on TaskInstance / TaskInstanceStep). ONE_TIME uses scheduledFor + timezone;
+# RECURRING uses scheduleRule (an RRULE) + startDate + startTime + timezone (+ optional endDate).
+type TaskAssignment {
   assignmentId: ID!
   taskId: ID!
   userId: ID!
   assignedBy: ID
-  dueDate: String
-  recurrence: String
+  scheduleType: TaskAssignmentScheduleType!
+  # ONE_TIME: the single occurrence's ISO datetime.
+  scheduledFor: String
+  # RECURRING: an RRULE string (e.g. "FREQ=DAILY;INTERVAL=1"). FREQ is required and must be
+  # DAILY, WEEKLY, MONTHLY, or YEARLY.
   scheduleRule: String
-  # Derived OVERDUE when persisted TO_DO + dueDate in the past; otherwise the persisted value.
-  status: AssignmentStatus!
+  # RECURRING: inclusive first/last calendar dates (YYYY-MM-DD); endDate null ⇒ open-ended.
+  startDate: String
+  endDate: String
+  # RECURRING: wall-clock time of day each occurrence fires (HH:mm).
+  startTime: String
+  # IANA timezone the schedule is interpreted in.
+  timezone: String!
+  # False once the assignment is ended/soft-deleted; only active rows expand to occurrences.
+  active: Boolean!
+  endedAt: String
   assignedAt: String!
   createdAt: String!
   updatedAt: String
 }
 
-# A snapshot of one TaskStep captured into one Assignment at creation. Immutable to
-# later template edits, so historical assignments keep the step content as assigned.
-# NOTE: carries text/completion only — NOT media. A live Task MediaAsset may be deleted
-# with its TaskStep, so it is never copied here as an assignment-media snapshot. (If
-# assignment-visible media is needed later, it must be a separate, assignment-owned copy.)
-type AssignmentStep {
+# One concrete occurrence of a scheduled assignment — created lazily when a user acts on it.
+# Stores status + lifecycle timestamps. instanceId = <assignmentId>#<scheduledDate>#<scheduledTime>.
+type TaskInstance {
+  instanceId: ID!
+  assignmentId: ID!
+  taskId: ID!
+  userId: ID!
+  scheduledDate: String!
+  scheduledTime: String!
+  scheduledFor: String!
+  timezone: String!
+  status: TaskInstanceStatus!
+  startedAt: String
+  completedAt: String
+  skippedAt: String
+  cancelledAt: String
+  # True when the instance diverges from the plain schedule (e.g. a cancelled occurrence).
+  isException: Boolean
+  createdAt: String!
+  updatedAt: String
+}
+
+# An immutable snapshot of one TaskStep captured into one TaskInstance when it is started.
+# Per-occurrence completion lives here. Carries text/completion only — NOT media.
+type TaskInstanceStep {
+  instanceId: ID!
   assignmentId: ID!
   taskId: ID!
   stepId: ID!
@@ -200,6 +218,24 @@ type AssignmentStep {
   completedAt: String
   createdAt: String!
   updatedAt: String!
+}
+
+# A calendar cell for getTaskInstanceViews: a real TaskInstance overlaid on its scheduled
+# slot, or a VIRTUAL occurrence that has no real instance yet (isVirtual:true, instanceId:null).
+type TaskInstanceView {
+  # Null for a virtual occurrence (no real instance exists yet).
+  instanceId: ID
+  assignmentId: ID!
+  taskId: ID!
+  userId: ID!
+  title: String!
+  scheduledDate: String!
+  scheduledTime: String!
+  scheduledFor: String!
+  timezone: String!
+  status: TaskInstanceStatus!
+  isVirtual: Boolean!
+  isException: Boolean!
 }
 
 type MediaAsset {
@@ -261,14 +297,14 @@ type AdminDeleteUserResult {
   deletedCognitoUser: Boolean!
 }
 
-# Full read-only snapshot of everything one user owns (SystemAdmin user-detail view):
-# their profile, owned tasks, categories, assignments, and support links (either direction).
+# Full read-only snapshot of everything one user owns (SystemAdmin user-detail view): their
+# profile, owned tasks, categories, task assignments, and support links (either direction).
 type AdminUserData {
   userId: ID!
   profile: UserProfile
   tasks: [Task!]!
   categories: [Category!]!
-  assignments: [Assignment!]!
+  taskAssignments: [TaskAssignment!]!
   supportLinks: [SupportLink!]!
 }
 
@@ -370,28 +406,15 @@ input DeleteCategoryInput {
   categoryId: ID!
 }
 
-# Schedule metadata accepted at task creation. `enabled` defaults to true when stored.
-input TaskScheduleInput {
-  repeatEvery: Int!
-  repeatUnit: RepeatUnit!
-  firstOccurrenceAt: String!
-  timezone: String!
-  enabled: Boolean
-}
-
-# The owner is derived from the Cognito identity — there is no ownerId.
+# The owner is derived from the Cognito identity — there is no ownerId. A Task is a reusable
+# template only: it carries no schedule (scheduling lives on TaskAssignment).
 input CreateTaskInput {
   title: String!
   # Optional. Omitted/null ⇒ the owner's default category. A blank string is rejected; a
   # supplied id must be a real, owned, non-deleting Category.
   categoryId: ID
   description: String
-  scheduleRule: String
   steps: [CreateTaskStepNestedInput!]
-  # Optional recurring schedule (stored only in phase 1; no delivery yet).
-  schedule: TaskScheduleInput
-  # Optional; defaults to true when a schedule is provided, otherwise left unset.
-  notificationEnabled: Boolean
   # Optional cover image: the pending s3Key from createTaskCoverImageUploadUrl (after
   # the client PUT the bytes). Omitted ⇒ the task has no cover image.
   coverImageS3Key: String
@@ -420,9 +443,6 @@ input UpdateTaskInput {
   # non-deleting Category belonging to the task's owner.
   categoryId: ID
   description: String
-  scheduleRule: String
-  schedule: TaskScheduleInput
-  notificationEnabled: Boolean
   # Optional new cover image: the pending s3Key from createTaskCoverImageUploadUrl.
   # Supplied ⇒ replace the cover (old asset/binary cleaned up after the new one is
   # registered); omitted ⇒ leave the current cover image unchanged.
@@ -507,33 +527,68 @@ input DeleteTaskStepInput {
   stepId: ID!
 }
 
-# createAssignment always persists status TO_DO; status is not client-supplied.
-input CreateAssignmentInput {
+# Create a TaskAssignment (schedule rule). Validates the source Task exists but creates NO
+# TaskInstance rows. ONE_TIME requires scheduledFor + timezone; RECURRING requires
+# scheduleRule + startDate + startTime + timezone (endDate optional). The RRULE's FREQ must be
+# DAILY/WEEKLY/MONTHLY/YEARLY — a missing FREQ or HOURLY/MINUTELY/SECONDLY is rejected.
+input CreateTaskAssignmentInput {
   taskId: ID!
   userId: ID!
   assignedBy: ID
-  dueDate: String
-  recurrence: String
+  scheduleType: TaskAssignmentScheduleType!
+  scheduledFor: String
   scheduleRule: String
+  startDate: String
+  endDate: String
+  startTime: String
+  timezone: String!
 }
 
-# status accepts TO_DO, COMPLETED, or SKIPPED. OVERDUE is rejected (it is derived).
-input UpdateAssignmentStatusInput {
+# Materialize one occurrence (status IN_PROGRESS) and snapshot the task's current steps.
+# Verifies (assignmentId, scheduledDate, scheduledTime) is a valid occurrence; idempotent.
+input StartTaskInstanceInput {
   userId: ID!
   assignmentId: ID!
-  status: AssignmentStatus!
+  scheduledDate: String!
+  scheduledTime: String!
 }
 
-input SetAssignmentStepCompletionInput {
+# Toggle one TaskInstanceStep's completion on an existing, non-terminal instance.
+input SetTaskInstanceStepCompletionInput {
   userId: ID!
-  assignmentId: ID!
+  instanceId: ID!
   stepId: ID!
   completed: Boolean!
 }
 
-# Identifies one Assignment for deletion by its composite key. Deleting it also
-# removes every AssignmentStep snapshot under it; the source Task is untouched.
-input DeleteAssignmentInput {
+# Set a TaskInstance's status. Accepts IN_PROGRESS, COMPLETED, SKIPPED (OVERDUE rejected —
+# derived; CANCELLED uses cancelTaskInstance). COMPLETED requires all steps completed.
+input UpdateTaskInstanceStatusInput {
+  userId: ID!
+  instanceId: ID!
+  status: TaskInstanceStatus!
+}
+
+# Cancel one occurrence — creates or updates a real TaskInstance (CANCELLED, isException:true).
+# Rejected if an instance already exists and is terminal (COMPLETED/SKIPPED/CANCELLED).
+input CancelTaskInstanceInput {
+  userId: ID!
+  assignmentId: ID!
+  scheduledDate: String!
+  scheduledTime: String!
+}
+
+# End an assignment from effectiveDate onward (RECURRING with days remaining: caps endDate to
+# the earlier of its current value and the day before effectiveDate — only ever shortening the
+# window, never extending it; otherwise fully ends it. ONE_TIME: fully ends it).
+input EndTaskAssignmentInput {
+  userId: ID!
+  assignmentId: ID!
+  effectiveDate: String!
+}
+
+# Soft-delete an assignment (active:false, endedAt set, task-deletion marker removed).
+input DeleteTaskAssignmentInput {
   userId: ID!
   assignmentId: ID!
 }
@@ -643,13 +698,20 @@ type TaskStepConnection {
   nextToken: String
 }
 
-type AssignmentConnection {
-  items: [Assignment!]!
+type TaskAssignmentConnection {
+  items: [TaskAssignment!]!
   nextToken: String
 }
 
-type AssignmentStepConnection {
-  items: [AssignmentStep!]!
+type TaskInstanceStepConnection {
+  items: [TaskInstanceStep!]!
+  nextToken: String
+}
+
+# The calendar feed: real instances overlaid on virtual occurrences for a date range. Returned
+# as a Connection for shape consistency; getTaskInstanceViews returns the full window (nextToken null).
+type TaskInstanceViewConnection {
+  items: [TaskInstanceView!]!
   nextToken: String
 }
 
@@ -679,9 +741,13 @@ type Query {
   # Tasks in one of an owner's real categories. categoryId is required.
   listTasksByCategory(ownerId: ID!, categoryId: ID!, limit: Int, nextToken: String): TaskConnection!
 
-  listAssignmentsForUser(userId: ID!, limit: Int, nextToken: String): AssignmentConnection!
-  # One assignment's step snapshots, sorted by `order`.
-  listAssignmentSteps(userId: ID!, assignmentId: ID!, limit: Int, nextToken: String): AssignmentStepConnection!
+  # A user's schedule rules (active + ended).
+  listTaskAssignmentsForUser(userId: ID!, limit: Int, nextToken: String): TaskAssignmentConnection!
+  # The calendar feed over [startDate, endDate] (both YYYY-MM-DD, max 370-day span): active
+  # assignments' virtual occurrences overlaid with any real TaskInstance rows.
+  getTaskInstanceViews(userId: ID!, startDate: String!, endDate: String!): TaskInstanceViewConnection!
+  # One instance's step snapshots, sorted by `order`.
+  listTaskInstanceSteps(userId: ID!, instanceId: ID!, limit: Int, nextToken: String): TaskInstanceStepConnection!
   getMediaDownloadUrl(taskId: ID!, assetId: ID!): MediaDownloadTarget
   listMediaForTask(taskId: ID!, limit: Int, nextToken: String): MediaAssetConnection!
 
@@ -733,7 +799,7 @@ type Mutation {
   # A step may have one IMAGE, one AUDIO, and one VIDEO asset. Errors if not found.
   updateTaskStep(input: UpdateTaskStepInput!): TaskStep
   # Delete one TaskStep and every attached media asset (metadata rows + S3 objects), if any.
-  # Historical AssignmentSteps are unaffected. Returns the deleted TaskStep.
+  # Existing TaskInstanceStep snapshots are unaffected. Returns the deleted TaskStep.
   deleteTaskStep(input: DeleteTaskStepInput!): TaskStep
   # Atomically reorder ALL of a task's steps (must supply the complete current set).
   # Returns the steps sorted by ascending order. Step ids, media, and assignments are
@@ -743,17 +809,28 @@ type Mutation {
   # positive, unique orders). Returns the tasks sorted by ascending order. The owner is taken
   # from the Cognito identity, never the input.
   updateTaskOrder(input: UpdateTaskOrderInput!): [Task!]!
-  # Delete a task template and all of its TaskSteps. Historical Assignments and
-  # AssignmentSteps snapshotted from it are NOT deleted. Returns the deleted Task.
+  # Delete a task template and all of its TaskSteps. REJECTED while any active TaskAssignment
+  # still references it (end/delete those first). TaskInstance/TaskInstanceStep snapshots under
+  # USER# partitions are not touched. Returns the deleted Task.
   deleteTask(taskId: ID!): Task
 
-  createAssignment(input: CreateAssignmentInput!): Assignment
-  updateAssignmentStatus(input: UpdateAssignmentStatusInput!): Assignment
-  # Toggle one assignment step's completion. Rejected on COMPLETED/SKIPPED assignments.
-  setAssignmentStepCompletion(input: SetAssignmentStepCompletionInput!): AssignmentStep
-  # Delete an assignment and all of its AssignmentStep snapshots. The source Task is
-  # untouched. Returns the deleted Assignment.
-  deleteAssignment(input: DeleteAssignmentInput!): Assignment
+  # Create a schedule rule binding a task to a user. Validates the task exists; creates no
+  # TaskInstance rows (occurrences are materialized lazily by startTaskInstance).
+  createTaskAssignment(input: CreateTaskAssignmentInput!): TaskAssignment!
+  # Materialize one occurrence (status IN_PROGRESS) and snapshot the task's current steps into
+  # TaskInstanceStep rows, atomically. Idempotent when the instance already exists.
+  startTaskInstance(input: StartTaskInstanceInput!): TaskInstance!
+  # Toggle one instance step's completion. Rejected on a terminal (COMPLETED/SKIPPED/CANCELLED) instance.
+  setTaskInstanceStepCompletion(input: SetTaskInstanceStepCompletionInput!): TaskInstanceStep!
+  # Set an instance's status (IN_PROGRESS/COMPLETED/SKIPPED). COMPLETED requires all steps complete.
+  updateTaskInstanceStatus(input: UpdateTaskInstanceStatusInput!): TaskInstance!
+  # Cancel one occurrence — writes a CANCELLED, isException TaskInstance (creating it if needed).
+  # Rejected on a terminal (COMPLETED/SKIPPED/CANCELLED) instance.
+  cancelTaskInstance(input: CancelTaskInstanceInput!): TaskInstance!
+  # End an assignment from a date onward (shortens endDate — never extends it — or fully ends it).
+  endTaskAssignment(input: EndTaskAssignmentInput!): TaskAssignment!
+  # Soft-delete an assignment (active:false; unblocks deleteTask for the source task).
+  deleteTaskAssignment(input: DeleteTaskAssignmentInput!): TaskAssignment!
 
   # Mint a presigned S3 upload URL; the client uploads the file, then calls
   # createMediaAsset with the returned s3Key to register the metadata.

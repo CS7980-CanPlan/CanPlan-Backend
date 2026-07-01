@@ -1,6 +1,6 @@
 # CanPlan 2.0 — Frontend API Reference
 
-_Last updated: 2026-06-27. Version: phase 1 (pre-authorization)._
+_Last updated: 2026-06-28. Version: phase 1 (pre-authorization)._
 
 > ## 🚨 Breaking change — categories, default category, Task status, TaskStep keys
 >
@@ -19,8 +19,9 @@ _Last updated: 2026-06-27. Version: phase 1 (pre-authorization)._
 >   `categoryId` must be a real, owned category.
 > - **`TaskStep.description`** added; **`reorderTaskSteps`** mutation added.
 >
-> An earlier breaking change also replaced the progress model — see
-> [Breaking changes — progress & assignment rework](#breaking-changes-progress--assignment-rework).
+> Scheduling was also reworked — a `Task` is now a template only and scheduling lives on
+> `TaskAssignment`/`TaskInstance`. See
+> [Breaking changes — scheduling rework](#breaking-changes-scheduling-rework).
 
 The backend exposes a single **AWS AppSync GraphQL** endpoint backed by a single
 DynamoDB table. This document covers how to connect, the available operations, and
@@ -68,8 +69,8 @@ of how data is keyed and read back:
   client-supplied id and uses your `sub` from the session (see below). So your
   profile always lands at `USER#<sub>`.
 - But the **read** and every other self-scoped write (`getUserProfile`,
-  `createAssignment`, `setAssignmentStepCompletion`, `listAssignmentsForUser`,
-  `listAssignmentSteps`, …) take a `userId`/`ownerId` **argument**. If you pass
+  `createTaskAssignment`, `startTaskInstance`, `getTaskInstanceViews`,
+  `listTaskInstanceSteps`, …) take a `userId`/`ownerId` **argument**. If you pass
   anything other than your own `sub` there, you will write rows you can never read
   back through your own profile, or read an empty result — silently, with no error.
 
@@ -151,24 +152,30 @@ GraphQL types below. The key layout (for reference):
 | Category | `USER#<ownerId>` | `CATEGORY#<categoryId>` |
 | Task (template) | `TASK#<taskId>` | `#META` |
 | TaskStep | `TASK#<taskId>` | `STEP#<stepId>` (stable id key; `order` is a plain attribute) |
-| Assignment | `USER#<userId>` | `ASSIGN#<assignmentId>` |
-| AssignmentStep | `USER#<userId>` | `ASSIGN_STEP#<assignmentId>#STEP#<stepId>` |
+| TaskAssignment | `USER#<userId>` | `TASK_ASSIGNMENT#<assignmentId>` |
+| TaskInstance | `USER#<userId>` | `TASK_INSTANCE#<scheduledDate>#<scheduledTime>#<assignmentId>` |
+| TaskInstanceStep | `USER#<userId>` | `TASK_INSTANCE_STEP#<instanceId>#STEP#<stepId>` |
 | MediaAsset | `TASK#<taskId>` | `MEDIA#<assetId>` |
 
-Six GSIs serve the cross-cutting lists: `supporterIndex` (users managed by a
+Seven GSIs serve the cross-cutting lists: `supporterIndex` (users managed by a
 supporter), `primaryUserSupportLinkIndex` (`SupportLink`s by primary user — keyed on
 `userId`/`supporterId`, the inverse of `supporterIndex`; sparse to `SupportLink`,
 used by `adminDeleteUser`), `orgIndex` (users in an organization), `taskOwnerIndex`
 (task templates by owner), `taskCategoryIndex` (tasks within one owner's category —
-keyed on a denormalized `<ownerId>#<categoryId>`, newest-first), and `entityTypeIndex`
+keyed on a denormalized `<ownerId>#<categoryId>`, newest-first), `entityTypeIndex`
 (every item of one `entityType`, newest-first — backs the SystemAdmin list-all APIs
-without a Scan).
+without a Scan), and `activeTaskAssignmentTaskIndex` (active `TaskAssignment`s by their
+source `taskId` — sparse: only an active assignment carries `activeTaskAssignmentTaskId`,
+so `deleteTask` can prove no active assignment still references a template).
 
-`Assignment` and its `AssignmentStep` snapshots share the `USER#<userId>` partition.
-`ASSIGN_STEP#…` deliberately does **not** begin with `ASSIGN#` (its 7th character is
-`_`, not `#`), so `listAssignmentsForUser`'s `begins_with(SK, 'ASSIGN#')` query never
-returns step rows; `listAssignmentSteps` scopes to one assignment's steps and sorts
-them by `order`.
+**Scheduling model.** A `Task` is a reusable **template only** — it carries no schedule.
+A `TaskAssignment` is the schedule rule binding a template to a user (`ONE_TIME` or
+`RECURRING` via an RRULE); it holds no status or step completion. A `TaskInstance` is one
+concrete occurrence (created lazily by `startTaskInstance`/`cancelTaskInstance`) and holds
+status + lifecycle timestamps; `instanceId = <assignmentId>#<scheduledDate>#<scheduledTime>`.
+A `TaskInstanceStep` is an immutable per-occurrence step snapshot. `TaskInstance` SKs are
+date-sorted, so `getTaskInstanceViews` reads a date window with one `BETWEEN` on the SK; a
+`TASK_INSTANCE_STEP#…` SK does not collide with the `TASK_INSTANCE#<date>#…` instance prefix.
 
 `TaskStep`s are keyed by their stable `stepId` (`STEP#<stepId>`), with `order` stored as
 a plain attribute — so a step keeps its key when reordered and a whole-task reorder is one
@@ -186,10 +193,10 @@ real Category row. Categories also keep an internal, transactionally-maintained 
 | Enum | Values |
 |---|---|
 | `UserRole` | `PRIMARY_USER`, `SUPPORT_PERSON`, `ORG_ADMIN` — a server-derived projection of Cognito group membership (`PrimaryUser`/`SupportPerson`/`OrganizationAdmin`); **Cognito groups are the authorization source of truth**. `SystemAdmin` is an elevated group, not a `UserRole`. |
-| `AssignmentStatus` | `TO_DO`, `OVERDUE`, `COMPLETED`, `SKIPPED` — only `TO_DO`/`COMPLETED`/`SKIPPED` are persisted; `OVERDUE` is **derived** at read time (a `TO_DO` assignment whose `dueDate` is in the past) and cannot be set by a mutation |
+| `TaskAssignmentScheduleType` | `ONE_TIME`, `RECURRING` |
+| `TaskInstanceStatus` | `TO_DO`, `IN_PROGRESS`, `OVERDUE`, `COMPLETED`, `SKIPPED`, `CANCELLED` — `OVERDUE` is **derived** at read time (a non-terminal occurrence whose `scheduledFor` is in the past) and cannot be set by a mutation; `CANCELLED` is set via `cancelTaskInstance` |
 | `MediaType` | `IMAGE`, `AUDIO`, `VIDEO` |
 | `SupportLinkStatus` | `PENDING`, `ACTIVE`, `REVOKED` |
-| `RepeatUnit` | `MINUTE`, `HOUR`, `DAY`, `WEEK`, `MONTH` |
 
 ### `AWSJSON` fields — encoding (foot-gun)
 
@@ -250,8 +257,8 @@ curl -s "$GRAPHQL_URL" \
 ### `createTask` — mutation
 
 Creates a **reusable task template** owned by the authenticated caller, plus one
-`TaskStep` item per nested step (each stored as its own row). Assigning a task to a
-user is a separate operation — see `createAssignment`.
+`TaskStep` item per nested step (each stored as its own row). A `Task` carries **no
+schedule** — scheduling a task for a user is a separate operation, see `createTaskAssignment`.
 
 **Input — `CreateTaskInput`**
 
@@ -260,10 +267,8 @@ user is a separate operation — see `createAssignment`.
 | `title` | `String!` | ✅ | Non-empty after trimming |
 | `categoryId` | `ID` | — | Optional; omitted/null ⇒ the owner's default category. A **blank string is rejected**. A supplied id must be a real, owned, non-deleting Category (see below) |
 | `description` | `String` | — | Optional |
-| `scheduleRule` | `String` | — | Optional (e.g. an RRULE) |
 | `steps` | `[CreateTaskStepNestedInput!]` | — | Ordered; each becomes a `STEP#<stepId>` item; max **97**, or max **96** when `coverImageS3Key` is supplied |
-| `schedule` | `TaskScheduleInput` | — | Optional recurring schedule (stored only — see below) |
-| `notificationEnabled` | `Boolean` | — | Defaults to `true` when `schedule` is set; otherwise left unset unless you pass it |
+| `coverImageS3Key` | `String` | — | Optional cover image (pending key from `createTaskCoverImageUploadUrl`) |
 
 > **No `ownerId`.** The owner is the caller's Cognito `sub`; a client-supplied `ownerId`
 > is ignored. The owner must already have a profile (and therefore a default category) —
@@ -299,23 +304,10 @@ renumbers orders, and gaps are harmless. Reorder the whole set with
 [`updateTaskOrder`](#tasks--steps); `listTasksByOwner` returns tasks sorted by ascending
 `order` (un-ordered legacy rows last). `Task.order` is `null` only on un-migrated legacy rows.
 
-**Schedule behavior.** Pass `schedule` to attach recurring-reminder metadata. It is
-**stored only** in this phase — no reminders are delivered yet (see _Not available
-yet_). `TaskScheduleInput` fields:
-
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `repeatEvery` | `Int!` | ✅ | Must be a positive integer (e.g. `2` for "every 2 …") |
-| `repeatUnit` | `RepeatUnit!` | ✅ | `MINUTE` · `HOUR` · `DAY` · `WEEK` · `MONTH` |
-| `firstOccurrenceAt` | `String!` | ✅ | Non-empty ISO-8601 timestamp of the first occurrence |
-| `timezone` | `String!` | ✅ | Non-empty IANA tz (e.g. `America/Toronto`) |
-| `enabled` | `Boolean` | — | Defaults to `true` when stored |
-
-When a schedule is supplied, the task is stored with `schedule` (its `enabled`
-defaulted to `true`), `nextOccurrenceAt` set equal to `schedule.firstOccurrenceAt`,
-and `notificationEnabled` defaulted to `true` (unless you pass `false`). Invalid
-schedules are rejected before any write (e.g. `repeatEvery: 0`, or a missing
-`firstOccurrenceAt`/`timezone`).
+**No schedule on a Task.** A `Task` is a reusable template only and stores no scheduling
+fields (`scheduleRule`, `schedule`, `nextOccurrenceAt`, `notificationEnabled` were all
+removed). To schedule a task for a user, create a `TaskAssignment` — see the
+**Scheduling — task assignments & instances** operations under [Operations](#operations).
 
 **Returns — `Task`** (with the `steps` it just created)
 
@@ -361,8 +353,8 @@ fields are marked `!` and everything else is optional; see
 
 > **All `list*` queries are paginated.** Each accepts optional `limit` (page size)
 > and `nextToken`, and returns a `{ items, nextToken }` **connection** (e.g.
-> `listTaskSteps` → `TaskStepConnection`, `listAssignmentsForUser` →
-> `AssignmentConnection`). `nextToken` is an opaque, base64-encoded cursor — pass it
+> `listTaskSteps` → `TaskStepConnection`, `listTaskAssignmentsForUser` →
+> `TaskAssignmentConnection`). `nextToken` is an opaque, base64-encoded cursor — pass it
 > back to fetch the next page; it's `null` on the last page. (See the
 > `listAllUsers` example below for the paging loop — every list query works the same way.)
 >
@@ -489,7 +481,7 @@ client-supplied id)
 | `listTaskSteps` | `taskId!, limit, nextToken` | `TaskStepConnection!` — steps sorted by ascending `order`, order preserved across pages; owner-only; see below |
 | `listTasksByOwner` | `ownerId!, limit, nextToken` | `TaskConnection!` — tasks sorted by ascending per-owner `order` (un-ordered legacy rows last), order preserved across pages; `ownerId` must be the caller |
 | `listTasksByCategory` | `ownerId!, categoryId!, limit, nextToken` | `TaskConnection!` — tasks in one real category; **`categoryId` is required** and is validated (owned + exists + not deleting → `NOT_FOUND`/`VALIDATION`, never a silent empty result); `ownerId` must be the caller |
-| `updateTask` | `input: { taskId!, title, categoryId, description, scheduleRule, schedule, notificationEnabled }` | `Task` — **partial edit**; owner-only; see below |
+| `updateTask` | `input: { taskId!, title, categoryId, description, coverImageS3Key }` | `Task` — **partial edit**; owner-only; see below |
 | `createTaskStep` | `input: { taskId!, order!, text!, description, media }` | `TaskStep` — **appends** one step at the end, optionally with initial type-specific media (owner-only); see below |
 | `updateTaskStep` | `input: { taskId!, stepId!, text, description, media }` | `TaskStep` — **partial edit** of one step and its type-specific media slots; see below |
 | `deleteTaskStep` | `input: { taskId!, stepId! }` | `TaskStep` — the deleted step; also deletes all its media assets; see below |
@@ -501,16 +493,13 @@ client-supplied id)
 > fields keep their current value. `ownerId` is immutable and **steps are not edited
 > here** (use `createTaskStep`/`reorderTaskSteps`; per-step content editing is
 > `updateTaskStep`). A missing `taskId` returns a not-found error rather than creating a
-> row. Two coupled fields are kept consistent for you: changing `categoryId` recomputes the
-> internal category key (so the task moves buckets in `listTasksByCategory`), and supplying
-> a new `schedule` re-derives `nextOccurrenceAt`. A supplied `categoryId` must be a real
-> category **you own** and not mid-deletion; moving the task decrements the old category's
-> internal task count and increments the new one's **in the same transaction** (so a
-> concurrent `deleteCategory` can't attach the task to a category being removed). A **blank
-> string is rejected** (omit it to leave the category unchanged). `title`, if supplied,
-> must be non-empty; and
-> `notificationEnabled` only changes when you pass it explicitly. The `schedule` fields and
-> validation are the same as [`createTask`](#createtask--mutation).
+> row. Changing `categoryId` recomputes the internal category key (so the task moves buckets
+> in `listTasksByCategory`). A supplied `categoryId` must be a real category **you own** and
+> not mid-deletion; moving the task decrements the old category's internal task count and
+> increments the new one's **in the same transaction** (so a concurrent `deleteCategory`
+> can't attach the task to a category being removed). A **blank string is rejected** (omit it
+> to leave the category unchanged). `title`, if supplied, must be non-empty. A `Task` has no
+> schedule fields to edit — scheduling lives on `TaskAssignment`.
 >
 > ```graphql
 > mutation UpdateTask($input: UpdateTaskInput!) {
@@ -535,7 +524,7 @@ client-supplied id)
 > validates that every `stepId` exists under the task, each appears exactly once, and the
 > `order`s are **unique positive integers contiguous from 1..N** (max 99 steps). All steps'
 > `order` attributes are updated in **one DynamoDB transaction** (all-or-nothing); step ids,
-> attached media, task contents, and historical `AssignmentStep`s are **never** touched.
+> attached media, task contents, and existing `TaskInstanceStep` snapshots are **never** touched.
 > Returns the resulting steps sorted by ascending `order`.
 >
 > ```graphql
@@ -564,7 +553,7 @@ client-supplied id)
 >   is `NOT_FOUND`. The cap is the same 50 tasks per owner.
 >
 > All tasks' `order` attributes are updated in **one DynamoDB transaction** (all-or-nothing);
-> task ids, steps, media, categories, and historical assignments are **never** touched. If the
+> task ids, steps, media, categories, and task assignments/instances are **never** touched. If the
 > owner's task set changed concurrently (a task was added/removed between your read and this
 > call), the transaction is canceled and you get a retryable `VALIDATION` error — reload your
 > tasks and retry. Returns the tasks sorted by ascending `order`.
@@ -650,10 +639,9 @@ client-supplied id)
 > is nothing shared to preserve.
 >
 > **Not touched:** the `Task` itself, any other `TaskStep`, and — importantly — **any
-> `Assignment` or `AssignmentStep`**. Historical `AssignmentStep` snapshots are immutable;
-> removing a template step never alters them, and future `createAssignment` calls simply
-> snapshot the task's remaining steps. (There is still **no API to delete an
-> `AssignmentStep`** — see [assignments](#assignments--progress-tracking).)
+> `TaskAssignment`, `TaskInstance`, or `TaskInstanceStep`**. Existing per-occurrence step
+> snapshots are immutable; removing a template step never alters them, and a future
+> `startTaskInstance` simply snapshots the task's remaining steps.
 >
 > _Consistency note:_ uses the same media-cleanup policy as `deleteMediaAsset` (delete row →
 > delete S3 binary, DB-first, structured-logged; cover references are cleared when relevant).
@@ -678,10 +666,12 @@ client-supplied id)
 > binaries**. Nothing task-owned — DynamoDB rows, S3 objects, or cover/step references —
 > is left behind.
 >
-> **Historical `Assignment`s and `AssignmentStep`s are preserved.** They are immutable
-> snapshots and **remain readable after the template is deleted** — deleting a template
-> never rewrites history. (To remove an assignment, use `deleteAssignment`; to remove one
-> individual media asset, use `deleteMediaAsset`.)
+> **Rejected while an active `TaskAssignment` references the task.** `deleteTask` first
+> queries `activeTaskAssignmentTaskIndex`; if any **active** assignment still schedules this
+> template, the delete is rejected with a `VALIDATION` error — end or delete those
+> assignments first (`endTaskAssignment` / `deleteTaskAssignment`). Existing `TaskInstance`
+> and `TaskInstanceStep` rows (under `USER#` partitions) are never touched and **remain
+> readable** after the template is deleted.
 >
 > _Consistency note:_ a task with **>99 children** exceeds DynamoDB's 100-item transaction
 > limit, so deletion is **not** a single atomic transaction. Before any `MediaAsset` row
@@ -697,34 +687,42 @@ client-supplied id)
 > }
 > ```
 
-**Assignments & progress tracking**
+**Scheduling — task assignments & instances**
+
+A `Task` is a reusable template. To put it on a user's calendar, create a
+`TaskAssignment` (the schedule rule). Occurrences are **virtual** until a user acts on one:
+`getTaskInstanceViews` expands an active assignment's occurrences over a date range and
+overlays any real `TaskInstance` rows; `startTaskInstance` materializes one occurrence and
+snapshots the task's current steps into `TaskInstanceStep` rows.
 
 | Operation | Input | Returns |
 |---|---|---|
-| `createAssignment` | `input: { taskId!, userId!, assignedBy, dueDate, recurrence, scheduleRule }` | `Assignment` · always created with persisted status `TO_DO`. Validates the `Task` exists, then snapshots its `TaskStep`s into one `AssignmentStep` per step (all `completed: false`), atomically. Errors if the task is missing or has > 99 steps (DynamoDB's 100-item transaction limit). |
-| `updateAssignmentStatus` | `input: { userId!, assignmentId!, status! }` | `Assignment` · `status` accepts only `TO_DO`/`COMPLETED`/`SKIPPED` (`OVERDUE` is rejected). **Needs both `userId` and `assignmentId`** (they form the item key); errors if the assignment doesn't exist. Setting `COMPLETED` is rejected while any `AssignmentStep` is still incomplete (a zero-step assignment may be completed). Marking all steps complete does **not** auto-complete the assignment — the client sets `COMPLETED` explicitly. |
-| `setAssignmentStepCompletion` | `input: { userId!, assignmentId!, stepId!, completed! }` | `AssignmentStep` · toggles one step. Sets `completedAt` to now when `completed: true`, clears it when `false`. Rejected if the assignment is `COMPLETED` or `SKIPPED`; 404s if the assignment or step doesn't exist for the user. |
-| `deleteAssignment` | `input: { userId!, assignmentId! }` | `Assignment` · the deleted assignment (internal fields stripped); deletes all its `AssignmentStep`s. See below. |
-| `listAssignmentsForUser` | `userId!, limit, nextToken` | `AssignmentConnection!` · `status` is returned with `OVERDUE` derived and legacy values mapped (see [breaking changes](#breaking-changes-progress--assignment-rework)). |
-| `listAssignmentSteps` | `userId!, assignmentId!, limit, nextToken` | `AssignmentStepConnection!` · one assignment's step snapshots, sorted by `order`. |
+| `createTaskAssignment` | `input: { taskId!, userId!, assignedBy, scheduleType!, scheduledFor, scheduleRule, startDate, endDate, startTime, timezone! }` | `TaskAssignment!` · validates the `Task` exists and the schedule, then writes **one** row — **no** `TaskInstance`s. `ONE_TIME` requires `scheduledFor` + `timezone`; `RECURRING` requires `scheduleRule` (an RRULE) + `startDate` + `startTime` + `timezone` (`endDate` optional). The RRULE must carry a `FREQ` of `DAILY`/`WEEKLY`/`MONTHLY`/`YEARLY` — incomplete rules and `HOURLY`/`MINUTELY`/`SECONDLY` are rejected. An active assignment carries the sparse `activeTaskAssignmentTaskId` marker. |
+| `startTaskInstance` | `input: { userId!, assignmentId!, scheduledDate!, scheduledTime! }` | `TaskInstance!` · verifies the occurrence is valid for the assignment; if no instance exists, creates it (`IN_PROGRESS`, `startedAt` set) and snapshots the current `TaskStep`s into `TaskInstanceStep` rows **atomically**. **Idempotent** — an existing instance is returned untouched (steps are never re-snapshotted). |
+| `setTaskInstanceStepCompletion` | `input: { userId!, instanceId!, stepId!, completed! }` | `TaskInstanceStep!` · toggles one step. Sets/clears `completedAt`. Rejected on a **terminal** (`COMPLETED`/`SKIPPED`/`CANCELLED`) instance; 404s if the instance or step doesn't exist. |
+| `updateTaskInstanceStatus` | `input: { userId!, instanceId!, status! }` | `TaskInstance!` · `status` accepts `IN_PROGRESS`/`COMPLETED`/`SKIPPED` (`OVERDUE` is rejected — derived; `CANCELLED` uses `cancelTaskInstance`). `COMPLETED` is rejected while any step is incomplete (a zero-step instance may be completed). |
+| `cancelTaskInstance` | `input: { userId!, assignmentId!, scheduledDate!, scheduledTime! }` | `TaskInstance!` · creates or updates a real `TaskInstance` with status `CANCELLED` and `isException: true`, so the occurrence stops surfacing as an open virtual slot. Rejected on a **terminal** (`COMPLETED`/`SKIPPED`/`CANCELLED`) instance — a finished occurrence can't be cancelled. |
+| `endTaskAssignment` | `input: { userId!, assignmentId!, effectiveDate! }` | `TaskAssignment!` · for a `RECURRING` assignment with days remaining, caps `endDate` to the day before `effectiveDate` — taking the **earlier** of that and any existing `endDate`, so it only ever shortens the window (stays active); otherwise fully ends it (`active: false`, `endedAt` set, marker removed). |
+| `deleteTaskAssignment` | `input: { userId!, assignmentId! }` | `TaskAssignment!` · **soft delete** — `active: false`, `endedAt` set, `activeTaskAssignmentTaskId` removed (unblocking `deleteTask`). 404s if missing. |
+| `listTaskAssignmentsForUser` | `userId!, limit, nextToken` | `TaskAssignmentConnection!` · a user's schedule rules (active + ended). |
+| `getTaskInstanceViews` | `userId!, startDate!, endDate!` | `TaskInstanceViewConnection!` · the calendar feed (both dates `YYYY-MM-DD`, **max 370-day** span). See below. |
+| `listTaskInstanceSteps` | `userId!, instanceId!, limit, nextToken` | `TaskInstanceStepConnection!` · one instance's step snapshots, sorted by `order`. |
 
-> **`deleteAssignment` removes an assignment and all its steps.** Identify it by `userId`
-> + `assignmentId` (its composite key). Deletes the `Assignment` row **and every
-> `AssignmentStep` snapshot** under it, then returns the deleted `Assignment` (internal
-> storage fields stripped; `status` is derived/legacy-mapped as on reads). A missing
-> assignment for that user returns a not-found error. The **source `Task` and its
-> `TaskSteps` are never touched**. There is **no API for deleting an `AssignmentStep`
-> independently** — a step snapshot is removed only when its parent assignment is deleted
-> (its completion can be toggled with `setAssignmentStepCompletion`, nothing more).
->
-> _Consistency note:_ identical to `deleteTask` — an assignment with **>99 step
-> snapshots** can't be deleted in one atomic transaction (DynamoDB's 100-item limit), so
-> steps are batch-deleted first and the assignment row last, making the call idempotent/
-> retryable and never leaving an orphaned `AssignmentStep`.
+> **`getTaskInstanceViews` is the calendar feed.** For `[startDate, endDate]` it (1) queries
+> the user's `TaskAssignment`s, (2) expands **active** assignments' virtual occurrences within
+> the window using a real recurrence library (`rrule` + `luxon`, so a `09:00` local rule keeps
+> firing at `09:00` across DST), (3) queries the real `TaskInstance` rows in the window
+> (date-sorted SK `BETWEEN`), (4) **overlays** real instances onto their virtual slots, and
+> (5) returns a virtual view (`isVirtual: true`, `instanceId: null`) for each scheduled
+> occurrence with no real instance yet. A real instance with no matching virtual slot (e.g. a
+> `CANCELLED` exception, or one from a since-ended assignment) is still surfaced. `status` is
+> returned with `OVERDUE` **derived** (a non-terminal occurrence whose `scheduledFor` is past).
 >
 > ```graphql
-> mutation DeleteAssignment($input: DeleteAssignmentInput!) {
->   deleteAssignment(input: $input) { assignmentId userId taskId status }
+> query Calendar($userId: ID!, $startDate: String!, $endDate: String!) {
+>   getTaskInstanceViews(userId: $userId, startDate: $startDate, endDate: $endDate) {
+>     items { instanceId assignmentId taskId title scheduledDate scheduledTime status isVirtual isException }
+>   }
 > }
 > ```
 
@@ -879,7 +877,7 @@ do {
 > | `profile` | `UserProfile` | the user's `#PROFILE` row · `null` if none exists |
 > | `tasks` | `[Task!]!` | the user's owned task templates via `taskOwnerIndex` — Task `#META` items only, **no nested `steps`** (same projection as `listAllTasks`) |
 > | `categories` | `[Category!]!` | every `CATEGORY#…` row in the user's partition (incl. their default) |
-> | `assignments` | `[Assignment!]!` | every `ASSIGN#…` row in the user's partition |
+> | `taskAssignments` | `[TaskAssignment!]!` | every `TASK_ASSIGNMENT#…` row in the user's partition (active + ended schedule rules) |
 > | `supportLinks` | `[SupportLink!]!` | links in **both** directions — where the user is the supporter and where they are the primary user — deduped by the `(supporterId, primaryUserId)` pair |
 >
 > `userId` is the app-level id (= Cognito `sub`); a blank id is a `VALIDATION` error. Lists
@@ -892,9 +890,9 @@ do {
 >   adminGetUserData(userId: $userId) {
 >     userId
 >     profile { userId displayName email role }
->     tasks { taskId title categoryId createdAt }
+>     tasks { taskId title categoryId order createdAt }
 >     categories { categoryId name isDefault }
->     assignments { assignmentId taskId status dueDate }
+>     taskAssignments { assignmentId taskId scheduleType scheduledFor active }
 >     supportLinks { supporterId primaryUserId status }
 >   }
 > }
@@ -950,8 +948,8 @@ otherwise — invites don't create a profile).
 1. If `deleteCognitoUser` and `disableFirst`, `AdminDisableUser` first (so an in-flight
    session can't race the cleanup).
 2. Delete every **owned task** via `taskOwnerIndex` → the shared cascade each.
-3. Delete every row in the **`USER#<userId>` partition** (profile, categories, assignments,
-   assignment steps, progress events, …) with one PK query + batch delete.
+3. Delete every row in the **`USER#<userId>` partition** (profile, categories, task
+   assignments, task instances, task-instance steps, …) with one PK query + batch delete.
 4. Delete every `SupportLink` where the user is the **supporter** (`SUPPORTER#<userId>`
    partition) **and** where they are the **primary user** (`primaryUserSupportLinkIndex`).
 5. **Last**, if `deleteCognitoUser`, `AdminDeleteUser`. Any DynamoDB/S3 failure above throws
@@ -1096,11 +1094,10 @@ stable contract and may be reworded at any time.
 
 Planned but not implemented — don't build against them:
 
-- **Push notifications / reminder delivery** — `createTask` and `updateTask` accept
-  and persist `schedule` metadata (and derive `nextOccurrenceAt` /
-  `notificationEnabled`), but **nothing fires reminders yet**. There is no scheduling
-  engine (EventBridge), no device-token registration, and no push-notification Lambda
-  in this phase — only the query-ready fields are stored.
+- **Push notifications / reminder delivery** — `TaskAssignment`s define schedules and
+  `getTaskInstanceViews` expands occurrences on read, but **nothing fires reminders yet**.
+  There is no delivery engine (EventBridge), no device-token registration, and no
+  push-notification Lambda in this phase.
 - **Per-role/owner authorization on domain operations** — the `SystemAdmin` admin
   queries are group-gated (enforced), and `createUserProfile` is self-scoped (it
   derives `userId`/`email`/`role` from the caller's Cognito session). The other
@@ -1114,12 +1111,11 @@ Planned but not implemented — don't build against them:
   resolver errors currently surface as `Lambda:Unhandled` with the cause only in
   `message`. Branch defensively until the codes are wired through.
 - **Delete** exists for categories (`deleteCategory`, non-default only), tasks
-  (`deleteTask`), task steps (`deleteTaskStep`), assignments (`deleteAssignment`), and media
-  assets (`deleteMediaAsset`); there is **no standalone delete for an `AssignmentStep`** (it
-  is removed only when its parent `Assignment` is deleted). **Update** exists for categories
+  (`deleteTask`), task steps (`deleteTaskStep`), task assignments (`deleteTaskAssignment`,
+  soft delete), and media assets (`deleteMediaAsset`). **Update** exists for categories
   (`updateCategory`), tasks (`updateTask`), task steps (`updateTaskStep`), task-step ordering
-  (`reorderTaskSteps`), whole-owner task ordering (`updateTaskOrder`), and assignment status
-  (`updateAssignmentStatus`); other entities have no update yet.
+  (`reorderTaskSteps`), whole-owner task ordering (`updateTaskOrder`), and task-instance
+  status (`updateTaskInstanceStatus`); other entities have no update yet.
 - **Report generation** — the `Report` type exists in the schema, but no query or
   mutation is exposed for it yet.
 - **Streaming AI responses** — `generateTaskSteps` is request/response only.
@@ -1157,8 +1153,8 @@ ordering changed. **This is a breaking API change.**
 - An **internal `Category.taskCount`** (not exposed in GraphQL) — a durable, transactionally
   maintained count of the tasks in each category, so `deleteCategory` is safe despite the
   eventually-consistent category index.
-- `TaskStep.description` (optional), persisted by create/update; AssignmentStep snapshots
-  are unchanged (no `description`).
+- `TaskStep.description` (optional), persisted by create/update; `TaskInstanceStep`
+  snapshots carry text/completion only (no `description`).
 - `reorderTaskSteps` — atomic whole-task reordering.
 
 **Data compatibility / migration**
@@ -1179,46 +1175,46 @@ ordering changed. **This is a breaking API change.**
 
 ---
 
-## Breaking changes: progress & assignment rework
+## Breaking changes: scheduling rework
 
-The `ProgressEvent`-based progress model was replaced by assignment-level status plus
-per-assignment step completion. **This is a breaking API change.**
+Scheduling was redesigned so that a `Task` is a **reusable template only**. The flat
+`Assignment` model (with `dueDate`/`status`/`AssignmentStep`) was replaced by a three-layer
+model: `TaskAssignment` (schedule rule), `TaskInstance` (one occurrence with status), and
+`TaskInstanceStep` (per-occurrence step snapshot). **This is a breaking API change**, and
+**no data migration / backward compatibility is provided.**
 
 **Removed**
 
-- `ProgressEvent` type, `ProgressEventType` enum, `ProgressEventConnection`,
-  `CreateProgressEventInput`, the `createProgressEvent` mutation, and the
-  `listProgressEventsForUser` query. The `canplan-progress-<env>` Lambda and its
-  resolver wiring are gone.
-- `Assignment.active` and the `active` input on `createAssignment` /
-  `updateAssignmentStatus`.
-- The `status` input on `createAssignment` — assignments are always created `TO_DO`.
+- All scheduling fields on `Task`: `scheduleRule`, `schedule`, `nextOccurrenceAt`,
+  `notificationEnabled` — and the `TaskSchedule` type, `TaskScheduleInput`, and `RepeatUnit`
+  enum. Those fields are also gone from `CreateTaskInput` / `UpdateTaskInput`.
+- The `Assignment` and `AssignmentStep` types, the `AssignmentStatus` enum, and every old
+  operation: `createAssignment`, `updateAssignmentStatus`, `setAssignmentStepCompletion`,
+  `deleteAssignment`, `listAssignmentsForUser`, `listAssignmentSteps`.
 
-**Changed — `AssignmentStatus`**
+**Added — `TaskAssignment`**
 
-- New values: `TO_DO`, `OVERDUE`, `COMPLETED`, `SKIPPED`.
-- Only `TO_DO`, `COMPLETED`, and `SKIPPED` are ever persisted. `OVERDUE` is **derived**
-  at read time — an assignment is `OVERDUE` when its persisted status is `TO_DO`, it has
-  a `dueDate`, and that `dueDate` is in the past. An assignment without a `dueDate` is
-  never `OVERDUE`. Mutations reject an attempt to set `OVERDUE`.
+- The schedule rule binding a template to a user (`scheduleType` `ONE_TIME`/`RECURRING`,
+  `scheduledFor` or `scheduleRule`/`startDate`/`endDate`/`startTime`, `timezone`, `active`).
+- Operations: `createTaskAssignment`, `endTaskAssignment`, `deleteTaskAssignment` (soft
+  delete), `listTaskAssignmentsForUser`. An active assignment carries a sparse
+  `activeTaskAssignmentTaskId` (new `activeTaskAssignmentTaskIndex` GSI) so `deleteTask` is
+  rejected while any active assignment references the template.
 
-**Added — per-assignment steps**
+**Added — `TaskInstance` & `TaskInstanceStep`**
 
-- `AssignmentStep` is an immutable snapshot of one `TaskStep` captured into one
-  `Assignment` at creation (`assignmentId`, `taskId`, `stepId`, `order`, `text`,
-  `completed`, `completedAt`, `createdAt`, `updatedAt`).
-  Editing the `Task` template later does **not** change historical assignments.
-- `listAssignmentSteps(userId, assignmentId, …)` and
-  `setAssignmentStepCompletion(input)` (see the operations table above).
+- A `TaskInstance` is one concrete occurrence (`TaskInstanceStatus`:
+  `TO_DO`/`IN_PROGRESS`/`OVERDUE`/`COMPLETED`/`SKIPPED`/`CANCELLED`; `OVERDUE` is derived).
+  Occurrences are **virtual** until `startTaskInstance` (or `cancelTaskInstance`)
+  materializes one; `startTaskInstance` snapshots the task's current steps into
+  `TaskInstanceStep` rows exactly once (idempotent).
+- Operations: `startTaskInstance`, `updateTaskInstanceStatus`, `cancelTaskInstance`,
+  `setTaskInstanceStepCompletion`, `getTaskInstanceViews` (the calendar feed),
+  `listTaskInstanceSteps`.
 
-**Data compatibility**
+**Recurrence**
 
-- Existing `Assignment` rows with legacy statuses are mapped on read so the new enum
-  never surfaces an invalid value: `ACTIVE` → `TO_DO`, `PAUSED` → `TO_DO`,
-  `CANCELLED` → `SKIPPED`, `COMPLETED` → `COMPLETED`. A legacy `active` attribute is
-  dropped from responses.
-- Legacy assignments created before this change have **no** `AssignmentStep` rows, so
-  `listAssignmentSteps` returns empty for them. Only assignments created via the new
-  `createAssignment` carry step snapshots.
-- This is an API/code refactor only: existing `ProgressEvent` rows are **left in
-  DynamoDB** (not deleted) — they are simply no longer served by any API.
+- `RECURRING` assignments use an RRULE (`scheduleRule`) expanded with `rrule` + `luxon`
+  (timezone-correct across DST). The RRULE must carry a `FREQ` of `DAILY`/`WEEKLY`/`MONTHLY`/
+  `YEARLY` (`HOURLY`/`MINUTELY`/`SECONDLY` and a missing `FREQ` are rejected).
+  `getTaskInstanceViews` caps its date range at **370 days**.

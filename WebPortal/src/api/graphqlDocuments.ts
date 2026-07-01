@@ -21,7 +21,6 @@ const TASK_FIELDS = `
   title
   categoryId
   description
-  notificationEnabled
   createdAt
   updatedAt
 `;
@@ -78,13 +77,20 @@ export const ADMIN_GET_USER_DATA = /* GraphQL */ `
         createdAt
         updatedAt
       }
-      assignments {
+      taskAssignments {
         assignmentId
         taskId
         userId
         assignedBy
-        dueDate
-        status
+        scheduleType
+        scheduledFor
+        scheduleRule
+        startDate
+        endDate
+        startTime
+        timezone
+        active
+        endedAt
         assignedAt
         createdAt
         updatedAt
