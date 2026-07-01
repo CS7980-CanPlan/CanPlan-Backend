@@ -148,7 +148,12 @@ export class Functions extends Construct {
         BEDROCK_MODEL_ID: bedrockModelId,
         BEDROCK_MAX_TOKENS: '1024',
         KNOWLEDGE_BASE_ID: knowledgeBaseId,
-        RETRIEVAL_TOP_K: '4',
+        RERANK_COARSE_K: '25',
+        RERANK_MODEL_ID: 'cohere.rerank-v3-5:0',
+        RERANK_SCORE_FLOOR: '0.3',
+        RERANK_REL_RATIO: '0.5',
+        RERANK_MIN_RESULTS: '2',
+        RERANK_MAX_RESULTS: '5',
         AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
       },
       logRetention: logs.RetentionDays.ONE_WEEK,
@@ -181,6 +186,23 @@ export class Functions extends Construct {
         ],
       }),
     );
+    // Standalone Rerank (stage 2). bedrock:Rerank is NOT a model-scoped action —
+    // it only authorizes against "*" (per AWS reranking permissions docs); only
+    // bedrock:InvokeModel is scoped to the Cohere reranker in the Bedrock region.
+    // NOTE: this ARN is hardcoded to cohere.rerank-v3-5:0 and must be kept in sync
+    // with the RERANK_MODEL_ID env var below — overriding that env without updating
+    // this ARN denies InvokeModel at runtime (us-east-1 has no other reranker today).
+    this.generateTaskStepsFn.addToRolePolicy(
+      new iam.PolicyStatement({ actions: ['bedrock:Rerank'], resources: ['*'] }),
+    );
+    this.generateTaskStepsFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['bedrock:InvokeModel'],
+        resources: [
+          `arn:aws:bedrock:${bedrockRegion}::foundation-model/cohere.rerank-v3-5:0`,
+        ],
+      }),
+    );
 
     // ── createAiTask (Bedrock KB + RAG; returns a preview, persists nothing) ─────
     this.createAiTaskFn = new NodejsFunction(this, 'CreateAiTaskFunction', {
@@ -193,7 +215,12 @@ export class Functions extends Construct {
         BEDROCK_MODEL_ID: bedrockModelId,
         BEDROCK_MAX_TOKENS: '1024',
         KNOWLEDGE_BASE_ID: knowledgeBaseId,
-        RETRIEVAL_TOP_K: '4',
+        RERANK_COARSE_K: '25',
+        RERANK_MODEL_ID: 'cohere.rerank-v3-5:0',
+        RERANK_SCORE_FLOOR: '0.3',
+        RERANK_REL_RATIO: '0.5',
+        RERANK_MIN_RESULTS: '2',
+        RERANK_MAX_RESULTS: '5',
         AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
       },
       logRetention: logs.RetentionDays.ONE_WEEK,
@@ -224,6 +251,23 @@ export class Functions extends Construct {
         actions: ['bedrock:Retrieve'],
         resources: [
           `arn:aws:bedrock:${bedrockRegion}:${cdk.Stack.of(this).account}:knowledge-base/${knowledgeBaseId}`,
+        ],
+      }),
+    );
+    // Standalone Rerank (stage 2). bedrock:Rerank is NOT a model-scoped action —
+    // it only authorizes against "*" (per AWS reranking permissions docs); only
+    // bedrock:InvokeModel is scoped to the Cohere reranker in the Bedrock region.
+    // NOTE: this ARN is hardcoded to cohere.rerank-v3-5:0 and must be kept in sync
+    // with the RERANK_MODEL_ID env var below — overriding that env without updating
+    // this ARN denies InvokeModel at runtime (us-east-1 has no other reranker today).
+    this.createAiTaskFn.addToRolePolicy(
+      new iam.PolicyStatement({ actions: ['bedrock:Rerank'], resources: ['*'] }),
+    );
+    this.createAiTaskFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['bedrock:InvokeModel'],
+        resources: [
+          `arn:aws:bedrock:${bedrockRegion}::foundation-model/cohere.rerank-v3-5:0`,
         ],
       }),
     );

@@ -5,7 +5,12 @@ import { bedrock } from '../../shared/bedrock';
 jest.mock('../../shared/kb', () => ({
   kb: { send: jest.fn() },
   KNOWLEDGE_BASE_ID: 'kb-test-123',
-  RETRIEVAL_TOP_K: 4,
+  RERANK_COARSE_K: 25,
+  RERANK_MODEL_ARN: 'arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0',
+  RERANK_SCORE_FLOOR: 0.3,
+  RERANK_REL_RATIO: 0.5,
+  RERANK_MIN_RESULTS: 2,
+  RERANK_MAX_RESULTS: 5,
 }));
 
 jest.mock('../../shared/bedrock', () => ({
@@ -32,6 +37,10 @@ function retrieveResult() {
   };
 }
 
+function rerankResult() {
+  return { results: [{ index: 0, relevanceScore: 0.9 }] };
+}
+
 function converseResult(text: string) {
   return {
     output: { message: { role: 'assistant', content: [{ text }] } },
@@ -42,7 +51,11 @@ function converseResult(text: string) {
 const goodSteps = '{"steps":[{"text":"Wet your hands.","citations":["hlbc-85-handwash-steps"]}]}';
 
 beforeEach(() => {
-  mockKbSend.mockResolvedValue(retrieveResult());
+  mockKbSend.mockImplementation((command) =>
+    Promise.resolve(
+      command.constructor.name === 'RerankCommand' ? rerankResult() : retrieveResult(),
+    ),
+  );
   mockBedrockSend.mockResolvedValue(converseResult(goodSteps));
 });
 
@@ -73,7 +86,7 @@ describe('generateTaskSteps handler', () => {
     const cmd = mockKbSend.mock.calls[0][0];
     expect(cmd.input.knowledgeBaseId).toBe('kb-test-123');
     expect(cmd.input.retrievalQuery.text).toBe('wash my hands');
-    expect(cmd.input.retrievalConfiguration.vectorSearchConfiguration.numberOfResults).toBe(4);
+    expect(cmd.input.retrievalConfiguration.vectorSearchConfiguration.numberOfResults).toBe(25);
   });
 
   it('drops citations whose chunk_id is not in the retrieved set', async () => {

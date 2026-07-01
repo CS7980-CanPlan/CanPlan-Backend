@@ -35,11 +35,18 @@ Converse to generate cited task steps (it returns the steps; it does not save a
 task). `createAiTask` takes a single free-text `query`, generates a clean title
 plus ordered steps over the same Knowledge Base, and returns them directly to the
 frontend as a `GeneratedAiTask` preview; it persists nothing (no task, steps,
-category, or media are written, and no `categoryId` is resolved) and does not
-surface or store citations. The caller saves the preview later via `createTask` if
-they keep it. It reuses the same KB/Bedrock generation as `generateTaskSteps` (via
-`src/shared/stepsService.ts`). A caregiver review/approval flow over the cited
-sources is a separate future project, not part of this mutation.
+category, or media are written, and no `categoryId` is resolved). The caller saves
+the preview later via `createTask` if they keep it. Its behaviour is
+**input-controlled, not role-gated**: `groundingMode` (`GROUNDED_ONLY` default, or
+`ALLOW_UNGROUNDED_FALLBACK`) decides whether a query with no relevant corpus passage
+fails with `NOT_FOUND` (no generation model call) or falls back to ungrounded AI
+generation; `source` (`CORPUS` / `UNGROUNDED_AI`) reports which path produced the
+result; each step carries `citations` (populated for corpus output, empty for
+ungrounded, fetched only if the frontend selects the field); and an optional
+`stepCount` (1..20) requests an exact number of steps. It reuses the same KB/Bedrock
+generation as `generateTaskSteps` (via `src/shared/stepsService.ts`). A caregiver
+review/approval flow over the cited sources is a separate future project, not part
+of this mutation.
 
 Default authorization is Cognito User Pool — frontend clients send a signed-in
 user's JWT. A few fields carry auth directives; see [Authentication](#authentication).

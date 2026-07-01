@@ -7,6 +7,10 @@
 export type UserRole = 'PRIMARY_USER' | 'SUPPORT_PERSON' | 'ORG_ADMIN';
 export type SupportLinkStatus = 'PENDING' | 'ACTIVE' | 'REVOKED';
 export type MediaType = 'IMAGE' | 'AUDIO' | 'VIDEO';
+/** createAiTask fallback policy, chosen per request (not by role). */
+export type AiTaskGroundingMode = 'GROUNDED_ONLY' | 'ALLOW_UNGROUNDED_FALLBACK';
+/** Where a createAiTask result was generated from. */
+export type AiTaskGenerationSource = 'CORPUS' | 'UNGROUNDED_AI';
 
 // ── Scheduling enums (mirror graphql/schema.graphql) ──────────────────────────
 /** How a TaskAssignment recurs: a single occurrence, or a recurrence rule. */
@@ -363,10 +367,14 @@ export interface CreateTaskInput {
   coverImageS3Key?: string;
 }
 
-// AI one-shot task creation input: one free-text request (+ optional category).
+// AI one-shot task PREVIEW input: one free-text request, plus the fallback policy and an
+// optional requested step count.
 export interface CreateAiTaskInput {
   query: string;
-  categoryId?: string;
+  /** Fallback policy; defaults to GROUNDED_ONLY when omitted. */
+  groundingMode?: AiTaskGroundingMode;
+  /** Requested number of steps. Must be an integer 1..20 if supplied; omitted ⇒ AI chooses (≤ 20). */
+  stepCount?: number;
 }
 
 /**
@@ -717,16 +725,26 @@ export interface TaskStepsResponse {
   outputTokens?: number;
 }
 
-// createAiTask PREVIEW response: an AI-generated title + ordered, text-only steps.
-// Nothing is persisted — no taskId/ownerId/categoryId/timestamps and no step ids or
-// citations; the caller saves it later via createTask if they keep it.
+// createAiTask PREVIEW response: an AI-generated title + ordered steps. Nothing is
+// persisted — no taskId/ownerId/categoryId/timestamps and no step ids; the caller saves
+// it later via createTask if they keep it. `citations` carry the resolved corpus sources
+// (empty for ungrounded fallback output).
 export interface GeneratedAiTaskStep {
   text: string;
+  citations: Citation[];
 }
 
 export interface GeneratedAiTask {
   title: string;
   steps: GeneratedAiTaskStep[];
+  /**
+   * Whether the steps are grounded in the guidance corpus. true = built from retrieved
+   * sources; false = ungrounded fallback generated from the model's general knowledge.
+   * The frontend renders an "AI-generated, not from our guidance" notice when false.
+   */
+  grounded: boolean;
+  /** Where the result came from — CORPUS (grounded) or UNGROUNDED_AI (fallback). */
+  source: AiTaskGenerationSource;
   inputTokens?: number;
   outputTokens?: number;
 }
