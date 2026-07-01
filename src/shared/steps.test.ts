@@ -1,4 +1,4 @@
-import { buildStepsPrompt, parseSteps, resolveCitations, SYSTEM_PROMPT, buildTitledStepsPrompt, parseTitledSteps } from './steps';
+import { buildStepsPrompt, parseSteps, resolveCitations, SYSTEM_PROMPT, buildTitledStepsPrompt, buildUngroundedTitledStepsPrompt, stepCountInstruction, parseTitledSteps } from './steps';
 import type { RetrievedPassage } from './types';
 
 const passages: RetrievedPassage[] = [
@@ -73,6 +73,34 @@ describe('buildTitledStepsPrompt', () => {
     expect(prompt).toContain('[hlbc-85-handwash-steps] Wet your hands, use soap for 20 seconds.');
     expect(prompt).toContain('"title"');
     expect(prompt).toContain('"steps"');
+  });
+
+  it('asks for no more than 20 steps when no stepCount is given', () => {
+    expect(buildTitledStepsPrompt('wash my hands', passages)).toContain('no more than 20 steps');
+  });
+
+  it('asks for exactly N steps when stepCount is given', () => {
+    expect(buildTitledStepsPrompt('wash my hands', passages, 3)).toContain('Return exactly 3 steps.');
+  });
+});
+
+describe('stepCountInstruction', () => {
+  it('caps at 20 when omitted', () => {
+    expect(stepCountInstruction()).toBe('Return no more than 20 steps.');
+  });
+
+  it('requests an exact count, pluralizing correctly', () => {
+    expect(stepCountInstruction(1)).toBe('Return exactly 1 step.');
+    expect(stepCountInstruction(5)).toBe('Return exactly 5 steps.');
+  });
+});
+
+describe('buildUngroundedTitledStepsPrompt', () => {
+  it('has no Sources block and carries the step-count instruction', () => {
+    const prompt = buildUngroundedTitledStepsPrompt('scramble eggs', 4);
+    expect(prompt).toContain('Task: scramble eggs');
+    expect(prompt).not.toContain('Sources:');
+    expect(prompt).toContain('Return exactly 4 steps.');
   });
 });
 

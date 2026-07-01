@@ -87,17 +87,37 @@ export function toTaskSteps(raw: RawSteps, passages: RetrievedPassage[]): Genera
   return raw.steps.map((s) => ({ text: s.text, citations: resolveCitations(s.citations, passages) }));
 }
 
+/** Hard ceiling on generated steps when the caller does not request an exact count. */
+export const MAX_AI_TASK_STEPS = 20;
+
+/**
+ * Build the sentence that tells the model how many steps to return.
+ *  - stepCount supplied → "return exactly N steps".
+ *  - omitted            → "return no more than MAX steps" (the AI picks the count).
+ */
+export function stepCountInstruction(stepCount?: number): string {
+  return stepCount != null
+    ? `Return exactly ${stepCount} step${stepCount === 1 ? '' : 's'}.`
+    : `Return no more than ${MAX_AI_TASK_STEPS} steps.`;
+}
+
 /**
  * Like buildStepsPrompt, but also asks the model for a short, clean task title.
- * Used by createAiTask (one-shot generate + save). Verbatim step style as the
- * untitled prompt; only the requested JSON shape gains a `title`.
+ * Used by createAiTask (one-shot generate + preview). Verbatim step style as the
+ * untitled prompt; only the requested JSON shape gains a `title`. `stepCount`, when
+ * supplied, instructs the model to return exactly that many steps.
  */
-export function buildTitledStepsPrompt(query: string, passages: RetrievedPassage[]): string {
+export function buildTitledStepsPrompt(
+  query: string,
+  passages: RetrievedPassage[],
+  stepCount?: number,
+): string {
   const sources = passages.map((p) => `[${p.chunkId}] ${p.text}`).join('\n');
   return (
     `Task: ${query}\n\n` +
     `Sources:\n${sources}\n\n` +
     'Also give the task a short, clear title in plain everyday words (a few words, no jargon).\n' +
+    `${stepCountInstruction(stepCount)}\n` +
     'Return JSON shaped exactly as: ' +
     '{"title": "<short clear task title>", "steps": [{"text": "<one simple action, ' +
     'one short sentence, no jargon>", "citations": ["<chunk_id used>"]}]}'
@@ -120,10 +140,11 @@ export const UNGROUNDED_SYSTEM_PROMPT =
   'Respond with JSON only, no prose.';
 
 /** Like buildTitledStepsPrompt but with no Sources block — used by the ungrounded fallback. */
-export function buildUngroundedTitledStepsPrompt(query: string): string {
+export function buildUngroundedTitledStepsPrompt(query: string, stepCount?: number): string {
   return (
     `Task: ${query}\n\n` +
     'Also give the task a short, clear title in plain everyday words (a few words, no jargon).\n' +
+    `${stepCountInstruction(stepCount)}\n` +
     'Return JSON shaped exactly as: ' +
     '{"title": "<short clear task title>", "steps": [{"text": "<one simple action, ' +
     'one short sentence, no jargon>"}]}'

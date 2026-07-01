@@ -117,7 +117,7 @@ async function main() {
     } else {
       console.log(
         `\nClusters OVERLAP in [${fmt(gMin)}, ${fmt(oMax)}] — no floor classifies the set perfectly. ` +
-          `Pick by tolerance: lower floor = fewer false rejects (误杀) but more false accepts (漏网).`,
+          `Pick by tolerance: lower floor = fewer false rejects but more false accepts.`,
       );
     }
   }
@@ -126,9 +126,9 @@ async function main() {
   const falseRejects = g.filter((r) => (r.top === null ? true : r.top < RERANK_SCORE_FLOOR));
   const falseAccepts = o.filter((r) => r.top !== null && r.top >= RERANK_SCORE_FLOOR);
   console.log(`\n── current floor ${RERANK_SCORE_FLOOR} on this set ──`);
-  console.log(`false rejects (误杀: grounded below floor):  ${falseRejects.length}/${g.length}`);
+  console.log(`false rejects (grounded below floor):  ${falseRejects.length}/${g.length}`);
   falseRejects.forEach((r) => console.log(`   ${fmt(r.top)}  ${r.query}`));
-  console.log(`false accepts (漏网: off_corpus at/above floor): ${falseAccepts.length}/${o.length}`);
+  console.log(`false accepts (off_corpus at/above floor): ${falseAccepts.length}/${o.length}`);
   falseAccepts.forEach((r) => console.log(`   ${fmt(r.top)}  ${r.query}`));
 
   // ── Optional CSV ─────────────────────────────────────────────────────────────

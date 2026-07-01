@@ -16,9 +16,9 @@ coarse KB recall (`RERANK_COARSE_K`) then Cohere rerank (`rerankPassages`) — a
 **top rerank score**. It then prints, per label, where those scores cluster and how the
 current floor would misclassify the set:
 
-- **false reject (误杀)** — a `grounded` query whose top score is below the floor (had usable
+- **false reject** — a `grounded` query whose top score is below the floor (had usable
   guidance, got rejected).
-- **false accept (漏网)** — an `off_corpus` query whose top score clears the floor (irrelevant
+- **false accept** — an `off_corpus` query whose top score clears the floor (irrelevant
   passage treated as grounded).
 
 The floor should land in the gap between the two clusters.

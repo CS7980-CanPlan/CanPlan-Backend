@@ -52,6 +52,24 @@ enum AdminBaseRole {
   ORG_ADMIN
 }
 
+# createAiTask fallback policy, chosen per request (not by role).
+#   GROUNDED_ONLY              — corpus only; if nothing clears the relevance floor, fail
+#                                with NOT_FOUND (the generation model is never called).
+#   ALLOW_UNGROUNDED_FALLBACK  — corpus first; if nothing is relevant, fall back to
+#                                ungrounded AI generation from general knowledge.
+enum AiTaskGroundingMode {
+  GROUNDED_ONLY
+  ALLOW_UNGROUNDED_FALLBACK
+}
+
+# Where a createAiTask result was generated from.
+#   CORPUS        — built from retrieved guidance passages (grounded: true).
+#   UNGROUNDED_AI — ungrounded fallback from the model's general knowledge (grounded: false).
+enum AiTaskGenerationSource {
+  CORPUS
+  UNGROUNDED_AI
+}
+
 # ─── Domain types ───────────────────────────────────────────────────────────--
 
 type UserProfile {
@@ -276,21 +294,25 @@ type TaskStepsResponse {
   outputTokens: Int
 }
 
-# An AI-generated task PREVIEW — a clean title + ordered, text-only steps. Nothing is
-# persisted: the caller decides whether to keep it and saves it later via createTask.
-# Citations are intentionally dropped (end users have cognitive disabilities).
+# An AI-generated task PREVIEW step — a clean, ordered step. Nothing is persisted: the
+# caller decides whether to keep it and saves it later via createTask. `citations` carry
+# the resolved corpus sources (empty for ungrounded fallback output); the frontend controls
+# whether to request them via GraphQL selection.
 type GeneratedAiTaskStep {
   text: String!
+  citations: [Citation!]!
 }
 
 type GeneratedAiTask {
   title: String!
   steps: [GeneratedAiTaskStep!]!
   # Whether the steps are grounded in the guidance corpus. true = built from retrieved
-  # sources; false = ungrounded fallback generated from general knowledge (only returned
-  # to support persons). Frontend shows an "AI-generated, not from our guidance" notice
-  # when false.
+  # sources; false = ungrounded fallback generated from general knowledge. Frontend shows
+  # an "AI-generated, not from our guidance" notice when false.
   grounded: Boolean!
+  # Where the result came from: CORPUS (grounded) or UNGROUNDED_AI (fallback). A clearer
+  # companion to `grounded` for frontend display.
+  source: AiTaskGenerationSource!
   inputTokens: Int
   outputTokens: Int
 }
@@ -375,13 +397,17 @@ input CreateTaskInput {
   coverImageS3Key: String
 }
 
-# AI one-shot task creation: the user gives one request; the AI generates a clean
-# title + steps and the task is created directly. No citations are surfaced or
-# stored (end users have cognitive disabilities). Owner is derived from the
+# AI one-shot task PREVIEW: the user gives one request; the AI generates a clean title +
+# ordered steps and returns them directly. Nothing is persisted. Owner is derived from the
 # Cognito identity.
 input CreateAiTaskInput {
   query: String!          # the user's request, e.g. "wash my hair"; drives generation + title
-  categoryId: ID          # optional, as in createTask: omitted ⇒ owner's default category
+  # Fallback policy (default GROUNDED_ONLY). GROUNDED_ONLY fails with NOT_FOUND when no
+  # corpus passage is relevant; ALLOW_UNGROUNDED_FALLBACK generates ungrounded AI steps instead.
+  groundingMode: AiTaskGroundingMode = GROUNDED_ONLY
+  # Optional requested number of steps. Must be an integer 1..20 if supplied; omitted ⇒ the
+  # AI chooses (capped at 20).
+  stepCount: Int
 }
 
 # Partial edit of an existing task. Only fields you include are changed; omitted
@@ -696,8 +722,9 @@ type Mutation {
 
   # Create a reusable task template (and optionally its ordered steps).
   createTask(input: CreateTaskInput!): Task
-  # Generate a titled, stepped task PREVIEW from one request (no citations). Nothing is
-  # persisted — the caller saves it later via createTask if they keep it.
+  # Generate a titled, stepped task PREVIEW from one request. Citations are available on
+  # each returned step when requested. Nothing is persisted — the caller saves it later via
+  # createTask if they keep it.
   createAiTask(input: CreateAiTaskInput!): GeneratedAiTask!
   # Edit an existing task template's fields (partial update). Errors if not found.
   updateTask(input: UpdateTaskInput!): Task

@@ -1002,40 +1002,53 @@ Generates a clean **title + ordered steps** for one free-text request over the s
 Bedrock Knowledge Base + RAG, and returns them directly as a **preview**. It **persists
 nothing** — no `Task`, `TaskStep`, category count, or `MediaAsset` is written, and no
 `categoryId` is resolved. The caller decides whether to keep the result and saves it
-later via [`createTask`](#createtask--mutation). Citations are intentionally dropped
-(end users have cognitive disabilities). Owner is derived from the Cognito identity.
+later via [`createTask`](#createtask--mutation). Owner is derived from the Cognito identity.
 
-**Input — `CreateAiTaskInput`**: `query: String!` (the free-text request; empty/whitespace
-is rejected with `VALIDATION`). `categoryId` is accepted by the input type but **ignored**
-— nothing is saved, so no category is resolved.
+**Input — `CreateAiTaskInput`**:
+- `query: String!` — the free-text request; empty/whitespace is rejected with `VALIDATION`.
+- `groundingMode: AiTaskGroundingMode = GROUNDED_ONLY` — controls the fallback policy (below);
+  chosen **per request**, not by the caller's role.
+- `stepCount: Int` — optional requested number of steps. If supplied it must be an integer
+  **1..20** inclusive (`0`, negatives, `> 20`, and non-integers are rejected with `VALIDATION`);
+  omitted ⇒ the AI chooses the count (capped at 20).
 
 **Returns — `GeneratedAiTask!`**: `title: String!`, `steps: [GeneratedAiTaskStep!]!`
-(each `{ text }` — **text only**, no step ids and no citations), `grounded: Boolean!`,
-plus `inputTokens`, `outputTokens`. No database-created fields (`taskId`, `ownerId`,
-`categoryId`, `createdAt`, `updatedAt`) are returned.
+(each `{ text, citations }`), `grounded: Boolean!`, `source: AiTaskGenerationSource!`, plus
+`inputTokens`, `outputTokens`. No database-created fields (`taskId`, `ownerId`, `categoryId`,
+`createdAt`, `updatedAt`) are returned.
 
-`grounded` reports whether the steps are backed by the guidance corpus: `true` = built
-from retrieved sources; `false` = an **ungrounded fallback** generated from the model's
-general knowledge. Render an "AI-generated, not from our guidance" notice when `false`.
+- `grounded` — `true` = steps built from retrieved corpus sources; `false` = an **ungrounded
+  fallback** generated from the model's general knowledge. Render an "AI-generated, not from
+  our guidance" notice when `false`.
+- `source` — a clearer companion to `grounded`: `CORPUS` (grounded) or `UNGROUNDED_AI`
+  (fallback). Use it to drive frontend display.
+- `citations` on each step carry the resolved corpus sources for corpus-generated output, and
+  are `[]` for ungrounded fallback output. The frontend controls whether the field is fetched
+  via GraphQL selection — steps are **not** forced to include it.
 
-> **No-guidance behaviour (role-gated).** When the query retrieves nothing that clears the
-> rerank relevance floor:
-> - **Support persons** get the ungrounded fallback — steps are still returned, with
->   `grounded: false` and no citations.
-> - **All other callers** (e.g. primary users / care recipients) get a **`NotFoundError`**
->   (`message: "no relevant guidance found for this task"`); `data.createAiTask` is null and
->   nothing is generated. See [Error handling](#error-handling).
+> **No-guidance behaviour (input-controlled).** When the query retrieves nothing that clears the
+> rerank relevance floor, `groundingMode` decides what happens — the caller's Cognito role is
+> **not** consulted:
+> - **`GROUNDED_ONLY`** (default) → a **`NotFoundError`** (`message: "no relevant guidance found
+>   for this task"`); `data.createAiTask` is null and the Bedrock Converse generation model is
+>   **never called**. See [Error handling](#error-handling).
+> - **`ALLOW_UNGROUNDED_FALLBACK`** → the ungrounded fallback runs: steps are returned with
+>   `grounded: false`, `source: UNGROUNDED_AI`, and empty `citations`.
 >
-> When guidance is found the steps are built from the corpus and `grounded: true`. Because
-> it persists nothing, the result is a throwaway preview: re-running the same `query` may
-> yield different wording.
+> When guidance **is** found, the steps are built from the corpus with `grounded: true` and
+> `source: CORPUS` — regardless of `groundingMode`. Because it persists nothing, the result is a
+> throwaway preview: re-running the same `query` may yield different wording.
 
 ```graphql
 mutation CreateAiTask($input: CreateAiTaskInput!) {
   createAiTask(input: $input) {
     title
-    steps { text }
+    steps {
+      text
+      citations { chunkId title url snippet }
+    }
     grounded
+    source
     inputTokens
     outputTokens
   }

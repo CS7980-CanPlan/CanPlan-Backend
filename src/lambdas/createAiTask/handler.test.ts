@@ -27,6 +27,7 @@ beforeEach(() => {
       { text: 'Use soap.', citations: [] },
     ],
     grounded: true,
+    source: 'CORPUS',
     usage: { inputTokens: 5, outputTokens: 9 },
   });
 });
@@ -34,14 +35,22 @@ beforeEach(() => {
 afterEach(() => jest.clearAllMocks());
 
 describe('createAiTask handler', () => {
-  it('returns the generated title and text-only steps without persisting anything', async () => {
+  it('returns the generated title, steps with citations, and source without persisting', async () => {
     const result = await handler(makeEvent({ query: 'wash my hands' }));
-    expect(mockGenerate).toHaveBeenCalledWith('wash my hands', { allowFallback: false });
-    // Returns the AI title and text-only steps (citations dropped, no step/task ids).
+    // Default grounding mode is GROUNDED_ONLY; no requested step count.
+    expect(mockGenerate).toHaveBeenCalledWith('wash my hands', {
+      groundingMode: 'GROUNDED_ONLY',
+      stepCount: undefined,
+    });
+    // Corpus-generated: grounded true, source CORPUS, citations preserved per step.
     expect(result).toEqual({
       title: 'Wash your hands',
-      steps: [{ text: 'Wet your hands.' }, { text: 'Use soap.' }],
+      steps: [
+        { text: 'Wet your hands.', citations: [{ chunkId: 'c1', title: 't', snippet: 's' }] },
+        { text: 'Use soap.', citations: [] },
+      ],
       grounded: true,
+      source: 'CORPUS',
       inputTokens: 5,
       outputTokens: 9,
     });
@@ -49,31 +58,67 @@ describe('createAiTask handler', () => {
     expect(mockPersist).not.toHaveBeenCalled();
   });
 
-  it('allows the ungrounded fallback only for support persons', async () => {
-    await handler(makeEvent({ query: 'scramble eggs' }, 'owner-1', ['SupportPerson']));
-    expect(mockGenerate).toHaveBeenCalledWith('scramble eggs', { allowFallback: true });
+  it('passes ALLOW_UNGROUNDED_FALLBACK through for any authenticated user (not only SupportPerson)', async () => {
+    await handler(
+      makeEvent({ query: 'scramble eggs', groundingMode: 'ALLOW_UNGROUNDED_FALLBACK' }, 'owner-1', [
+        'PrimaryUser',
+      ]),
+    );
+    expect(mockGenerate).toHaveBeenCalledWith('scramble eggs', {
+      groundingMode: 'ALLOW_UNGROUNDED_FALLBACK',
+      stepCount: undefined,
+    });
   });
 
-  it('does not allow the fallback for a primary user (care recipient)', async () => {
-    await handler(makeEvent({ query: 'wash my hands' }, 'owner-1', ['PrimaryUser']));
-    expect(mockGenerate).toHaveBeenCalledWith('wash my hands', { allowFallback: false });
+  it('no longer treats the SupportPerson group as special — mode still defaults to GROUNDED_ONLY', async () => {
+    await handler(makeEvent({ query: 'wash my hands' }, 'owner-1', ['SupportPerson']));
+    expect(mockGenerate).toHaveBeenCalledWith('wash my hands', {
+      groundingMode: 'GROUNDED_ONLY',
+      stepCount: undefined,
+    });
   });
 
-  it('passes through grounded:false from an ungrounded fallback', async () => {
+  it('returns source UNGROUNDED_AI, grounded false, and empty citations for an ungrounded fallback', async () => {
     mockGenerate.mockResolvedValue({
       title: 'Scramble eggs',
       steps: [{ text: 'Crack the eggs.', citations: [] }],
       grounded: false,
+      source: 'UNGROUNDED_AI',
       usage: { inputTokens: 3, outputTokens: 7 },
     });
-    const result = await handler(makeEvent({ query: 'scramble eggs' }, 'owner-1', ['SupportPerson']));
+    const result = await handler(
+      makeEvent({ query: 'scramble eggs', groundingMode: 'ALLOW_UNGROUNDED_FALLBACK' }),
+    );
     expect(result.grounded).toBe(false);
-    expect(result.steps).toEqual([{ text: 'Crack the eggs.' }]);
+    expect(result.source).toBe('UNGROUNDED_AI');
+    expect(result.steps).toEqual([{ text: 'Crack the eggs.', citations: [] }]);
   });
 
-  it('does not persist even when a categoryId is supplied', async () => {
-    await handler(makeEvent({ query: 'wash my hands', categoryId: 'cat-9' }));
-    expect(mockPersist).not.toHaveBeenCalled();
+  it('accepts stepCount 1 and 20 and passes them through', async () => {
+    await handler(makeEvent({ query: 'wash my hands', stepCount: 1 }));
+    expect(mockGenerate).toHaveBeenCalledWith('wash my hands', {
+      groundingMode: 'GROUNDED_ONLY',
+      stepCount: 1,
+    });
+    await handler(makeEvent({ query: 'wash my hands', stepCount: 20 }));
+    expect(mockGenerate).toHaveBeenLastCalledWith('wash my hands', {
+      groundingMode: 'GROUNDED_ONLY',
+      stepCount: 20,
+    });
+  });
+
+  it.each([0, -1, 21, 2.5])('throws ValidationError for invalid stepCount %p', async (stepCount) => {
+    await expect(handler(makeEvent({ query: 'wash my hands', stepCount }))).rejects.toThrow(
+      'stepCount',
+    );
+    expect(mockGenerate).not.toHaveBeenCalled();
+  });
+
+  it('throws ValidationError for an unknown groundingMode', async () => {
+    await expect(
+      handler(makeEvent({ query: 'wash my hands', groundingMode: 'NOPE' })),
+    ).rejects.toThrow('groundingMode');
+    expect(mockGenerate).not.toHaveBeenCalled();
   });
 
   it('throws UnauthorizedError when there is no identity', async () => {
