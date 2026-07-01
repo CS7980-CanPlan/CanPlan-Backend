@@ -73,6 +73,38 @@ export interface SupportLink {
   updatedAt?: string;
 }
 
+/**
+ * An organization a UserProfile.organizationId references. PK = ORG#<organizationId>,
+ * SK = #META. Managed by SystemAdmin-only admin APIs.
+ */
+export interface Organization {
+  organizationId: string;
+  name: string;
+  /**
+   * Internal, transient marker set while the organization is being deleted and its members'
+   * organizationId references are being removed. While present, new memberships may not point
+   * at it. Never exposed in the GraphQL Organization type.
+   */
+  deleting?: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * A strongly-consistent membership row: one per (organization, user), written in the SAME
+ * transaction as any UserProfile.organizationId set/clear so it always mirrors the profile's
+ * current org. PK = ORG#<organizationId>, SK = MEMBER#<userId>. It is the source of truth
+ * adminDeleteOrganization reads (a consistent Query of the org partition) to detach every member
+ * safely — the orgIndex GSI is eventually consistent and could miss a just-joined member. Purely
+ * internal: never exposed in GraphQL.
+ */
+export interface OrganizationMember {
+  organizationId: string;
+  userId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 /** A user-owned grouping for tasks (folder-like). PK = USER#<ownerId>, SK = CATEGORY#<categoryId>. */
 export interface Category {
   categoryId: string;
@@ -691,6 +723,26 @@ export interface AdminDeleteUserResult {
   deletedUserItems: number;
   deletedSupportLinks: number;
   deletedCognitoUser: boolean;
+}
+
+// ── Admin organization management (SystemAdmin-only) ──────────────────────────
+export interface CreateOrganizationInput {
+  name: string;
+}
+
+export interface UpdateOrganizationInput {
+  organizationId: string;
+  name: string;
+}
+
+export interface DeleteOrganizationInput {
+  organizationId: string;
+}
+
+/** Result of adminDeleteOrganization: the removed org plus how many members were detached. */
+export interface AdminDeleteOrganizationResult {
+  organization: Organization;
+  removedUsers: number;
 }
 
 /**
