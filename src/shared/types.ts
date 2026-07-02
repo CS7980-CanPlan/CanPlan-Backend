@@ -516,6 +516,7 @@ export interface SetTaskInstanceStepCompletionInput {
 /**
  * Set a TaskInstance's status. Accepts IN_PROGRESS, COMPLETED, SKIPPED (OVERDUE is derived
  * and rejected; CANCELLED uses cancelTaskInstance). COMPLETED requires all steps completed.
+ * A SKIPPED instance may be undone by setting it back to IN_PROGRESS.
  */
 export interface UpdateTaskInstanceStatusInput {
   userId: string;

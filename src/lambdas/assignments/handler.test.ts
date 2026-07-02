@@ -319,6 +319,18 @@ describe('updateTaskInstanceStatus', () => {
     expect(update.UpdateExpression).toContain('REMOVE completedAt, skippedAt');
   });
 
+  it('allows undoing SKIPPED back to IN_PROGRESS, clearing skippedAt', async () => {
+    db.instance = { status: 'SKIPPED', skippedAt: 'old-skip-time' };
+    const result = (await handler(
+      event('updateTaskInstanceStatus', { input: { ...base, status: 'IN_PROGRESS' } }),
+    )) as TaskInstance;
+    const update = byCommand('UpdateCommand')[0];
+    expect(update.UpdateExpression).toContain('#status = :status');
+    expect(update.UpdateExpression).toContain('startedAt = if_not_exists(startedAt, :now)');
+    expect(update.UpdateExpression).toContain('REMOVE completedAt, skippedAt');
+    expect(result.status).toBe('IN_PROGRESS');
+  });
+
   it('rejects COMPLETED while a step is incomplete', async () => {
     db.instance = { status: 'IN_PROGRESS' };
     mockQueryAllItems.mockResolvedValue([{ completed: true }, { completed: false }]);
@@ -333,6 +345,14 @@ describe('updateTaskInstanceStatus', () => {
     await expect(
       handler(event('updateTaskInstanceStatus', { input: { ...base, status: 'IN_PROGRESS' } })),
     ).rejects.toThrow('cannot change status of a COMPLETED instance');
+    expect(byCommand('UpdateCommand')).toHaveLength(0);
+  });
+
+  it('rejects changing SKIPPED to anything except IN_PROGRESS', async () => {
+    db.instance = { status: 'SKIPPED' };
+    await expect(
+      handler(event('updateTaskInstanceStatus', { input: { ...base, status: 'COMPLETED' } })),
+    ).rejects.toThrow('cannot change status of a SKIPPED instance');
     expect(byCommand('UpdateCommand')).toHaveLength(0);
   });
 

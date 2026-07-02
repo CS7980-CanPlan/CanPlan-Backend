@@ -338,7 +338,8 @@ async function setTaskInstanceStepCompletion(
 /**
  * Set a TaskInstance's status. Accepts IN_PROGRESS, COMPLETED, SKIPPED; OVERDUE is rejected
  * (derived) and CANCELLED must go through cancelTaskInstance. COMPLETED requires every step
- * complete (a zero-step instance may be completed).
+ * complete (a zero-step instance may be completed). SKIPPED may be undone by moving back to
+ * IN_PROGRESS; COMPLETED/CANCELLED remain frozen.
  */
 async function updateTaskInstanceStatus(input: UpdateTaskInstanceStatusInput): Promise<TaskInstance> {
   const userId = input?.userId?.trim();
@@ -359,8 +360,8 @@ async function updateTaskInstanceStatus(input: UpdateTaskInstanceStatusInput): P
   const parsed = parseInstanceId(instanceId);
   if (!parsed) throw new ValidationError(`invalid instanceId "${instanceId}"`);
 
-  // The instance must exist and not already be terminal — a COMPLETED/SKIPPED/CANCELLED
-  // instance is frozen (no rewinding it back to IN_PROGRESS).
+  // The instance must exist. Terminal instances are frozen except for the explicit "undo skip"
+  // transition, which moves SKIPPED back to IN_PROGRESS and clears skippedAt below.
   const instance = await getInstance(
     userId,
     parsed.scheduledDate,
@@ -369,7 +370,8 @@ async function updateTaskInstanceStatus(input: UpdateTaskInstanceStatusInput): P
   );
   if (!instance) throw new NotFoundError(`task instance ${instanceId} not found for user ${userId}`);
   const current = instance.status as PersistedTaskInstanceStatus;
-  if (TERMINAL_STATUSES.includes(current)) {
+  const isUndoSkip = current === 'SKIPPED' && status === 'IN_PROGRESS';
+  if (TERMINAL_STATUSES.includes(current) && !isUndoSkip) {
     throw new ValidationError(`cannot change status of a ${current} instance`);
   }
 

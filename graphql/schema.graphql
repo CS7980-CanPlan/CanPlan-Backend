@@ -563,6 +563,7 @@ input SetTaskInstanceStepCompletionInput {
 
 # Set a TaskInstance's status. Accepts IN_PROGRESS, COMPLETED, SKIPPED (OVERDUE rejected —
 # derived; CANCELLED uses cancelTaskInstance). COMPLETED requires all steps completed.
+# Undo skip by setting a SKIPPED instance back to IN_PROGRESS; COMPLETED/CANCELLED stay frozen.
 input UpdateTaskInstanceStatusInput {
   userId: ID!
   instanceId: ID!
@@ -822,7 +823,8 @@ type Mutation {
   startTaskInstance(input: StartTaskInstanceInput!): TaskInstance!
   # Toggle one instance step's completion. Rejected on a terminal (COMPLETED/SKIPPED/CANCELLED) instance.
   setTaskInstanceStepCompletion(input: SetTaskInstanceStepCompletionInput!): TaskInstanceStep!
-  # Set an instance's status (IN_PROGRESS/COMPLETED/SKIPPED). COMPLETED requires all steps complete.
+  # Set an instance's status (IN_PROGRESS/COMPLETED/SKIPPED). COMPLETED requires all steps complete;
+  # SKIPPED can be undone by setting IN_PROGRESS.
   updateTaskInstanceStatus(input: UpdateTaskInstanceStatusInput!): TaskInstance!
   # Cancel one occurrence — writes a CANCELLED, isException TaskInstance (creating it if needed).
   # Rejected on a terminal (COMPLETED/SKIPPED/CANCELLED) instance.
