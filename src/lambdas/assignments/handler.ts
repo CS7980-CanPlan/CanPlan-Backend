@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import {
+  BatchGetCommand,
   GetCommand,
   PutCommand,
   QueryCommand,
@@ -8,6 +9,7 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import { DateTime } from 'luxon';
 import { presentAssignment } from '../../shared/assignment';
+import { requireCaller } from '../../shared/authz';
 import { queryAllItems } from '../../shared/batch';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import {
@@ -20,6 +22,7 @@ import {
   taskAssignmentSk,
   taskInstanceId,
   taskInstanceSk,
+  taskInstanceSkFromId,
   taskInstanceStepPrefix,
   taskInstanceStepSk,
   taskPk,
@@ -46,6 +49,7 @@ import type {
   StartTaskInstanceInput,
   TaskAssignment,
   TaskInstance,
+  TaskInstanceLookupResult,
   TaskInstanceStatus,
   TaskInstanceStep,
   TaskInstanceView,
@@ -63,13 +67,19 @@ const SETTABLE_INSTANCE_STATUSES: readonly TaskInstanceStatus[] = ['IN_PROGRESS'
 /** A TaskInstance is terminal (frozen) once it reaches one of these. */
 const TERMINAL_STATUSES: readonly PersistedTaskInstanceStatus[] = ['COMPLETED', 'SKIPPED', 'CANCELLED'];
 
+/** batchGetTaskInstances accepts at most this many ids per request (also DynamoDB's BatchGet cap). */
+const MAX_BATCH_GET_INSTANCES = 100;
+
 type SchedulingResult =
   | TaskAssignment
   | TaskInstance
   | TaskInstanceStep
   | Connection<TaskAssignment>
+  | Connection<TaskInstance>
   | Connection<TaskInstanceStep>
-  | Connection<TaskInstanceView>;
+  | Connection<TaskInstanceView>
+  | TaskInstanceLookupResult[]
+  | null;
 
 /**
  * Scheduling domain Lambda — TaskAssignment (schedule rules), TaskInstance (concrete
@@ -103,6 +113,17 @@ export const handler = async (
         args.startDate as string,
         args.endDate as string,
       );
+    case 'getTaskInstance':
+      return getTaskInstance(identity, args.instanceId as string);
+    case 'listTaskInstances':
+      return listTaskInstances(
+        identity,
+        args.startDate as string,
+        args.endDate as string,
+        pageArgs(args),
+      );
+    case 'batchGetTaskInstances':
+      return batchGetTaskInstances(identity, args.instanceIds as string[]);
     case 'listTaskInstanceSteps':
       return listTaskInstanceSteps(args.userId as string, args.instanceId as string, pageArgs(args));
     default:
@@ -675,6 +696,101 @@ async function getTaskInstanceViews(
   return { items: views, nextToken: null };
 }
 
+/**
+ * getTaskInstance — read ONE of the caller's own materialized TaskInstances by instanceId. The
+ * owner is the authenticated caller (Cognito `sub`); no userId is accepted, so a caller can only
+ * read their own rows (delegated access is intentionally out of scope). Returns null when the
+ * instance doesn't exist for the caller. `status` is derived like getTaskInstanceViews.
+ */
+async function getTaskInstance(
+  identity: AppSyncIdentity | undefined,
+  instanceId: string,
+): Promise<TaskInstance | null> {
+  const userId = requireCaller(identity);
+  const id = instanceId?.trim();
+  if (!id) throw new ValidationError('instanceId is required and cannot be empty');
+  const parsed = parseInstanceId(id);
+  if (!parsed) throw new ValidationError(`invalid instanceId "${id}"`);
+
+  const item = await getInstance(userId, parsed.scheduledDate, parsed.scheduledTime, parsed.assignmentId);
+  if (!item) return null;
+  return presentInstanceRead(item, Date.now());
+}
+
+/**
+ * listTaskInstances — the caller's own real/materialized TaskInstances whose scheduledDate falls
+ * in [startDate, endDate]. The owner is the authenticated caller (no userId argument). Unlike
+ * getTaskInstanceViews this returns ONLY rows that exist in DynamoDB — it never synthesizes
+ * virtual occurrences — and is truly paginated via the opaque nextToken. `status` is derived
+ * (a past-due non-terminal instance surfaces as OVERDUE; the stored row is never rewritten).
+ */
+async function listTaskInstances(
+  identity: AppSyncIdentity | undefined,
+  startDate: string,
+  endDate: string,
+  page: PageArgs,
+): Promise<Connection<TaskInstance>> {
+  const userId = requireCaller(identity);
+  const { start, end } = validateDateRange(startDate, endDate);
+
+  // Date-sorted SK ⇒ one BETWEEN scopes the USER#<userId> partition to instance rows in the
+  // window; the TASK_INSTANCE#…#￿ upper bound stays below TASK_INSTANCE_STEP# so step rows never leak in.
+  const result = await queryPage<Record<string, unknown>>(
+    {
+      TableName: TABLE_NAME,
+      KeyConditionExpression: 'PK = :pk AND SK BETWEEN :lo AND :hi',
+      ExpressionAttributeValues: {
+        ':pk': userPk(userId),
+        ':lo': `${TASK_INSTANCE_PREFIX}${start}`,
+        ':hi': `${TASK_INSTANCE_PREFIX}${end}#￿`,
+      },
+    },
+    page,
+  );
+  const nowMs = Date.now();
+  return {
+    items: result.items.map((item) => presentInstanceRead(item, nowMs)),
+    nextToken: result.nextToken,
+  };
+}
+
+/**
+ * batchGetTaskInstances — read up to 100 of the caller's own materialized TaskInstances by id in
+ * one shot. The owner is the authenticated caller (no userId argument). Returns one result per
+ * requested id, in the SAME order, with `item: null` for ids that don't exist for the caller.
+ * Invalid ids are rejected before any IO. `status` is derived (OVERDUE surfaced).
+ */
+async function batchGetTaskInstances(
+  identity: AppSyncIdentity | undefined,
+  instanceIds: string[],
+): Promise<TaskInstanceLookupResult[]> {
+  const userId = requireCaller(identity);
+  if (!Array.isArray(instanceIds) || instanceIds.length === 0) {
+    throw new ValidationError('instanceIds is required and cannot be empty');
+  }
+  if (instanceIds.length > MAX_BATCH_GET_INSTANCES) {
+    throw new ValidationError(`instanceIds may contain at most ${MAX_BATCH_GET_INSTANCES} ids`);
+  }
+
+  // Validate every id up front and map it to its SK (the id↔SK mapping is a bijection). Fetch
+  // only the unique SKs — duplicate ids in the request resolve from the same fetched row.
+  const requested = instanceIds.map((raw) => {
+    const id = raw?.trim();
+    if (!id) throw new ValidationError('instanceId is required and cannot be empty');
+    const sk = taskInstanceSkFromId(id);
+    if (!sk) throw new ValidationError(`invalid instanceId "${id}"`);
+    return { id, sk };
+  });
+
+  const bySk = await batchGetInstances(userId, [...new Set(requested.map((r) => r.sk))]);
+
+  const nowMs = Date.now();
+  return requested.map(({ id, sk }) => {
+    const item = bySk.get(sk);
+    return { instanceId: id, item: item ? presentInstanceRead(item, nowMs) : null };
+  });
+}
+
 async function listTaskInstanceSteps(
   userId: string,
   instanceId: string,
@@ -778,6 +894,39 @@ async function queryInstancesInRange(
   return items;
 }
 
+/**
+ * BatchGet the caller's TaskInstance rows for the given SKs, keyed by SK (missing rows are simply
+ * absent from the map). Chunks at DynamoDB's 100-key BatchGet ceiling and retries throttling-driven
+ * UnprocessedKeys under a bounded budget, mirroring batchDelete/batchPut in the shared batch helper.
+ */
+async function batchGetInstances(
+  userId: string,
+  sks: string[],
+): Promise<Map<string, Record<string, unknown>>> {
+  const found = new Map<string, Record<string, unknown>>();
+  for (let i = 0; i < sks.length; i += MAX_BATCH_GET_INSTANCES) {
+    let keys: Record<string, unknown>[] = sks
+      .slice(i, i + MAX_BATCH_GET_INSTANCES)
+      .map((sk) => ({ PK: userPk(userId), SK: sk }));
+    // Bounded retry for throttling-driven UnprocessedKeys (no infinite loop).
+    for (let attempt = 0; attempt < 8 && keys.length; attempt++) {
+      const result = await dynamo.send(
+        new BatchGetCommand({ RequestItems: { [TABLE_NAME]: { Keys: keys } } }),
+      );
+      for (const item of (result.Responses?.[TABLE_NAME] as Record<string, unknown>[]) ?? []) {
+        found.set(item.SK as string, item);
+      }
+      keys = (result.UnprocessedKeys?.[TABLE_NAME]?.Keys as Record<string, unknown>[]) ?? [];
+    }
+    if (keys.length) {
+      throw new Error(
+        `batchGetTaskInstances: ${keys.length} key(s) still unprocessed after retries`,
+      );
+    }
+  }
+  return found;
+}
+
 /** Fetch the titles of the given tasks, keyed by taskId (missing/deleted tasks are omitted). */
 async function loadTaskTitles(taskIds: string[]): Promise<Map<string, string>> {
   const titles = new Map<string, string>();
@@ -838,7 +987,8 @@ function viewFromInstance(
     scheduledTime: inst.scheduledTime,
     scheduledFor: inst.scheduledFor,
     timezone: inst.timezone,
-    status: deriveInstanceStatus(inst.status, inst.scheduledFor, nowMs),
+    // A stored row's status is always persisted (never the derived OVERDUE).
+    status: deriveInstanceStatus(inst.status as PersistedTaskInstanceStatus, inst.scheduledFor, nowMs),
     isVirtual: false,
     isException: inst.isException ?? false,
   };
@@ -856,4 +1006,22 @@ function stripStorage(item: Record<string, unknown>): Record<string, unknown> {
 /** Project a stored TaskInstance row into the API shape (storage attributes stripped). */
 function presentInstance(item: Record<string, unknown>): TaskInstance {
   return stripStorage(item) as unknown as TaskInstance;
+}
+
+/**
+ * Project a stored TaskInstance row for the read APIs (getTaskInstance/listTaskInstances/
+ * batchGetTaskInstances): strip storage attributes AND derive `status` the same way
+ * getTaskInstanceViews does — a past-due non-terminal instance surfaces as OVERDUE, terminal
+ * statuses pass through unchanged. OVERDUE is never written back to DynamoDB.
+ */
+function presentInstanceRead(item: Record<string, unknown>, nowMs: number): TaskInstance {
+  const instance = presentInstance(item);
+  // A stored row's status is always persisted; deriveInstanceStatus may widen it to OVERDUE,
+  // which TaskInstance.status (TaskInstanceStatus) now permits — no cast on the result needed.
+  const status = deriveInstanceStatus(
+    instance.status as PersistedTaskInstanceStatus,
+    instance.scheduledFor,
+    nowMs,
+  );
+  return { ...instance, status };
 }

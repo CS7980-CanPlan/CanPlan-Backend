@@ -133,6 +133,9 @@ export class Api extends Construct {
       { typeName: 'Mutation', fieldName: 'deleteTaskAssignment' },
       { typeName: 'Query', fieldName: 'listTaskAssignmentsForUser' },
       { typeName: 'Query', fieldName: 'getTaskInstanceViews' },
+      { typeName: 'Query', fieldName: 'getTaskInstance' },
+      { typeName: 'Query', fieldName: 'listTaskInstances' },
+      { typeName: 'Query', fieldName: 'batchGetTaskInstances' },
       { typeName: 'Query', fieldName: 'listTaskInstanceSteps' },
     ]);
 

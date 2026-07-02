@@ -493,6 +493,255 @@ describe('listTaskAssignmentsForUser', () => {
   });
 });
 
+// ── getTaskInstance / listTaskInstances / batchGetTaskInstances (self-scoped reads) ──
+/** A stored TaskInstance row (with PK/SK/entityType), overridable per test. */
+const storedInstance = (over: Rec = {}): Rec => ({
+  instanceId: 'a1#2099-07-02#09:00',
+  assignmentId: 'a1',
+  taskId: 't1',
+  userId: 'u1',
+  scheduledDate: '2099-07-02',
+  scheduledTime: '09:00',
+  scheduledFor: '2099-07-02T09:00:00.000Z',
+  timezone: 'UTC',
+  status: 'IN_PROGRESS',
+  PK: 'USER#u1',
+  SK: 'TASK_INSTANCE#2099-07-02#09:00#a1',
+  entityType: 'TaskInstance',
+  createdAt: 'x',
+  ...over,
+});
+
+/** An event with NO authenticated identity (for the unauthenticated-caller checks). */
+function anonEvent(fieldName: string, args: Record<string, unknown>) {
+  return { arguments: args, info: { fieldName } } as Parameters<typeof handler>[0];
+}
+
+describe('getTaskInstance', () => {
+  it("returns the caller's own instance, keyed under USER#<sub>, with storage stripped", async () => {
+    db.instance = storedInstance();
+    const result = (await handler(
+      event('getTaskInstance', { instanceId: 'a1#2099-07-02#09:00' }, 'u1'),
+    )) as TaskInstance;
+
+    expect(inputs()[0].Key).toEqual({ PK: 'USER#u1', SK: 'TASK_INSTANCE#2099-07-02#09:00#a1' });
+    expect(result.instanceId).toBe('a1#2099-07-02#09:00');
+    expect(result.status).toBe('IN_PROGRESS');
+    expect((result as Rec).PK).toBeUndefined();
+    expect((result as Rec).SK).toBeUndefined();
+    expect((result as Rec).entityType).toBeUndefined();
+  });
+
+  it('returns null when the instance does not exist', async () => {
+    db.instance = undefined;
+    const result = await handler(event('getTaskInstance', { instanceId: 'a1#2099-07-02#09:00' }, 'u1'));
+    expect(result).toBeNull();
+  });
+
+  it('rejects an invalid instanceId without reading DynamoDB', async () => {
+    await expect(handler(event('getTaskInstance', { instanceId: 'not-a-valid-id' }, 'u1'))).rejects.toThrow(
+      'invalid instanceId',
+    );
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unauthenticated caller', async () => {
+    await expect(
+      handler(anonEvent('getTaskInstance', { instanceId: 'a1#2099-07-02#09:00' })),
+    ).rejects.toThrow('authenticated user is required');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('uses the caller sub, never a client-provided userId', async () => {
+    db.instance = storedInstance();
+    await handler(
+      event('getTaskInstance', { instanceId: 'a1#2099-07-02#09:00', userId: 'attacker' }, 'u1'),
+    );
+    // The row is read from the CALLER's partition, not the injected userId.
+    expect(inputs()[0].Key.PK).toBe('USER#u1');
+  });
+});
+
+describe('listTaskInstances', () => {
+  it('queries only USER#<sub> with a TASK_INSTANCE# date-range BETWEEN', async () => {
+    db.instancesInRange = [storedInstance()];
+    const result = (await handler(
+      event('listTaskInstances', { startDate: '2099-07-01', endDate: '2099-07-03' }, 'u1'),
+    )) as Connection<TaskInstance>;
+
+    const q = inputs()[0];
+    expect(q.KeyConditionExpression).toBe('PK = :pk AND SK BETWEEN :lo AND :hi');
+    expect(q.ExpressionAttributeValues[':pk']).toBe('USER#u1');
+    expect(q.ExpressionAttributeValues[':lo']).toBe('TASK_INSTANCE#2099-07-01');
+    expect(q.ExpressionAttributeValues[':hi']).toBe('TASK_INSTANCE#2099-07-03#￿');
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0].instanceId).toBe('a1#2099-07-02#09:00');
+    expect((result.items[0] as Rec).PK).toBeUndefined();
+  });
+
+  it('supports limit and round-trips an opaque nextToken', async () => {
+    const startKey = { PK: 'USER#u1', SK: 'TASK_INSTANCE#2099-07-02#09:00#a1' };
+    const inToken = Buffer.from(JSON.stringify(startKey), 'utf8').toString('base64');
+    mockSend.mockImplementation((command: { constructor: { name: string }; input: Rec }) => {
+      if (command.constructor.name === 'QueryCommand') {
+        return Promise.resolve({
+          Items: [storedInstance()],
+          LastEvaluatedKey: { PK: 'USER#u1', SK: 'TASK_INSTANCE#2099-07-03#09:00#a1' },
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    const result = (await handler(
+      event('listTaskInstances', { startDate: '2099-07-01', endDate: '2099-07-10', limit: 5, nextToken: inToken }, 'u1'),
+    )) as Connection<TaskInstance>;
+
+    const q = inputs()[0];
+    expect(q.Limit).toBe(5);
+    expect(q.ExclusiveStartKey).toEqual(startKey);
+    expect(result.nextToken).toBe(
+      Buffer.from(JSON.stringify({ PK: 'USER#u1', SK: 'TASK_INSTANCE#2099-07-03#09:00#a1' }), 'utf8').toString('base64'),
+    );
+  });
+
+  it('rejects date ranges beyond the existing max span', async () => {
+    await expect(
+      handler(event('listTaskInstances', { startDate: '2026-01-01', endDate: '2030-01-01' }, 'u1')),
+    ).rejects.toThrow('at most 370 days');
+  });
+
+  it('never synthesizes virtual occurrences (returns only real rows)', async () => {
+    // An active recurring assignment exists, but listTaskInstances must ignore it entirely.
+    mockQueryAllItems.mockResolvedValue([RECURRING]);
+    db.instancesInRange = [];
+    const result = (await handler(
+      event('listTaskInstances', { startDate: '2099-07-01', endDate: '2099-07-03' }, 'u1'),
+    )) as Connection<TaskInstance>;
+    expect(result.items).toHaveLength(0);
+    expect(mockQueryAllItems).not.toHaveBeenCalled(); // no assignment expansion happens
+  });
+
+  it('rejects an unauthenticated caller', async () => {
+    await expect(
+      handler(anonEvent('listTaskInstances', { startDate: '2099-07-01', endDate: '2099-07-03' })),
+    ).rejects.toThrow('authenticated user is required');
+  });
+});
+
+describe('batchGetTaskInstances', () => {
+  /** Mock BatchGetCommand against an in-memory store keyed by SK. */
+  function withStore(store: Record<string, Rec>) {
+    mockSend.mockImplementation((command: { constructor: { name: string }; input: Rec }) => {
+      if (command.constructor.name === 'BatchGetCommand') {
+        const keys: Rec[] = command.input.RequestItems['CanPlan-test'].Keys;
+        const items = keys.map((k) => store[k.SK]).filter(Boolean);
+        return Promise.resolve({ Responses: { 'CanPlan-test': items } });
+      }
+      return Promise.resolve({});
+    });
+  }
+  const A = 'a1#2099-07-02#09:00';
+  const skA = 'TASK_INSTANCE#2099-07-02#09:00#a1';
+  const B = 'a2#2099-07-05#10:00';
+  const skB = 'TASK_INSTANCE#2099-07-05#10:00#a2';
+
+  it('returns results in the SAME order as the requested ids', async () => {
+    withStore({
+      [skA]: storedInstance(),
+      [skB]: storedInstance({ instanceId: B, assignmentId: 'a2', scheduledDate: '2099-07-05', scheduledTime: '10:00', PK: 'USER#u1', SK: skB, scheduledFor: '2099-07-05T10:00:00.000Z' }),
+    });
+    const result = (await handler(
+      event('batchGetTaskInstances', { instanceIds: [B, A] }, 'u1'),
+    )) as { instanceId: string; item: TaskInstance | null }[];
+
+    expect(result.map((r) => r.instanceId)).toEqual([B, A]);
+    expect(result[0].item?.instanceId).toBe(B);
+    expect(result[1].item?.instanceId).toBe(A);
+    expect((result[0].item as Rec).PK).toBeUndefined();
+  });
+
+  it('returns { item: null } for ids that do not exist for the caller', async () => {
+    withStore({ [skA]: storedInstance() });
+    const missing = 'a9#2099-07-09#11:00';
+    const result = (await handler(
+      event('batchGetTaskInstances', { instanceIds: [A, missing] }, 'u1'),
+    )) as { instanceId: string; item: TaskInstance | null }[];
+    expect(result[0].item?.instanceId).toBe(A);
+    expect(result[1]).toEqual({ instanceId: missing, item: null });
+  });
+
+  it('reads only from USER#<sub> (caller partition)', async () => {
+    withStore({ [skA]: storedInstance() });
+    await handler(event('batchGetTaskInstances', { instanceIds: [A, B] }, 'u1'));
+    const keys: Rec[] = byCommand('BatchGetCommand')[0].RequestItems['CanPlan-test'].Keys;
+    expect(keys.every((k) => k.PK === 'USER#u1')).toBe(true);
+  });
+
+  it('rejects an empty instanceIds list without any read', async () => {
+    await expect(handler(event('batchGetTaskInstances', { instanceIds: [] }, 'u1'))).rejects.toThrow(
+      'cannot be empty',
+    );
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('rejects more than 100 ids', async () => {
+    const ids = Array.from({ length: 101 }, (_, i) => `a1#2099-07-02#${String(i).padStart(2, '0')}:00`);
+    await expect(handler(event('batchGetTaskInstances', { instanceIds: ids }, 'u1'))).rejects.toThrow(
+      'at most 100',
+    );
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('rejects an invalid instanceId without reading DynamoDB', async () => {
+    await expect(
+      handler(event('batchGetTaskInstances', { instanceIds: [A, 'garbage'] }, 'u1')),
+    ).rejects.toThrow('invalid instanceId');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unauthenticated caller', async () => {
+    await expect(handler(anonEvent('batchGetTaskInstances', { instanceIds: [A] }))).rejects.toThrow(
+      'authenticated user is required',
+    );
+  });
+});
+
+describe('read APIs derive OVERDUE consistently with getTaskInstanceViews', () => {
+  it('surfaces a past-due non-terminal instance as OVERDUE (without rewriting the row)', async () => {
+    db.instance = storedInstance({
+      instanceId: 'a1#2000-01-01#09:00',
+      scheduledDate: '2000-01-01',
+      scheduledFor: '2000-01-01T09:00:00.000Z',
+      status: 'IN_PROGRESS',
+      SK: 'TASK_INSTANCE#2000-01-01#09:00#a1',
+    });
+    const result = (await handler(
+      event('getTaskInstance', { instanceId: 'a1#2000-01-01#09:00' }, 'u1'),
+    )) as TaskInstance;
+    expect(result.status).toBe('OVERDUE');
+    // Read-only: no write command was issued.
+    expect(byCommand('UpdateCommand')).toHaveLength(0);
+    expect(byCommand('PutCommand')).toHaveLength(0);
+  });
+
+  it('leaves terminal statuses (COMPLETED/SKIPPED/CANCELLED) unchanged even when past-due', async () => {
+    for (const status of ['COMPLETED', 'SKIPPED', 'CANCELLED'] as const) {
+      jest.clearAllMocks();
+      db.instance = storedInstance({
+        instanceId: 'a1#2000-01-01#09:00',
+        scheduledDate: '2000-01-01',
+        scheduledFor: '2000-01-01T09:00:00.000Z',
+        status,
+        SK: 'TASK_INSTANCE#2000-01-01#09:00#a1',
+      });
+      const result = (await handler(
+        event('getTaskInstance', { instanceId: 'a1#2000-01-01#09:00' }, 'u1'),
+      )) as TaskInstance;
+      expect(result.status).toBe(status);
+    }
+  });
+});
+
 // ── routing + pure helper ─────────────────────────────────────────────────────
 describe('routing', () => {
   it('throws on an unsupported field', async () => {

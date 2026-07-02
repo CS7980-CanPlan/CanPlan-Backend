@@ -221,8 +221,13 @@ export interface TaskInstance {
   /** The occurrence's absolute ISO instant (scheduledDate + scheduledTime in `timezone`). */
   scheduledFor: string;
   timezone: string;
-  /** Persisted as TO_DO/IN_PROGRESS/COMPLETED/SKIPPED/CANCELLED; surfaced as TaskInstanceStatus. */
-  status: PersistedTaskInstanceStatus;
+  /**
+   * The API-facing status. A stored row only ever holds a PersistedTaskInstanceStatus
+   * (TO_DO/IN_PROGRESS/COMPLETED/SKIPPED/CANCELLED), but read paths surface a derived OVERDUE
+   * for a past-due non-terminal occurrence — so the public type is the full TaskInstanceStatus.
+   * Mutation/storage paths cast to PersistedTaskInstanceStatus (OVERDUE is never written back).
+   */
+  status: TaskInstanceStatus;
   startedAt?: string;
   completedAt?: string;
   skippedAt?: string;
@@ -269,6 +274,16 @@ export interface TaskInstanceView {
   status: TaskInstanceStatus;
   isVirtual: boolean;
   isException: boolean;
+}
+
+/**
+ * One entry of a batchGetTaskInstances result: the requested instanceId paired with the
+ * materialized TaskInstance, or `item: null` when no such instance exists for the caller.
+ * Entries are returned in the same order as the requested ids.
+ */
+export interface TaskInstanceLookupResult {
+  instanceId: string;
+  item: TaskInstance | null;
 }
 
 export interface MediaAsset {
