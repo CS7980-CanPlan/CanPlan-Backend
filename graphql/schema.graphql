@@ -437,26 +437,39 @@ input UnselectPrimaryUserInput {
   primaryUserId: ID!
 }
 
-# Create one of the caller's own categories. The owner is derived from the Cognito
-# identity — there is no ownerId. `name` may not be the reserved "No Category".
+# Create a category. `userId` is optional: omitted/null ⇒ the caller's own categories;
+# a non-self `userId` targets that primary user's categories and requires SupportPerson
+# delegated access (an ACTIVE SupportLink to that primary user in the same organization).
+# The created category is always owned by the target user. `name` may not be the reserved
+# "No Category".
 input CreateCategoryInput {
+  # Omitted/null ⇒ the caller. A non-self value requires SupportPerson delegated access.
+  userId: ID
   name: String!
   color: String
   sortOrder: Int
 }
 
-# Partial edit of one of the caller's own categories — at least one of name/color/
-# sortOrder is required. The default category's name cannot be changed (color/sortOrder
-# are allowed); a normal category cannot be renamed to the reserved "No Category".
+# Partial edit of a category — at least one of name/color/sortOrder is required. The default
+# category's name cannot be changed (color/sortOrder are allowed); a normal category cannot be
+# renamed to the reserved "No Category". `userId` is optional: omitted/null ⇒ the caller's own
+# category; a non-self `userId` targets that primary user's category and requires SupportPerson
+# delegated access.
 input UpdateCategoryInput {
+  # Omitted/null ⇒ the caller. A non-self value requires SupportPerson delegated access.
+  userId: ID
   categoryId: ID!
   name: String
   color: String
   sortOrder: Int
 }
 
-# Identifies one of the caller's own categories to delete. The default cannot be deleted.
+# Identifies a category to delete. The default cannot be deleted. `userId` is optional:
+# omitted/null ⇒ the caller's own category; a non-self `userId` targets that primary user's
+# category and requires SupportPerson delegated access.
 input DeleteCategoryInput {
+  # Omitted/null ⇒ the caller. A non-self value requires SupportPerson delegated access.
+  userId: ID
   categoryId: ID!
 }
 
@@ -869,8 +882,10 @@ type Query {
   # (supporterIndex, keyed on the caller's sub). Includes ACTIVE and REVOKED links.
   listMySupportList(limit: Int, nextToken: String): SupportLinkConnection!
 
-  # The authenticated caller's own categories (owner derived from the Cognito identity).
-  listMyCategories(limit: Int, nextToken: String): CategoryConnection!
+  # Categories for a user. `userId` is optional: omitted/null ⇒ the authenticated caller's own
+  # categories; a non-self `userId` lists that primary user's categories and requires SupportPerson
+  # delegated access (an ACTIVE SupportLink to that primary user in the same organization).
+  listMyCategories(userId: ID, limit: Int, nextToken: String): CategoryConnection!
 
   getTask(taskId: ID!): Task
   # A task's steps, sorted by ascending numeric `order`.
@@ -946,15 +961,18 @@ type Mutation {
   # SupportLink (status REVOKED), never a hard delete. Supporter = the authenticated caller.
   unselectPrimaryUser(input: UnselectPrimaryUserInput!): SupportLink!
 
-  # Create one of the caller's own task categories (owner derived from identity).
+  # Create a task category. By default the caller's own; a non-self `input.userId` creates it
+  # for that primary user and requires SupportPerson delegated access.
   createCategory(input: CreateCategoryInput!): Category
-  # Edit one of the caller's own categories (partial update). The default category's name
-  # is immutable; normal categories cannot take the reserved "No Category" name.
+  # Edit a category (partial update). By default the caller's own; a non-self `input.userId`
+  # targets that primary user's category (SupportPerson delegated access). The default
+  # category's name is immutable; normal categories cannot take the reserved "No Category" name.
   updateCategory(input: UpdateCategoryInput!): Category!
-  # Delete one of the caller's own NON-default categories. Every task in it is first moved
-  # to the owner's default category, then the category row is removed. Internally this may
-  # run across multiple batches for large categories; it is safe to retry. Returns the
-  # deleted category. The default category cannot be deleted.
+  # Delete a NON-default category. By default the caller's own; a non-self `input.userId`
+  # targets that primary user's category (SupportPerson delegated access). Every task in it is
+  # first moved to the target user's default category, then the category row is removed.
+  # Internally this may run across multiple batches for large categories; it is safe to retry.
+  # Returns the deleted category. The default category cannot be deleted.
   deleteCategory(input: DeleteCategoryInput!): Category!
 
   # Create a reusable task template (and optionally its ordered steps).

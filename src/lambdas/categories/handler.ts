@@ -8,6 +8,7 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import { requireCaller } from '../../shared/authz';
 import { categoryCountDelta, getDefaultCategoryId, getOwnedCategory } from '../../shared/category';
+import { assertCanActForUser } from '../../shared/delegation';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import {
   CATEGORY_PREFIX,
@@ -35,11 +36,15 @@ import type {
 } from '../../shared/types';
 
 /**
- * Categories domain Lambda — task categories that are PRIVATE to their owner, routed by
- * the resolved GraphQL field. The owner is always the authenticated caller
- * (event.identity.sub); no operation accepts a client-supplied owner id. Categories
- * share the USER#<ownerId> partition with the owner's other rows under a CATEGORY#
- * sort-key prefix.
+ * Categories domain Lambda — task categories keyed under their owner's USER#<ownerId>
+ * partition (under a CATEGORY# sort-key prefix), routed by the resolved GraphQL field.
+ *
+ * Ownership: each operation resolves a target owner from an optional `userId` — omitted/null
+ * means the authenticated caller (event.identity.sub); a non-self `userId` targets that
+ * primary user and is authorized via `assertCanActForUser` (SupportPerson delegated access:
+ * an ACTIVE SupportLink to a PRIMARY_USER in the same organization). Delegated writes always
+ * key rows under the target user's partition, never the SupportPerson's. There is no
+ * client-supplied ownerId beyond this delegation path.
  */
 export const handler = async (
   event: AppSyncEvent<Record<string, unknown>>,
@@ -49,7 +54,7 @@ export const handler = async (
     case 'createCategory':
       return createCategory(identity, args.input as CreateCategoryInput);
     case 'listMyCategories':
-      return listMyCategories(identity, pageArgs(args));
+      return listMyCategories(identity, pageArgs(args), args.userId as string | null | undefined);
     case 'updateCategory':
       return updateCategory(identity, args.input as UpdateCategoryInput);
     case 'deleteCategory':
@@ -70,11 +75,27 @@ function stripCategory(item: Category | Record<string, unknown>): Category {
   return out as unknown as Category;
 }
 
+/**
+ * Resolve whose categories an operation acts on and authorize it. An omitted/null/blank
+ * `requestedUserId` means the caller's own categories; a non-self value targets that primary
+ * user and requires SupportPerson delegated access (`assertCanActForUser`). Returns the
+ * resolved target owner id, which every DynamoDB key in the operation must be built from.
+ */
+async function resolveCategoryOwner(
+  identity: AppSyncIdentity | undefined,
+  requestedUserId?: string | null,
+): Promise<string> {
+  const caller = requireCaller(identity);
+  const target = requestedUserId?.trim() || caller;
+  await assertCanActForUser(identity, target);
+  return target;
+}
+
 async function createCategory(
   identity: AppSyncIdentity | undefined,
   input: CreateCategoryInput,
 ): Promise<Category> {
-  const ownerId = requireCaller(identity);
+  const ownerId = await resolveCategoryOwner(identity, input?.userId);
   const name = input?.name?.trim();
   if (!name) throw new ValidationError('name is required and cannot be empty');
   // The reserved default name is owned exclusively by the auto-created default category.
@@ -114,8 +135,9 @@ async function createCategory(
 async function listMyCategories(
   identity: AppSyncIdentity | undefined,
   page: PageArgs,
+  userIdArg?: string | null,
 ): Promise<Connection<Category>> {
-  const ownerId = requireCaller(identity);
+  const ownerId = await resolveCategoryOwner(identity, userIdArg);
   // SK begins_with CATEGORY# scopes the USER#<ownerId> partition to category rows
   // (excludes #PROFILE, TASK_ASSIGNMENT#, TASK_INSTANCE#, …).
   const result = await queryPage<Record<string, unknown>>(
@@ -130,7 +152,8 @@ async function listMyCategories(
 }
 
 /**
- * Edit one of the caller's own categories with a targeted UpdateCommand (NOT a full-item
+ * Edit a category (the caller's own, or a delegated primary user's — see `resolveCategoryOwner`)
+ * with a targeted UpdateCommand (NOT a full-item
  * Put) so internal state — `isDefault`, `taskCount`, `createdAt`, and especially an
  * in-progress `deleting` flag — is preserved. At least one of name/color/sortOrder must be
  * supplied (a field key being present counts, including explicit null).
@@ -147,7 +170,7 @@ async function updateCategory(
   identity: AppSyncIdentity | undefined,
   input: UpdateCategoryInput,
 ): Promise<Category> {
-  const ownerId = requireCaller(identity);
+  const ownerId = await resolveCategoryOwner(identity, input?.userId);
   const categoryId = input?.categoryId?.trim();
   if (!categoryId) throw new ValidationError('categoryId is required and cannot be empty');
 
@@ -228,7 +251,8 @@ async function updateCategory(
 }
 
 /**
- * Delete one of the caller's own NON-default categories, reparenting its tasks first.
+ * Delete a NON-default category (the caller's own, or a delegated primary user's — see
+ * `resolveCategoryOwner`), reparenting its tasks first to that owner's default category.
  *
  * Retry-safe, resumable, and SAFE despite the category GSI being eventually consistent (a
  * just-created Task may not appear in the GSI yet). A durable, transactionally-maintained
@@ -249,7 +273,7 @@ async function deleteCategory(
   identity: AppSyncIdentity | undefined,
   input: DeleteCategoryInput,
 ): Promise<Category> {
-  const ownerId = requireCaller(identity);
+  const ownerId = await resolveCategoryOwner(identity, input?.userId);
   const categoryId = input?.categoryId?.trim();
   if (!categoryId) throw new ValidationError('categoryId is required and cannot be empty');
 

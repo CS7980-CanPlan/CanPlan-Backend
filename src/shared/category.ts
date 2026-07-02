@@ -1,7 +1,8 @@
 // Category lookup + Task↔Category integrity helpers shared by createTask and the tasks
-// Lambda. Categories are private to their owner (PK = USER#<ownerId>, SK =
+// Lambda. Categories are owned by a user partition (PK = USER#<ownerId>, SK =
 // CATEGORY#<categoryId>), so "owned by ownerId" is enforced simply by reading under the
-// owner's partition — a foreign category id is never found here.
+// owner's partition — a foreign category id is never found here. (Callers first resolve
+// `ownerId`: their own by default, or a delegated primary user's via assertCanActForUser.)
 
 import { GetCommand } from '@aws-sdk/lib-dynamodb';
 import { dynamo, TABLE_NAME } from './dynamodb';

@@ -19,7 +19,7 @@ item-key conventions live in [src/shared/keys.ts](src/shared/keys.ts).
 | `healthCheck` | Query | AppSync none data source |
 | `createTask` | Mutation | `canplan-createTask-<env>` Lambda (writes Task + steps atomically) |
 | `createUserProfile`, `updateMyUserProfile`, `getUserProfile`, `listMyOrganizationUsers`, `selectPrimaryUser`, `unselectPrimaryUser`, `listMySupportList` | Query/Mutation | `canplan-users-<env>` Lambda + DynamoDB (createUserProfile also creates the user's default category atomically) |
-| `createCategory`, `updateCategory`, `deleteCategory`, `listMyCategories` | Query/Mutation | `canplan-categories-<env>` Lambda + DynamoDB (owner derived from the Cognito identity; deleteCategory reparents tasks to the default category) |
+| `createCategory`, `updateCategory`, `deleteCategory`, `listMyCategories` | Query/Mutation | `canplan-categories-<env>` Lambda + DynamoDB (self by default; optional `userId` lets a SupportPerson manage a selected primary user's categories via delegated access; deleteCategory reparents tasks to the target user's default category) |
 | `getTask`, `listTaskSteps`, `listTasksByOwner`, `listTasksByCategory`, `updateTask`, `createTaskStep`, `updateTaskStep`, `deleteTaskStep`, `reorderTaskSteps`, `deleteTask` | Query/Mutation | `canplan-tasks-<env>` Lambda + DynamoDB + S3 (media cleanup) |
 | `createTaskAssignment`, `startTaskInstance`, `setTaskInstanceStepCompletion`, `updateTaskInstanceStatus`, `cancelTaskInstance`, `endTaskAssignment`, `deleteTaskAssignment`, `listTaskAssignmentsForUser`, `getTaskInstanceViews`, `getTaskInstance`, `listTaskInstances`, `batchGetTaskInstances`, `listTaskInstanceSteps` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB (TaskAssignment schedule rules; lazily-materialized TaskInstances; calendar feed; self-scoped instance reads) |
 | `createMediaUploadUrl`, `createTaskCoverImageUploadUrl`, `createMediaAsset`, `deleteMediaAsset`, `getMediaDownloadUrl`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB + S3 media bucket (presigned upload/download, cover images, cascade delete) |
@@ -148,9 +148,13 @@ refresh their tokens or re-login after any group change** (invite, `setUserBaseR
 `color: "#64748B"`, `isDefault: true`) — a real Category row with its own UUID — in the same transaction, and
 stores its id on the profile (`defaultCategoryId`). Every Task belongs to a real Category;
 one created without an explicit `categoryId` is filed under this default. The default
-cannot be renamed or deleted. **Categories are private to their owner:** `createCategory`,
-`updateCategory`, `deleteCategory`, and `listMyCategories` all derive the owner from the
-Cognito identity and never accept a client-supplied owner id. Likewise `createTask` and
+cannot be renamed or deleted. **Categories are owned by a user's `USER#<ownerId>` partition.**
+`createCategory`, `updateCategory`, `deleteCategory`, and `listMyCategories` operate on the
+authenticated caller's own categories by default; each also accepts an optional `userId` that
+lets a **SupportPerson** manage a selected primary user's categories through delegated access
+(an ACTIVE SupportLink to that PRIMARY_USER in the same organization — see `assertCanActForUser`).
+Omitting `userId` (or passing your own) is unchanged self-access; a non-self `userId` keys and
+reparents rows under the **target user's** partition, never the SupportPerson's. Likewise `createTask` and
 `createAiTask` derive the task owner from the identity. Before using a profile's default category, runtime code
 strongly reads and verifies the profile pointer, owner, exact `No Category` name,
 `isDefault: true`, and that it is not being deleted; an invalid legacy row fails clearly

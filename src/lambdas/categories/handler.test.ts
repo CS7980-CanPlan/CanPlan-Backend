@@ -1,5 +1,7 @@
 import { handler } from './handler';
 import { dynamo } from '../../shared/dynamodb';
+import { assertCanActForUser } from '../../shared/delegation';
+import { UnauthorizedError } from '../../shared/response';
 import type { Category, Connection } from '../../shared/types';
 
 jest.mock('../../shared/dynamodb', () => ({
@@ -7,9 +9,21 @@ jest.mock('../../shared/dynamodb', () => ({
   TABLE_NAME: 'CanPlan-test',
 }));
 
-const mockSend = dynamo.send as jest.Mock;
+// Delegated-access authorization is exercised via its own unit tests; here we stub it so the
+// category handler can be tested for "does it authorize the right target and key rows under
+// that target's partition" without standing up SupportLink/profile fixtures.
+jest.mock('../../shared/delegation', () => ({
+  assertCanActForUser: jest.fn(),
+}));
 
-beforeEach(() => mockSend.mockResolvedValue({}));
+const mockSend = dynamo.send as jest.Mock;
+const mockAssert = assertCanActForUser as jest.Mock;
+
+beforeEach(() => {
+  mockSend.mockResolvedValue({});
+  // Default: authorization passes (self, or an authorized delegated target).
+  mockAssert.mockResolvedValue(undefined);
+});
 afterEach(() => jest.clearAllMocks());
 
 function event(fieldName: string, args: Record<string, unknown>, sub: string | null = 'owner-1') {
@@ -38,12 +52,43 @@ describe('categories handler — createCategory', () => {
     expect(Item.taskCount).toBe(0);
   });
 
-  it('ignores any client-supplied ownerId — only the identity is trusted', async () => {
+  it('ignores any client-supplied ownerId — use userId for the delegated target path', async () => {
     await handler(
       event('createCategory', { input: { ownerId: 'victim', name: 'X' } as Record<string, unknown> }, 'me'),
     );
     expect(firstInput().Item.ownerId).toBe('me');
     expect(firstInput().Item.PK).toBe('USER#me');
+  });
+
+  it('authorizes the caller against themselves when userId is omitted', async () => {
+    await handler(event('createCategory', { input: { name: 'X' } }, 'me'));
+    expect(mockAssert).toHaveBeenCalledWith(expect.objectContaining({ sub: 'me' }), 'me');
+    expect(firstInput().Item.PK).toBe('USER#me');
+  });
+
+  it('treats a self userId the same as omitting it', async () => {
+    await handler(event('createCategory', { input: { userId: 'me', name: 'X' } }, 'me'));
+    expect(mockAssert).toHaveBeenCalledWith(expect.objectContaining({ sub: 'me' }), 'me');
+    expect(firstInput().Item.ownerId).toBe('me');
+    expect(firstInput().Item.PK).toBe('USER#me');
+  });
+
+  it('delegated create keys the row under the TARGET user, not the SupportPerson', async () => {
+    const result = (await handler(
+      event('createCategory', { input: { userId: 'primary-1', name: 'Chores' } }, 'support-1'),
+    )) as Category;
+    expect(mockAssert).toHaveBeenCalledWith(expect.objectContaining({ sub: 'support-1' }), 'primary-1');
+    expect(firstInput().Item.PK).toBe('USER#primary-1');
+    expect(firstInput().Item.ownerId).toBe('primary-1');
+    expect(result.ownerId).toBe('primary-1');
+  });
+
+  it('rejects an unauthorized delegated create WITHOUT writing to DynamoDB', async () => {
+    mockAssert.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
+    await expect(
+      handler(event('createCategory', { input: { userId: 'victim', name: 'X' } }, 'support-1')),
+    ).rejects.toThrow('no active support link');
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
   it('trims name/color and stores sortOrder', async () => {
@@ -103,6 +148,24 @@ describe('categories handler — listMyCategories', () => {
     expect(item.PK).toBeUndefined();
     expect(item.deleting).toBeUndefined();
     expect(item.taskCount).toBeUndefined();
+  });
+
+  it('delegated list queries the TARGET user partition, not the SupportPerson', async () => {
+    mockSend.mockResolvedValueOnce({ Items: [] });
+    await handler(event('listMyCategories', { userId: 'primary-1' }, 'support-1'));
+    expect(mockAssert).toHaveBeenCalledWith(expect.objectContaining({ sub: 'support-1' }), 'primary-1');
+    expect(firstInput().ExpressionAttributeValues).toEqual({
+      ':pk': 'USER#primary-1',
+      ':prefix': 'CATEGORY#',
+    });
+  });
+
+  it('rejects an unauthorized delegated list WITHOUT querying DynamoDB', async () => {
+    mockAssert.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
+    await expect(
+      handler(event('listMyCategories', { userId: 'victim' }, 'support-1')),
+    ).rejects.toThrow('no active support link');
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
   it('rejects an unauthenticated caller', async () => {
@@ -219,6 +282,26 @@ describe('categories handler — updateCategory', () => {
     await expect(
       handler(event('updateCategory', { input: { categoryId: 'missing', color: '#000' } })),
     ).rejects.toThrow('category missing not found');
+  });
+
+  it('delegated update reads/writes the TARGET user partition, not the SupportPerson', async () => {
+    const targetNormal = { ...normal, PK: 'USER#primary-1', ownerId: 'primary-1' };
+    mockSend
+      .mockResolvedValueOnce({ Item: { ...targetNormal } }) // getOwnedCategory (target)
+      .mockResolvedValueOnce({ Attributes: { ...targetNormal, color: '#0f0' } }); // UpdateCommand
+    await handler(
+      event('updateCategory', { input: { userId: 'primary-1', categoryId: 'c1', color: '#0f0' } }, 'support-1'),
+    );
+    expect(mockAssert).toHaveBeenCalledWith(expect.objectContaining({ sub: 'support-1' }), 'primary-1');
+    expect(updateCmd()!.input.Key).toEqual({ PK: 'USER#primary-1', SK: 'CATEGORY#c1' });
+  });
+
+  it('rejects an unauthorized delegated update WITHOUT touching DynamoDB', async () => {
+    mockAssert.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
+    await expect(
+      handler(event('updateCategory', { input: { userId: 'victim', categoryId: 'c1', color: '#000' } }, 'support-1')),
+    ).rejects.toThrow('no active support link');
+    expect(mockSend).not.toHaveBeenCalled();
   });
 });
 
@@ -364,6 +447,44 @@ describe('categories handler — deleteCategory', () => {
     await expect(handler(event('deleteCategory', { input: { categoryId: 'c1' } }))).rejects.toThrow(
       'canceled',
     );
+  });
+
+  it('delegated delete reparents into the TARGET user default and keys every row under the target', async () => {
+    const targetNormal = { ...normal, PK: 'USER#primary-1', ownerId: 'primary-1', taskCount: 1 };
+    const targetDefault = { ...validDefault, PK: 'USER#primary-1', ownerId: 'primary-1' };
+    mockSend
+      .mockResolvedValueOnce({ Item: { ...targetNormal } }) // GET category (target)
+      .mockResolvedValueOnce({ Item: { userId: 'primary-1', defaultCategoryId: 'def-1' } }) // GET target profile
+      .mockResolvedValueOnce({ Item: targetDefault }) // strongly-consistent GET target default
+      .mockResolvedValueOnce({}) // Update set deleting
+      .mockResolvedValueOnce({ Items: [{ taskId: 't1', ownerId: 'primary-1', categoryId: 'c1' }] }) // Query
+      .mockResolvedValueOnce({}) // TransactWrite move t1
+      .mockResolvedValueOnce({ Item: { ...targetNormal, deleting: true, taskCount: 0 } }) // consistent read
+      .mockResolvedValueOnce({}); // Delete category
+
+    const result = (await handler(
+      event('deleteCategory', { input: { userId: 'primary-1', categoryId: 'c1' } }, 'support-1'),
+    )) as Category;
+
+    expect(mockAssert).toHaveBeenCalledWith(expect.objectContaining({ sub: 'support-1' }), 'primary-1');
+    const cmds = calls();
+    // The reparent query and move target the primary user's partition/default category.
+    const tx = cmds.find((c) => c.input.TransactItems)!.input.TransactItems;
+    expect(tx[0].Update.Key.PK).toBe('TASK#t1');
+    expect(tx[0].Update.ExpressionAttributeValues[':to']).toBe('def-1');
+    expect(tx[1].Update.Key.PK).toBe('USER#primary-1'); // source category count row
+    expect(tx[2].Update.Key.PK).toBe('USER#primary-1'); // target default count row
+    const del = cmds.find((c) => c.constructor.name === 'DeleteCommand')!;
+    expect(del.input.Key).toEqual({ PK: 'USER#primary-1', SK: 'CATEGORY#c1' });
+    expect(result.categoryId).toBe('c1');
+  });
+
+  it('rejects an unauthorized delegated delete WITHOUT touching DynamoDB', async () => {
+    mockAssert.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
+    await expect(
+      handler(event('deleteCategory', { input: { userId: 'victim', categoryId: 'c1' } }, 'support-1')),
+    ).rejects.toThrow('no active support link');
+    expect(mockSend).not.toHaveBeenCalled();
   });
 });
 

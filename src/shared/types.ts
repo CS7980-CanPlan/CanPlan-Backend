@@ -403,30 +403,39 @@ export interface UnselectPrimaryUserInput {
   primaryUserId: string;
 }
 
-// ownerId is intentionally absent — the owner is derived from the authenticated
-// Cognito identity (event.identity.sub), never client-supplied. Categories are private
-// to their owner.
+// `userId` is optional and selects whose categories to operate on: omitted/null ⇒ the
+// authenticated caller (event.identity.sub); a non-self value targets that primary user and
+// requires SupportPerson delegated access. The created category is always owned by the target
+// user. There is no client-supplied ownerId.
 export interface CreateCategoryInput {
+  userId?: string | null;
   name: string;
   color?: string;
   sortOrder?: number;
 }
 
 /**
- * Partial edit of one of the caller's own categories. At least one updatable field
- * (name, color, sortOrder) must be supplied. The default category's `name` may not be
- * changed (color/sortOrder are allowed); a normal category may not be renamed to the
- * reserved default name.
+ * Partial edit of a category. At least one updatable field (name, color, sortOrder) must be
+ * supplied. `userId` is optional: omitted/null ⇒ the caller's own category; a non-self value
+ * targets that primary user's category (SupportPerson delegated access). The default category's
+ * `name` may not be changed (color/sortOrder are allowed); a normal category may not be renamed
+ * to the reserved default name.
  */
 export interface UpdateCategoryInput {
+  userId?: string | null;
   categoryId: string;
   name?: string;
   color?: string;
   sortOrder?: number;
 }
 
-/** Identifies one of the caller's own categories to delete. The default cannot be deleted. */
+/**
+ * Identifies a category to delete. The default cannot be deleted. `userId` is optional:
+ * omitted/null ⇒ the caller's own category; a non-self value targets that primary user's
+ * category (SupportPerson delegated access).
+ */
 export interface DeleteCategoryInput {
+  userId?: string | null;
   categoryId: string;
 }
 

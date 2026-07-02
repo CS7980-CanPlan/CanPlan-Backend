@@ -12,9 +12,10 @@ _Last updated: 2026-07-01. Version: SupportPerson delegation + organization mana
 > - **Real default category.** Every profile now owns one real Category named
 >   `No Category` (`isDefault: true`), created with the profile; `Task.categoryId` is now
 >   non-null and always a real Category.
-> - **Categories are private to their owner.** `createCategory` no longer takes `ownerId`;
+> - **Categories are owned by a user partition.** `createCategory` no longer takes `ownerId`;
 >   `listCategoriesByOwner` is replaced by **`listMyCategories`**. New: **`updateCategory`**,
->   **`deleteCategory`**. The owner is always the caller's Cognito identity.
+>   **`deleteCategory`**. Each defaults to the caller's own categories; an optional `userId`
+>   lets a **SupportPerson** manage a selected primary user's categories (delegated access).
 > - **`createTask` no longer takes `ownerId`** (derived from the identity), and a supplied
 >   `categoryId` must be a real, owned category.
 > - **`TaskStep.description`** added; **`reorderTaskSteps`** mutation added.
@@ -492,15 +493,24 @@ fields are marked `!` and everything else is optional; see
 > Optional `permissions` (`AWSJSON`) is stored on the link. List your selections with
 > `listMySupportList`.
 >
-**Categories** (all **private to the caller** — the owner is the Cognito identity, never a
-client-supplied id)
+**Categories** (self by default; a SupportPerson may manage a selected primary user's
+categories via the optional `userId` — see below)
 
 | Operation | Input | Returns |
 |---|---|---|
-| `createCategory` | `input: { name!, color, sortOrder }` | `Category` · `name`/`color` trimmed; `categoryId` server-generated; `isDefault: false`. The reserved name `No Category` is rejected |
-| `listMyCategories` | `limit, nextToken` | `CategoryConnection!` — the caller's categories (incl. their `isDefault` default) |
-| `updateCategory` | `input: { categoryId!, name, color, sortOrder }` | `Category!` — partial edit; see below |
-| `deleteCategory` | `input: { categoryId! }` | `Category!` — the deleted (non-default) category; reparents its tasks first; see below |
+| `createCategory` | `input: { userId, name!, color, sortOrder }` | `Category` · `name`/`color` trimmed; `categoryId` server-generated; `isDefault: false`; owned by the target user. The reserved name `No Category` is rejected |
+| `listMyCategories` | `userId, limit, nextToken` | `CategoryConnection!` — the target user's categories (incl. their `isDefault` default) |
+| `updateCategory` | `input: { userId, categoryId!, name, color, sortOrder }` | `Category!` — partial edit; see below |
+| `deleteCategory` | `input: { userId, categoryId! }` | `Category!` — the deleted (non-default) category; reparents its tasks first; see below |
+
+> **Whose categories? (`userId`)** Every category operation resolves a target owner from an
+> optional `userId`: **omitted/null (or your own id) ⇒ your own categories** — unchanged from
+> before. A **non-self `userId`** targets that primary user's categories and requires
+> **SupportPerson delegated access**: an ACTIVE SupportLink to that `PRIMARY_USER` in the same
+> organization (the same rule as scheduling — `assertCanActForUser`). Anything else is
+> `NOT_AUTHORIZED` and performs **no** writes. Categories always remain owned by the **target
+> user's** partition — a delegated create/update/delete keys (and reparents) rows under the
+> primary user, never the SupportPerson.
 
 > **The default category.** Every user has exactly one default Category named
 > `No Category` with `color: "#64748B"` and `isDefault: true`, created atomically with their profile
@@ -511,8 +521,8 @@ client-supplied id)
 > default row before using it; malformed legacy data must be repaired by the migration.
 >
 > **`updateCategory` is a partial edit** — supply at least one of `name`, `color`,
-> `sortOrder` (a request with none is rejected). Located by `categoryId` under your own
-> partition (`NOT_FOUND` if it isn't yours / doesn't exist). For a normal category, `name`
+> `sortOrder` (a request with none is rejected). Located by `categoryId` under the target
+> user's partition (`NOT_FOUND` if it isn't theirs / doesn't exist). For a normal category, `name`
 > is trimmed, must be non-empty, and may not be the reserved `No Category`. For the
 > **default** category, supplying `name` at all is rejected (even if unchanged) — only
 > `color`/`sortOrder` are allowed. `color`/`sortOrder` may be **cleared** with an explicit
@@ -521,7 +531,7 @@ client-supplied id)
 >
 > **`deleteCategory` reparents, then deletes.** The **default category cannot be deleted**.
 > For a normal category, the server (1) flags it `deleting` so new tasks can't attach to (or
-> move into) it, (2) moves **every** task in it to your default category — each move adjusts
+> move into) it, (2) moves **every** task in it to the target user's default category — each move adjusts
 > both categories' internal task counts in the same transaction — then (3) removes the
 > category row **only once a strongly-consistent read proves its task count is zero**.
 > Returns the deleted category.
@@ -1398,15 +1408,16 @@ Planned but not implemented — don't build against them:
 
 ## Breaking changes: categories & tasks rework
 
-Categories became first-class and private; Task status was removed; TaskStep storage and
+Categories became first-class; Task status was removed; TaskStep storage and
 ordering changed. **This is a breaking API change.**
 
 **Removed**
 
 - `TaskStatus` enum and `Task.status` (output), plus `status` on `CreateTaskInput` /
   `UpdateTaskInput`. Tasks have no status.
-- `ownerId` on `CreateTaskInput` and `CreateCategoryInput` — both are derived from the
-  caller's Cognito identity.
+- `ownerId` on `CreateTaskInput` and `CreateCategoryInput`. `createTask` is owned by the
+  caller; category operations default to the caller but may target a selected primary user via
+  optional `userId` and SupportPerson delegation.
 - `listCategoriesByOwner(ownerId, …)` — replaced by `listMyCategories(…)`.
 
 **Changed**
