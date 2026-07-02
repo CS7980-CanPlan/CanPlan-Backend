@@ -421,17 +421,6 @@ input UpdateMyUserProfileInput {
   organizationId: ID
 }
 
-# DEPRECATED — prefer selectPrimaryUser. Retained as a compatibility alias; the supporter is
-# now always the authenticated caller (a client-supplied supporterId is ignored), and the same
-# SupportPerson-only / same-organization / target-is-a-primary-user checks as selectPrimaryUser
-# apply. status is ignored (the link is always (re)activated as ACTIVE).
-input CreateSupportLinkInput {
-  supporterId: ID!
-  primaryUserId: ID!
-  status: SupportLinkStatus
-  permissions: AWSJSON
-}
-
 # A SupportPerson selects a PRIMARY_USER in their OWN current organization to support. The
 # supporter is the authenticated caller (never client-supplied). Writes or restores the
 # SupportLink as ACTIVE. Only a SupportPerson may select; the target must be a PRIMARY_USER
@@ -869,9 +858,6 @@ type Query {
   healthCheck: String! @aws_api_key @aws_cognito_user_pools
 
   getUserProfile(userId: ID!): UserProfile
-  # DEPRECATED — prefer listMySupportList. Now strictly self-scoped: the caller's sub must
-  # equal supporterId (a caller can only list their own support list), else NOT_AUTHORIZED.
-  listPrimaryUsersBySupporter(supporterId: ID!, limit: Int, nextToken: String): SupportLinkConnection!
 
   # The roster of users in the AUTHENTICATED caller's OWN current organization (orgIndex
   # projection: userId, displayName, role). The organization is taken from the caller's
@@ -952,11 +938,6 @@ type Mutation {
   # ⇒ clear). Errors (NotFound) if the profile doesn't exist — it never creates one. role,
   # email, defaultCategoryId, and timestamps cannot be changed here.
   updateMyUserProfile(input: UpdateMyUserProfileInput!): UserProfile!
-  # DEPRECATED — prefer selectPrimaryUser. Compatibility alias that (re)activates a SupportLink
-  # from the AUTHENTICATED caller (supporter) to the given primary user, with the same
-  # SupportPerson-only / same-organization checks; the client-supplied supporterId and status
-  # are ignored.
-  createSupportLink(input: CreateSupportLinkInput!): SupportLink
   # A SupportPerson selects a PRIMARY_USER in their own organization (writes/restores the
   # SupportLink as ACTIVE). Supporter = the authenticated caller. Only a SupportPerson may
   # call this; the target must be a PRIMARY_USER currently in the caller's organization.

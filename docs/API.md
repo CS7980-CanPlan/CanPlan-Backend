@@ -1,6 +1,6 @@
 # CanPlan 2.0 — Frontend API Reference
 
-_Last updated: 2026-06-29. Version: phase 2 (SupportPerson delegated access)._
+_Last updated: 2026-07-01. Version: SupportPerson delegation + organization management._
 
 > ## 🚨 Breaking change — categories, default category, Task status, TaskStep keys
 >
@@ -47,7 +47,7 @@ human-readable companion.
 > and return `NOT_AUTHORIZED` for an unauthenticated caller, so a caller can only ever read
 > their own instances.
 >
-> **SupportPerson delegated access (NEW).** A `SUPPORT_PERSON` may act on a `PRIMARY_USER`
+> **SupportPerson delegated access.** A `SUPPORT_PERSON` may act on a `PRIMARY_USER`
 > they have **selected** — `selectPrimaryUser` writes an **ACTIVE** `SupportLink`. Delegation
 > is granted only while (a) the caller's role is `SUPPORT_PERSON`, (b) the `SupportLink` is
 > `ACTIVE`, (c) the **target is still a `PRIMARY_USER`** (a legacy link pointing at a
@@ -57,10 +57,10 @@ human-readable companion.
 > `startTaskInstance`, `setTaskInstanceStepCompletion`, `updateTaskInstanceStatus`,
 > `cancelTaskInstance`, `endTaskAssignment`, `deleteTaskAssignment`,
 > `listTaskAssignmentsForUser`, `getTaskInstanceViews`, `listTaskInstanceSteps`). A **stale**
-> link (after either party changes org, the target's role changes, or the link is revoked)
-> stops granting access immediately.
+> link (after either party changes org, the target's role
+> changes, or the link is revoked) stops granting access immediately.
 >
-> **Read-only access for assigned templates/media (NEW).** A user who holds an **active
+> **Read-only access for assigned templates/media.** A user who holds an **active
 > assignment referencing a task** may READ that task and its resources even though they don't
 > own it: `getTask`, `listTaskSteps`, `getMediaDownloadUrl`, and `listMediaForTask`. This is
 > **read-only** — it never permits mutating the task, its steps, or its media.
@@ -71,12 +71,10 @@ human-readable companion.
 > identity — a client-supplied `assignedBy` is ignored.
 >
 > **SupportLink mutations are identity-derived.** `selectPrimaryUser` / `unselectPrimaryUser`
-> (and the deprecated `createSupportLink`) always take the supporter from the caller's identity;
-> a client-supplied `supporterId` is never trusted. Only a SupportPerson may select/unselect.
+> always take the supporter from the caller's identity. Only a SupportPerson may select/unselect.
 >
-> **Still self-scoped only (no delegation yet):** profile reads (`getUserProfile`) remain
-> readable by any authenticated caller. `updateMyUserProfile` only ever edits the caller's own
-> profile.
+> **Profile APIs:** profile reads (`getUserProfile`) remain readable by any authenticated caller.
+> `updateMyUserProfile` only ever edits the caller's own profile.
 >
 > **Do not bake "the server lets me, so it's allowed" into the client.** Always pass the
 > caller's own id for self-scoped operations, and treat a `NOT_AUTHORIZED` denial as a normal,
@@ -273,7 +271,7 @@ object instead is the most common mistake here and is rejected at the AppSync ed
 ```
 
 In practice: `accessibilitySettings: JSON.stringify(settings)` on the way in. The same
-applies to `permissions` (`selectPrimaryUser` / `createSupportLink`).
+applies to `permissions` (`selectPrimaryUser`).
 **Responses are symmetric** — these fields come back as JSON strings, so
 `JSON.parse(profile.accessibilitySettings)` on the way out.
 
@@ -424,8 +422,6 @@ fields are marked `!` and everything else is optional; see
 | `selectPrimaryUser` | `input: { primaryUserId!, permissions }` (`SelectPrimaryUserInput`) | `SupportLink!` — a **SupportPerson** selects an in-org `PRIMARY_USER` (supporter = caller); writes/restores the link **ACTIVE**; see below |
 | `unselectPrimaryUser` | `input: { primaryUserId! }` (`UnselectPrimaryUserInput`) | `SupportLink!` — soft-revokes the link (**REVOKED**, never deleted); see below |
 | `listMySupportList` | `limit, nextToken` | `SupportLinkConnection!` — the caller's OWN support list (every primary user they selected, ACTIVE + REVOKED), via supporterIndex on the caller's sub |
-| `createSupportLink` | `input: { supporterId!, primaryUserId!, status, permissions }` | `SupportLink` · **DEPRECATED** alias of `selectPrimaryUser` — supporter is the caller (supplied `supporterId`/`status` ignored); writes ACTIVE with the same SupportPerson/org checks |
-| `listPrimaryUsersBySupporter` | `supporterId!, limit, nextToken` | `SupportLinkConnection!` · **DEPRECATED** alias of `listMySupportList` — now strictly self-scoped (`supporterId` must equal the caller's sub, else `NOT_AUTHORIZED`) |
 
 > **Profile bootstrap — the client must create the profile on first run.** There is
 > **no automatic profile creation.** The Cognito Post Confirmation trigger does one
@@ -496,12 +492,6 @@ fields are marked `!` and everything else is optional; see
 > Optional `permissions` (`AWSJSON`) is stored on the link. List your selections with
 > `listMySupportList`.
 >
-> **`createSupportLink` (DEPRECATED).** A thin compatibility alias for `selectPrimaryUser`: the
-> supporter is taken from the caller's identity (a client-supplied **`supporterId` is ignored**,
-> never trusted), the same SupportPerson-only / same-organization / target-is-a-primary-user
-> checks apply, and the link is always (re)activated **ACTIVE** (the client `status` is ignored).
-> Prefer `selectPrimaryUser`.
-
 **Categories** (all **private to the caller** — the owner is the Cognito identity, never a
 client-supplied id)
 
@@ -718,8 +708,8 @@ client-supplied id)
 >
 > **Not touched:** the `Task` itself, any other `TaskStep`, and — importantly — **any
 > `TaskAssignment`, `TaskInstance`, or `TaskInstanceStep`**. Existing per-occurrence step
-> snapshots are immutable; removing a template step never alters them, and a future
-> `startTaskInstance` simply snapshots the task's remaining steps.
+> snapshots keep their captured template content; removing a template step never alters them,
+> and a future `startTaskInstance` simply snapshots the task's remaining steps.
 >
 > _Consistency note:_ uses the same media-cleanup policy as `deleteMediaAsset` (delete row →
 > delete S3 binary, DB-first, structured-logged; cover references are cleared when relevant).
@@ -782,8 +772,9 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 > assignment **references the template by id** (it is never copied into the primary user's
 > account). `assignedBy` is always the caller's identity; a client-supplied `assignedBy` is
 > **ignored**. Editing the SupportPerson's template later changes what **future/unstarted**
-> occurrences snapshot; already-started `TaskInstanceStep` snapshots are immutable. `deleteTask`
-> stays blocked while any active assignment references the template.
+> occurrences snapshot; already-started `TaskInstanceStep` rows keep their captured template
+> content, though their completion can still be changed until the instance is terminal.
+> `deleteTask` stays blocked while any active assignment references the template.
 
 | Operation | Input | Returns |
 |---|---|---|
@@ -1381,9 +1372,9 @@ Planned but not implemented — don't build against them:
   `adminDeleteOrganization`/`listAllOrganizations`), and `organizationId` must reference an
   existing org. But in this MVP **any signed-in user may set their own `organizationId`** to any
   valid org via `updateMyUserProfile` (self-service join). There is no `OrganizationAdmin`-approved
-  join/invite flow, and no admin API to move **another** user between organizations. This is
-  expected to tighten later (an org-admin-gated membership model), at which point unrestricted
-  self-service joins may be removed.
+  join/invite flow; only `SystemAdmin` can move **another** user between organizations via
+  `adminSetUserOrganization`. This is expected to tighten later (an org-admin-gated membership
+  model), at which point unrestricted self-service joins may be removed.
 - **PENDING / invite-style SupportLinks** — selection is immediate: `selectPrimaryUser` writes
   an **ACTIVE** link with no primary-user acceptance step. The `PENDING` `SupportLinkStatus`
   exists in the schema but no operation produces it (an invite/accept handshake is not built).
@@ -1437,7 +1428,7 @@ ordering changed. **This is a breaking API change.**
   maintained count of the tasks in each category, so `deleteCategory` is safe despite the
   eventually-consistent category index.
 - `TaskStep.description` (optional), persisted by create/update; `TaskInstanceStep`
-  snapshots carry text/completion only (no `description`).
+  snapshots carry text/order plus mutable completion fields (no `description`).
 - `reorderTaskSteps` — atomic whole-task reordering.
 
 **Data compatibility / migration**
@@ -1489,8 +1480,9 @@ model: `TaskAssignment` (schedule rule), `TaskInstance` (one occurrence with sta
 - A `TaskInstance` is one concrete occurrence (`TaskInstanceStatus`:
   `TO_DO`/`IN_PROGRESS`/`OVERDUE`/`COMPLETED`/`SKIPPED`/`CANCELLED`; `OVERDUE` is derived).
   Occurrences are **virtual** until `startTaskInstance` (or `cancelTaskInstance`)
-  materializes one; `startTaskInstance` snapshots the task's current steps into
-  `TaskInstanceStep` rows exactly once (idempotent).
+  materializes one; `startTaskInstance` snapshots the task's current step text/order into
+  `TaskInstanceStep` rows exactly once (idempotent). Completion on those rows can be set or
+  undone until the instance reaches a terminal status.
 - Operations: `startTaskInstance`, `updateTaskInstanceStatus`, `cancelTaskInstance`,
   `setTaskInstanceStepCompletion`, `startTaskInstanceStep`, `pauseTaskInstanceTimer`
   (server-calculated active-step timing), `getTaskInstanceViews` (the calendar feed),

@@ -392,14 +392,6 @@ export interface UpdateMyUserProfileInput {
   organizationId?: string | null;
 }
 
-/** DEPRECATED — prefer `SelectPrimaryUserInput`. supporterId/status are ignored (see schema). */
-export interface CreateSupportLinkInput {
-  supporterId: string;
-  primaryUserId: string;
-  status?: SupportLinkStatus;
-  permissions?: Record<string, unknown>;
-}
-
 /** A SupportPerson selects a primary user (supporter derived from identity). Writes ACTIVE. */
 export interface SelectPrimaryUserInput {
   primaryUserId: string;

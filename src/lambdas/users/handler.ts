@@ -34,7 +34,6 @@ import type {
   Category,
   Connection,
   CreateMyUserProfileInput,
-  CreateSupportLinkInput,
   SelectPrimaryUserInput,
   SupportLink,
   UnselectPrimaryUserInput,
@@ -62,14 +61,10 @@ export const handler = async (
       return getUserProfile(args.userId as string);
     case 'listMyOrganizationUsers':
       return listMyOrganizationUsers(identity, pageArgs(args));
-    case 'createSupportLink':
-      return createSupportLink(identity, args.input as CreateSupportLinkInput);
     case 'selectPrimaryUser':
       return selectPrimaryUser(identity, args.input as SelectPrimaryUserInput);
     case 'unselectPrimaryUser':
       return unselectPrimaryUser(identity, args.input as UnselectPrimaryUserInput);
-    case 'listPrimaryUsersBySupporter':
-      return listPrimaryUsersBySupporter(identity, args.supporterId as string, pageArgs(args));
     case 'listMySupportList':
       return listMySupportList(identity, pageArgs(args));
     default:
@@ -762,22 +757,6 @@ async function unselectPrimaryUser(
 }
 
 /**
- * createSupportLink — DEPRECATED compatibility alias for selectPrimaryUser. The supporter is the
- * authenticated caller (the client-supplied supporterId is IGNORED — it must never be trusted),
- * and the same SupportPerson-only / same-organization / target-is-a-primary-user checks apply.
- * The client-supplied status is ignored too: the link is always (re)activated as ACTIVE.
- */
-async function createSupportLink(
-  identity: AppSyncIdentity | undefined,
-  input: CreateSupportLinkInput,
-): Promise<SupportLink> {
-  return selectPrimaryUser(identity, {
-    primaryUserId: input?.primaryUserId,
-    permissions: input?.permissions,
-  });
-}
-
-/**
  * listMySupportList — the AUTHENTICATED caller's own support list (every primary user they have
  * selected, ACTIVE and REVOKED), via supporterIndex keyed on the caller's sub.
  */
@@ -789,27 +768,7 @@ async function listMySupportList(
   return querySupportList(supporterId, page);
 }
 
-/**
- * listPrimaryUsersBySupporter — DEPRECATED alias for listMySupportList. Now strictly
- * self-scoped: a caller may only list their OWN support list, so the supplied supporterId must
- * equal the caller's sub (else NOT_AUTHORIZED) — a client can no longer read an arbitrary
- * supporter's links.
- */
-async function listPrimaryUsersBySupporter(
-  identity: AppSyncIdentity | undefined,
-  supporterId: string,
-  page: PageArgs,
-): Promise<Connection<SupportLink>> {
-  const caller = requireCaller(identity);
-  const requested = supporterId?.trim();
-  if (!requested) throw new ValidationError('supporterId is required');
-  if (requested !== caller) {
-    throw new UnauthorizedError('Unauthorized: you can only list your own support list');
-  }
-  return querySupportList(caller, page);
-}
-
-/** Query a supporter's SupportLinks (supporterIndex), shared by listMySupportList + the alias. */
+/** Query a supporter's SupportLinks (supporterIndex). */
 function querySupportList(supporterId: string, page: PageArgs): Promise<Connection<SupportLink>> {
   return queryPage<SupportLink>(
     {

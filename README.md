@@ -10,15 +10,15 @@ The GraphQL schema is in [graphql/schema.graphql](graphql/schema.graphql) and th
 frontend-facing reference is [docs/API.md](docs/API.md).
 
 CanPlan uses a **single DynamoDB table** (`CanPlanTasks-<env>`, composite `PK`/`SK`)
-for every entity — UserProfile, SupportLink, Category, Task, TaskStep, TaskAssignment,
-TaskInstance, TaskInstanceStep, MediaAsset, Report. The item-key conventions live in
-[src/shared/keys.ts](src/shared/keys.ts).
+for every entity — UserProfile, SupportLink, Organization, OrganizationMember, Category,
+Task, TaskStep, TaskAssignment, TaskInstance, TaskInstanceStep, MediaAsset, Report. The
+item-key conventions live in [src/shared/keys.ts](src/shared/keys.ts).
 
 | Operation(s) | Type | Backing service |
 | --------- | ---- | --------------- |
 | `healthCheck` | Query | AppSync none data source |
 | `createTask` | Mutation | `canplan-createTask-<env>` Lambda (writes Task + steps atomically) |
-| `createUserProfile`, `updateMyUserProfile`, `getUserProfile`, `listMyOrganizationUsers`, `selectPrimaryUser`, `unselectPrimaryUser`, `listMySupportList`, `createSupportLink`, `listPrimaryUsersBySupporter` | Query/Mutation | `canplan-users-<env>` Lambda + DynamoDB (createUserProfile also creates the user's default category atomically; `createSupportLink`/`listPrimaryUsersBySupporter` are deprecated, self-scoped aliases) |
+| `createUserProfile`, `updateMyUserProfile`, `getUserProfile`, `listMyOrganizationUsers`, `selectPrimaryUser`, `unselectPrimaryUser`, `listMySupportList` | Query/Mutation | `canplan-users-<env>` Lambda + DynamoDB (createUserProfile also creates the user's default category atomically) |
 | `createCategory`, `updateCategory`, `deleteCategory`, `listMyCategories` | Query/Mutation | `canplan-categories-<env>` Lambda + DynamoDB (owner derived from the Cognito identity; deleteCategory reparents tasks to the default category) |
 | `getTask`, `listTaskSteps`, `listTasksByOwner`, `listTasksByCategory`, `updateTask`, `createTaskStep`, `updateTaskStep`, `deleteTaskStep`, `reorderTaskSteps`, `deleteTask` | Query/Mutation | `canplan-tasks-<env>` Lambda + DynamoDB + S3 (media cleanup) |
 | `createTaskAssignment`, `startTaskInstance`, `setTaskInstanceStepCompletion`, `updateTaskInstanceStatus`, `cancelTaskInstance`, `endTaskAssignment`, `deleteTaskAssignment`, `listTaskAssignmentsForUser`, `getTaskInstanceViews`, `getTaskInstance`, `listTaskInstances`, `batchGetTaskInstances`, `listTaskInstanceSteps` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB (TaskAssignment schedule rules; lazily-materialized TaskInstances; calendar feed; self-scoped instance reads) |
@@ -67,16 +67,16 @@ The only fields with auth directives:
 | everything else | default Cognito User Pool (any signed-in user) |
 
 The frontend needs the `UserPoolId` and `UserPoolClientId` deploy outputs to run the
-Cognito sign-in flow. **Task and Category operations are owner-scoped** — every
-`getTask`/`list*`/`updateTask`/`deleteTask`/`*TaskStep`/`reorderTaskSteps` and all category
-operations require the caller's Cognito `sub` to equal the resource's `ownerId` (strict
-self-ownership via [src/shared/authz.ts](src/shared/authz.ts); a foreign owner is rejected).
+Cognito sign-in flow. **Most user-facing data is self-owned or delegated explicitly.**
+Category and task mutations derive the owner from the caller's Cognito `sub`; task and
+media writes are owner-only. Task/media reads also allow a user with an active
+TaskAssignment referencing the task. Assignment and task-instance operations require the
+caller to act on their own schedule, or to be a `SupportPerson` with an ACTIVE selected
+primary user in the same organization (see [src/shared/delegation.ts](src/shared/delegation.ts)).
 The **self-scoped TaskInstance reads** (`getTaskInstance`, `listTaskInstances`,
-`batchGetTaskInstances`) are likewise enforced — they take no `userId`, derive the owner from
-the caller's `sub`, and reject an unauthenticated caller. Per-role/delegated authorization
-(e.g. a support person acting for a primary user) and owner checks on the remaining
-profile/assignment/support-link operations that take a `userId`/`ownerId` argument are **not
-enforced yet**.
+`batchGetTaskInstances`) take no `userId`, derive the owner from the caller's `sub`, and reject
+an unauthenticated caller. Profile writes are self-only via `createUserProfile` /
+`updateMyUserProfile`; `getUserProfile` remains readable by any authenticated caller.
 
 Self-registered users who verify their email and confirm sign-up are automatically
 added to the `PrimaryUser` group — a Cognito Post Confirmation trigger
@@ -422,14 +422,24 @@ Region resolution in [infrastructure/bin/app.ts](infrastructure/bin/app.ts):
 | Backend stack region | `--context backendRegion=...`, `CANPLAN_BACKEND_REGION` | `ca-central-1` |
 | Knowledge Base / Bedrock region | `--context knowledgeBaseRegion=...`, legacy `--context bedrockRegion=...`, `CANPLAN_KNOWLEDGE_BASE_REGION`, legacy `BEDROCK_REGION` | `us-east-1` |
 
-Runtime settings on `generateTaskSteps`:
+Runtime settings on the AI Lambdas (`generateTaskSteps` + `createAiTask`), set by the CDK
+Functions construct and overridable per env:
 
 | Env var | Default | Meaning |
 | ------- | ------- | ------- |
-| `BEDROCK_REGION` | KB region | Region for KB Retrieve and Converse |
+| `BEDROCK_REGION` | KB region | Region for KB Retrieve, Cohere Rerank, and Converse |
 | `BEDROCK_MODEL_ID` | `us.anthropic.claude-sonnet-4-6` | Generation model / inference profile |
 | `BEDROCK_MAX_TOKENS` | `1024` | Generation cap |
-| `RETRIEVAL_TOP_K` | `4` | KB passages retrieved per query |
+| `RERANK_COARSE_K` | `25` | Stage-1 vector candidates handed to the reranker |
+| `RERANK_MODEL_ID` | `cohere.rerank-v3-5:0` | Cohere reranker (IAM ARN is coupled to this) |
+| `RERANK_SCORE_FLOOR` | `0.3` | Absolute relevance floor (0–1); rejects low-quality matches |
+| `RERANK_REL_RATIO` | `0.5` | Relative cutoff = topScore × ratio |
+| `RERANK_MIN_RESULTS` | `2` | Min passages kept (only among floor-passing) |
+| `RERANK_MAX_RESULTS` | `5` | Max passages kept (caps prompt length) |
+
+Retrieval is a two-stage pipeline — coarse KB vector recall (`RERANK_COARSE_K`) then a
+Cohere rerank pass (`src/shared/kb.ts` / `src/shared/rerank.ts`); see
+[scripts/floor-eval/README.md](scripts/floor-eval/README.md) for calibrating the floor.
 
 ## Project Map
 

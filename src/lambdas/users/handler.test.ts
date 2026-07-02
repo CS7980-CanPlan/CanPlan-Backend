@@ -878,31 +878,6 @@ describe('users handler — selectPrimaryUser / unselectPrimaryUser', () => {
   });
 });
 
-describe('users handler — createSupportLink (deprecated alias)', () => {
-  const SP = 'support-1';
-  const PU = 'primary-1';
-
-  it('ignores a client-supplied supporterId, deriving the supporter from identity, and writes ACTIVE', async () => {
-    mockSend
-      .mockResolvedValueOnce({ Item: { userId: SP, role: 'SUPPORT_PERSON', organizationId: 'org-1' } })
-      .mockResolvedValueOnce({ Item: { userId: PU, role: 'PRIMARY_USER', organizationId: 'org-1' } })
-      .mockResolvedValueOnce({ Attributes: { supporterId: SP, primaryUserId: PU, status: 'ACTIVE' } });
-    const result = (await handler(
-      event(
-        'createSupportLink',
-        // Attacker tries to set supporterId to a victim; it must be ignored.
-        { input: { supporterId: 'victim', primaryUserId: PU, status: 'PENDING' } },
-        caller(['SupportPerson'], SP),
-      ),
-    )) as { supporterId: string; status: string };
-    const upsert = mockSend.mock.calls[2][0].input;
-    expect(upsert.Key).toEqual({ PK: `SUPPORTER#${SP}`, SK: `USER#${PU}` }); // NOT victim
-    expect(upsert.ExpressionAttributeValues[':supporterId']).toBe(SP);
-    expect(upsert.ExpressionAttributeValues[':active']).toBe('ACTIVE'); // client status ignored
-    expect(result.status).toBe('ACTIVE');
-  });
-});
-
 describe('users handler — support list queries', () => {
   it('listMySupportList queries supporterIndex by the caller sub (identity-derived)', async () => {
     mockSend.mockResolvedValueOnce({ Items: [{ supporterId: 'support-1', userId: 'primary-1' }] });
@@ -912,25 +887,6 @@ describe('users handler — support list queries', () => {
     expect(lastInput().IndexName).toBe('supporterIndex');
     expect(lastInput().ExpressionAttributeValues).toEqual({ ':sup': 'support-1' });
     expect(result.items).toHaveLength(1);
-  });
-
-  it('listPrimaryUsersBySupporter allows the caller to list their OWN support list', async () => {
-    mockSend.mockResolvedValueOnce({ Items: [{ supporterId: 'support-1', userId: 'primary-1' }] });
-    const result = (await handler(
-      event('listPrimaryUsersBySupporter', { supporterId: 'support-1' }, caller(['SupportPerson'], 'support-1')),
-    )) as Connection<unknown>;
-    expect(lastInput().IndexName).toBe('supporterIndex');
-    expect(lastInput().ExpressionAttributeValues).toEqual({ ':sup': 'support-1' });
-    expect(result.items).toHaveLength(1);
-  });
-
-  it('listPrimaryUsersBySupporter rejects listing another supporter list (no arbitrary supporterId)', async () => {
-    await expect(
-      handler(
-        event('listPrimaryUsersBySupporter', { supporterId: 'someone-else' }, caller(['SupportPerson'], 'support-1')),
-      ),
-    ).rejects.toThrow('only list your own support list');
-    expect(mockSend).not.toHaveBeenCalled();
   });
 });
 
