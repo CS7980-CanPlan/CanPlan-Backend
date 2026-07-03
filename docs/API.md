@@ -182,10 +182,22 @@ so `deleteTask` can prove no active assignment still references a template).
 A `TaskAssignment` is the schedule rule binding a template to a user (`ONE_TIME` or
 `RECURRING` via an RRULE); it holds no status or step completion. A `TaskInstance` is one
 concrete occurrence (created lazily by `startTaskInstance`/`cancelTaskInstance`) and holds
-status + lifecycle timestamps; `instanceId = <assignmentId>#<scheduledDate>#<scheduledTime>`.
-A `TaskInstanceStep` is an immutable per-occurrence step snapshot. `TaskInstance` SKs are
-date-sorted, so `getTaskInstanceViews` reads a date window with one `BETWEEN` on the SK; a
-`TASK_INSTANCE_STEP#…` SK does not collide with the `TASK_INSTANCE#<date>#…` instance prefix.
+status, lifecycle timestamps, and **server-calculated active timing** (see below);
+`instanceId = <assignmentId>#<scheduledDate>#<scheduledTime>`. A `TaskInstanceStep` is an
+immutable per-occurrence step snapshot that also tracks its own **completion and active timing**.
+`TaskInstance` SKs are date-sorted, so `getTaskInstanceViews` reads a date window with one
+`BETWEEN` on the SK; a `TASK_INSTANCE_STEP#…` SK does not collide with the
+`TASK_INSTANCE#<date>#…` instance prefix.
+
+**Active timing.** The backend tracks how long a user actively spends on each step and on the
+whole instance using **server timestamps only** — client-supplied durations are never trusted.
+`startTaskInstanceStep` starts (or switches to) a step's timer; `pauseTaskInstanceTimer` stops
+it. On every close (switch, pause, completing the active step, or completing the instance) the
+server computes `serverNow − activeStepStartedAt` and adds those whole seconds to both the step's
+and the instance's `activeDurationSeconds`. `TaskInstance.activeDurationSeconds` is the accumulated
+**active** time (paused/idle gaps excluded); `TaskInstance.elapsedSeconds` (set only on `COMPLETED`)
+is wall-clock `startedAt → completedAt` and **does** include idle time. Both `activeDurationSeconds`
+fields are `Int!` and default to `0` for freshly started or legacy (pre-timing) rows.
 
 `TaskStep`s are keyed by their stable `stepId` (`STEP#<stepId>`), with `order` stored as
 a plain attribute — so a step keeps its key when reordered and a whole-task reorder is one
@@ -709,9 +721,11 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 |---|---|---|
 | `createTaskAssignment` | `input: { taskId!, userId!, assignedBy, scheduleType!, scheduledFor, scheduleRule, startDate, endDate, startTime, timezone! }` | `TaskAssignment!` · validates the `Task` exists and the schedule, then writes **one** row — **no** `TaskInstance`s. `ONE_TIME` requires `scheduledFor` + `timezone`; `RECURRING` requires `scheduleRule` (an RRULE) + `startDate` + `startTime` + `timezone` (`endDate` optional). The RRULE must carry a `FREQ` of `DAILY`/`WEEKLY`/`MONTHLY`/`YEARLY` — incomplete rules and `HOURLY`/`MINUTELY`/`SECONDLY` are rejected. An active assignment carries the sparse `activeTaskAssignmentTaskId` marker. |
 | `startTaskInstance` | `input: { userId!, assignmentId!, scheduledDate!, scheduledTime! }` | `TaskInstance!` · verifies the occurrence is valid for the assignment; if no instance exists, creates it (`IN_PROGRESS`, `startedAt` set) and snapshots the current `TaskStep`s into `TaskInstanceStep` rows **atomically**. **Idempotent** — an existing instance is returned untouched (steps are never re-snapshotted). |
-| `setTaskInstanceStepCompletion` | `input: { userId!, instanceId!, stepId!, completed! }` | `TaskInstanceStep!` · toggles one step. Sets/clears `completedAt`. Rejected on a **terminal** (`COMPLETED`/`SKIPPED`/`CANCELLED`) instance; 404s if the instance or step doesn't exist. |
-| `updateTaskInstanceStatus` | `input: { userId!, instanceId!, status! }` | `TaskInstance!` · `status` accepts `IN_PROGRESS`/`COMPLETED`/`SKIPPED` (`OVERDUE` is rejected — derived; `CANCELLED` uses `cancelTaskInstance`). `COMPLETED` is rejected while any step is incomplete (a zero-step instance may be completed). To undo skip, set a `SKIPPED` instance back to `IN_PROGRESS`; `skippedAt` is cleared. `COMPLETED`/`CANCELLED` remain frozen. |
-| `cancelTaskInstance` | `input: { userId!, assignmentId!, scheduledDate!, scheduledTime! }` | `TaskInstance!` · creates or updates a real `TaskInstance` with status `CANCELLED` and `isException: true`, so the occurrence stops surfacing as an open virtual slot. Rejected on a **terminal** (`COMPLETED`/`SKIPPED`/`CANCELLED`) instance — a finished occurrence can't be cancelled. |
+| `setTaskInstanceStepCompletion` | `input: { userId!, instanceId!, stepId!, completed! }` | `TaskInstanceStep!` · toggles one step. Sets/clears `completedAt`. Completing the step whose timer is **currently active** first closes it — accumulating its active seconds onto the step and the instance and clearing the active pointer. `completed: false` only clears `completedAt` (prior `activeDurationSeconds` is preserved, never subtracted). Rejected on a **terminal** (`COMPLETED`/`SKIPPED`/`CANCELLED`) instance; 404s if the instance or step doesn't exist. |
+| `startTaskInstanceStep` | `input: { userId!, instanceId!, stepId! }` | `TaskInstanceTimingResult!` · starts (or switches to) a step's timer using **server time only**. **Idempotent** when the step is already active. Switching from a different active step first closes it (`serverNow − activeStepStartedAt` added to that step and the instance). Sets the instance's `activeStepId`/`activeStepStartedAt` and the step's `firstStartedAt` (once) + `lastStartedAt`. Rejected on a **terminal** instance; 404s if the instance or step snapshot doesn't exist. |
+| `pauseTaskInstanceTimer` | `input: { userId!, instanceId! }` | `TaskInstanceTimingResult!` · pauses the active-step timer (app backgrounded, task page left, screen locked, or manual pause): closes the active step (accumulating its active seconds onto the step and instance) and clears `activeStepId`/`activeStepStartedAt`. **Idempotent** when nothing is active. Rejected on a **terminal** instance. |
+| `updateTaskInstanceStatus` | `input: { userId!, instanceId!, status! }` | `TaskInstance!` · `status` accepts `IN_PROGRESS`/`COMPLETED`/`SKIPPED` (`OVERDUE` is rejected — derived; `CANCELLED` uses `cancelTaskInstance`). `COMPLETED` is rejected while any step is incomplete (a zero-step instance may be completed); on completion it **closes any still-running step**, sets `completedAt`, records `elapsedSeconds` (wall-clock `startedAt → now`), and keeps the accumulated `activeDurationSeconds`. `SKIPPED` likewise **closes any running step** (accumulating its active seconds) and clears the active pointer, so a terminal instance never leaves a step timer looking active. To undo skip, set a `SKIPPED` instance back to `IN_PROGRESS`; `skippedAt` is cleared. `COMPLETED`/`CANCELLED` remain frozen. |
+| `cancelTaskInstance` | `input: { userId!, assignmentId!, scheduledDate!, scheduledTime! }` | `TaskInstance!` · creates or updates a real `TaskInstance` with status `CANCELLED` and `isException: true`, so the occurrence stops surfacing as an open virtual slot. Closes any running step first (accumulating its active seconds) and clears the active pointer. Rejected on a **terminal** (`COMPLETED`/`SKIPPED`/`CANCELLED`) instance — a finished occurrence can't be cancelled. |
 | `endTaskAssignment` | `input: { userId!, assignmentId!, effectiveDate! }` | `TaskAssignment!` · for a `RECURRING` assignment with days remaining, caps `endDate` to the day before `effectiveDate` — taking the **earlier** of that and any existing `endDate`, so it only ever shortens the window (stays active); otherwise fully ends it (`active: false`, `endedAt` set, marker removed). |
 | `deleteTaskAssignment` | `input: { userId!, assignmentId! }` | `TaskAssignment!` · **soft delete** — `active: false`, `endedAt` set, `activeTaskAssignmentTaskId` removed (unblocking `deleteTask`). 404s if missing. |
 | `listTaskAssignmentsForUser` | `userId!, limit, nextToken` | `TaskAssignmentConnection!` · a user's schedule rules (active + ended). |
@@ -768,6 +782,66 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 >   }
 > }
 > ```
+
+> **Active-step timing (`startTaskInstanceStep` / `pauseTaskInstanceTimer`).** The backend
+> measures how long a user actively works on each step and on the whole instance using **server
+> time only** — the client never sends a duration or timestamp. At most one step is "active" at a
+> time, tracked by `TaskInstance.activeStepId` + `activeStepStartedAt`. Whenever that step is
+> closed — by switching to another step, pausing, completing the step, or reaching a terminal status
+> (`COMPLETED`/`SKIPPED`/`CANCELLED`) — the server computes `serverNow − activeStepStartedAt` and
+> adds those whole seconds to both the step's and the instance's `activeDurationSeconds`, then clears
+> the active pointer. (If the active pointer is ever stale — its step snapshot is gone — it is cleared
+> without counting, keeping the instance total equal to the sum of its steps.)
+>
+> - **`activeDurationSeconds`** (on `TaskInstance` and each `TaskInstanceStep`, `Int!`) — accumulated
+>   **active** seconds; paused/idle gaps are excluded. Defaults to `0` on a freshly started or legacy row.
+> - **`elapsedSeconds`** (on `TaskInstance`, nullable `Int`) — wall-clock `startedAt → completedAt`,
+>   set only when the instance is `COMPLETED`. Unlike `activeDurationSeconds` it **includes** idle time.
+> - **`firstStartedAt` / `lastStartedAt`** (on `TaskInstanceStep`) — when the step was first / most
+>   recently started.
+>
+> `startTaskInstanceStep` and `pauseTaskInstanceTimer` return `TaskInstanceTimingResult { instance,
+> activeStep, previousStep }`: the updated instance, the step now running (`null` after a pause), and
+> the step that was just closed with its duration accumulated (`null` when none was). Both are
+> **idempotent** (starting the already-active step, or pausing when nothing is active, is a no-op) and
+> **rejected on a terminal instance** (`COMPLETED`/`SKIPPED`/`CANCELLED`). Call `pauseTaskInstanceTimer`
+> when the app is backgrounded, the user leaves the task page, the screen locks, or the user manually pauses.
+>
+> Every close path guards its instance write with an **optimistic condition** on the exact active
+> pointer it read (`activeStepId` + `activeStepStartedAt`), so two overlapping closes — e.g. a
+> `pauseTaskInstanceTimer` racing a `setTaskInstanceStepCompletion` on the same step — can never both
+> count the same interval. A lost race is retried against fresh state (it converges to a no-op or
+> closes whatever is now active). A corrupt/stale pointer (missing `activeStepStartedAt`, or a step
+> snapshot that no longer exists) is cleared **without** counting, so `activeDurationSeconds` stays
+> equal to the sum of the steps'.
+>
+> **Expected frontend flow** — start the instance, then drive the timer per step; pause on
+> background/leave/lock; complete each step and finally the instance:
+>
+> ```text
+> startTaskInstance
+>   → startTaskInstanceStep(step1)
+>   → setTaskInstanceStepCompletion(step1, true)   # closes step1's timer, accumulates its seconds
+>   → startTaskInstanceStep(step2)
+>   → pauseTaskInstanceTimer                         # e.g. app backgrounded; closes step2's timer
+>   → startTaskInstanceStep(step2)                   # resumes step2
+>   → setTaskInstanceStepCompletion(step2, true)
+>   → updateTaskInstanceStatus(COMPLETED)            # sets elapsedSeconds; keeps activeDurationSeconds
+> ```
+>
+> ```graphql
+> mutation StartStep($userId: ID!, $instanceId: ID!, $stepId: ID!) {
+>   startTaskInstanceStep(input: { userId: $userId, instanceId: $instanceId, stepId: $stepId }) {
+>     instance { instanceId activeStepId activeStepStartedAt activeDurationSeconds }
+>     activeStep { stepId firstStartedAt lastStartedAt activeDurationSeconds }
+>     previousStep { stepId activeDurationSeconds }
+>   }
+> }
+> ```
+>
+> **Backward compatibility.** Instances/steps created before timing existed have no
+> `activeDurationSeconds` stored; every read path defaults it to `0`, so the `Int!` contract never
+> fails. Old timing is **not** back-filled from `completedAt` — pre-timing rows simply report `0`.
 
 **Media**
 
@@ -1256,10 +1330,14 @@ model: `TaskAssignment` (schedule rule), `TaskInstance` (one occurrence with sta
   materializes one; `startTaskInstance` snapshots the task's current steps into
   `TaskInstanceStep` rows exactly once (idempotent).
 - Operations: `startTaskInstance`, `updateTaskInstanceStatus`, `cancelTaskInstance`,
-  `setTaskInstanceStepCompletion`, `getTaskInstanceViews` (the calendar feed),
+  `setTaskInstanceStepCompletion`, `startTaskInstanceStep`, `pauseTaskInstanceTimer`
+  (server-calculated active-step timing), `getTaskInstanceViews` (the calendar feed),
   `listTaskInstanceSteps`, and the **self-scoped** materialized-instance reads
   `getTaskInstance`, `listTaskInstances`, `batchGetTaskInstances` (owner derived from the
   Cognito identity — no `userId` — real rows only, `OVERDUE` derived on read).
+- Each `TaskInstance` and `TaskInstanceStep` also carries server-calculated active timing
+  (`activeDurationSeconds`, plus `elapsedSeconds` on the instance and `firstStartedAt`/
+  `lastStartedAt` on the step); see the **Active-step timing** note in the scheduling section.
 
 **Recurrence**
 

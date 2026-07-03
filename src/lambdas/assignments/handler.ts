@@ -44,14 +44,17 @@ import type {
   CreateTaskAssignmentInput,
   DeleteTaskAssignmentInput,
   EndTaskAssignmentInput,
+  PauseTaskInstanceTimerInput,
   PersistedTaskInstanceStatus,
   SetTaskInstanceStepCompletionInput,
   StartTaskInstanceInput,
+  StartTaskInstanceStepInput,
   TaskAssignment,
   TaskInstance,
   TaskInstanceLookupResult,
   TaskInstanceStatus,
   TaskInstanceStep,
+  TaskInstanceTimingResult,
   TaskInstanceView,
   TaskStep,
   UpdateTaskInstanceStatusInput,
@@ -67,6 +70,13 @@ const SETTABLE_INSTANCE_STATUSES: readonly TaskInstanceStatus[] = ['IN_PROGRESS'
 /** A TaskInstance is terminal (frozen) once it reaches one of these. */
 const TERMINAL_STATUSES: readonly PersistedTaskInstanceStatus[] = ['COMPLETED', 'SKIPPED', 'CANCELLED'];
 
+/**
+ * Bounded retries for an active-step close that lost an optimistic-concurrency race. Each retry
+ * re-reads the instance, so it converges fast: the writer that won has already moved/cleared the
+ * pointer, so the re-read either finds nothing to close or a new pointer to close instead.
+ */
+const MAX_TIMING_RETRIES = 5;
+
 /** batchGetTaskInstances accepts at most this many ids per request (also DynamoDB's BatchGet cap). */
 const MAX_BATCH_GET_INSTANCES = 100;
 
@@ -74,6 +84,7 @@ type SchedulingResult =
   | TaskAssignment
   | TaskInstance
   | TaskInstanceStep
+  | TaskInstanceTimingResult
   | Connection<TaskAssignment>
   | Connection<TaskInstance>
   | Connection<TaskInstanceStep>
@@ -97,6 +108,10 @@ export const handler = async (
       return startTaskInstance(args.input as StartTaskInstanceInput);
     case 'setTaskInstanceStepCompletion':
       return setTaskInstanceStepCompletion(args.input as SetTaskInstanceStepCompletionInput);
+    case 'startTaskInstanceStep':
+      return startTaskInstanceStep(args.input as StartTaskInstanceStepInput);
+    case 'pauseTaskInstanceTimer':
+      return pauseTaskInstanceTimer(args.input as PauseTaskInstanceTimerInput);
     case 'updateTaskInstanceStatus':
       return updateTaskInstanceStatus(args.input as UpdateTaskInstanceStatusInput);
     case 'cancelTaskInstance':
@@ -238,6 +253,8 @@ async function startTaskInstance(input: StartTaskInstanceInput): Promise<TaskIns
     timezone: occ.timezone,
     status: 'IN_PROGRESS',
     startedAt: now,
+    // Active timing starts at zero; no step is active until startTaskInstanceStep is called.
+    activeDurationSeconds: 0,
     createdAt: now,
     updatedAt: now,
   };
@@ -251,6 +268,7 @@ async function startTaskInstance(input: StartTaskInstanceInput): Promise<TaskIns
     order: step.order,
     text: step.text,
     completed: false,
+    activeDurationSeconds: 0,
     createdAt: now,
     updatedAt: now,
   }));
@@ -314,43 +332,326 @@ async function setTaskInstanceStepCompletion(
 
   const parsed = parseInstanceId(instanceId);
   if (!parsed) throw new ValidationError(`invalid instanceId "${instanceId}"`);
+  const instanceSk = taskInstanceSk(parsed.scheduledDate, parsed.scheduledTime, parsed.assignmentId);
 
-  const instance = await getInstance(
-    userId,
-    parsed.scheduledDate,
-    parsed.scheduledTime,
-    parsed.assignmentId,
-  );
-  if (!instance) throw new NotFoundError(`task instance ${instanceId} not found for user ${userId}`);
-  const status = instance.status as PersistedTaskInstanceStatus;
-  if (TERMINAL_STATUSES.includes(status)) {
-    throw new ValidationError(`cannot change step completion on a ${status} instance`);
-  }
-
-  const now = new Date().toISOString();
-  const updateExpression = input.completed
-    ? 'SET completed = :completed, completedAt = :completedAt, updatedAt = :updatedAt'
-    : 'SET completed = :completed, updatedAt = :updatedAt REMOVE completedAt';
-  const values: Record<string, unknown> = { ':completed': input.completed, ':updatedAt': now };
-  if (input.completed) values[':completedAt'] = now;
-
-  try {
-    const result = await dynamo.send(
-      new UpdateCommand({
-        TableName: TABLE_NAME,
-        Key: { PK: userPk(userId), SK: taskInstanceStepSk(instanceId, stepId) },
-        UpdateExpression: updateExpression,
-        ExpressionAttributeValues: values,
-        ConditionExpression: 'attribute_exists(PK)',
-        ReturnValues: 'ALL_NEW',
-      }),
+  for (let attempt = 0; ; attempt++) {
+    const instance = await getInstance(
+      userId,
+      parsed.scheduledDate,
+      parsed.scheduledTime,
+      parsed.assignmentId,
     );
-    return stripStorage(result.Attributes as Record<string, unknown>) as unknown as TaskInstanceStep;
-  } catch (err) {
-    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
-      throw new NotFoundError(`step ${stepId} not found for instance ${instanceId}`);
+    if (!instance) throw new NotFoundError(`task instance ${instanceId} not found for user ${userId}`);
+    const status = instance.status as PersistedTaskInstanceStatus;
+    if (TERMINAL_STATUSES.includes(status)) {
+      throw new ValidationError(`cannot change step completion on a ${status} instance`);
     }
-    throw err;
+
+    const now = new Date().toISOString();
+
+    // Completing the step whose timer is currently running: close it first — accumulate its active
+    // seconds onto the step and the instance and clear the active pointer — in ONE transaction. The
+    // instance update is guarded on the exact pointer observed so a concurrent close (e.g. a racing
+    // pauseTaskInstanceTimer) can't double-count the interval; a lost race re-reads and, seeing the
+    // step no longer active, falls through to the plain completion below (adding no extra duration).
+    if (input.completed && instance.activeStepId === stepId && instance.activeStepStartedAt) {
+      const step = await loadInstanceStep(userId, instanceId, stepId);
+      if (!step) throw new NotFoundError(`step ${stepId} not found for instance ${instanceId}`);
+      const delta = elapsedSecondsBetween(instance.activeStepStartedAt as string, now);
+      const guard = activePointerGuard(instance);
+      try {
+        await dynamo.send(
+          new TransactWriteCommand({
+            TransactItems: [
+              {
+                Update: {
+                  TableName: TABLE_NAME,
+                  Key: { PK: userPk(userId), SK: taskInstanceStepSk(instanceId, stepId) },
+                  UpdateExpression:
+                    'SET completed = :true, completedAt = :now, ' +
+                    'activeDurationSeconds = if_not_exists(activeDurationSeconds, :zero) + :delta, ' +
+                    'updatedAt = :now',
+                  ExpressionAttributeValues: { ':true': true, ':now': now, ':zero': 0, ':delta': delta },
+                  ConditionExpression: 'attribute_exists(PK)',
+                },
+              },
+              {
+                Update: {
+                  TableName: TABLE_NAME,
+                  Key: { PK: userPk(userId), SK: instanceSk },
+                  UpdateExpression:
+                    'SET activeDurationSeconds = if_not_exists(activeDurationSeconds, :zero) + :delta, ' +
+                    'updatedAt = :now REMOVE activeStepId, activeStepStartedAt',
+                  ExpressionAttributeValues: { ':zero': 0, ':delta': delta, ':now': now, ...guard.values },
+                  ConditionExpression: `attribute_exists(PK) AND ${guard.condition}`,
+                },
+              },
+            ],
+          }),
+        );
+      } catch (err) {
+        if (isOptimisticConflict(err) && attempt < MAX_TIMING_RETRIES) continue;
+        throw err;
+      }
+      return presentStep({
+        ...step,
+        completed: true,
+        completedAt: now,
+        activeDurationSeconds: numberOr(step.activeDurationSeconds, 0) + delta,
+        updatedAt: now,
+      });
+    }
+
+    // Otherwise a plain toggle — completing a non-active step adds no duration; uncompleting only
+    // clears completedAt (prior activeDurationSeconds is preserved, never subtracted). This touches
+    // only the step row (not the instance pointer), so it needs no optimistic guard.
+    const updateExpression = input.completed
+      ? 'SET completed = :completed, completedAt = :completedAt, updatedAt = :updatedAt'
+      : 'SET completed = :completed, updatedAt = :updatedAt REMOVE completedAt';
+    const values: Record<string, unknown> = { ':completed': input.completed, ':updatedAt': now };
+    if (input.completed) values[':completedAt'] = now;
+
+    try {
+      const result = await dynamo.send(
+        new UpdateCommand({
+          TableName: TABLE_NAME,
+          Key: { PK: userPk(userId), SK: taskInstanceStepSk(instanceId, stepId) },
+          UpdateExpression: updateExpression,
+          ExpressionAttributeValues: values,
+          ConditionExpression: 'attribute_exists(PK)',
+          ReturnValues: 'ALL_NEW',
+        }),
+      );
+      return presentStep(result.Attributes as Record<string, unknown>);
+    } catch (err) {
+      if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
+        throw new NotFoundError(`step ${stepId} not found for instance ${instanceId}`);
+      }
+      throw err;
+    }
+  }
+}
+
+// ── startTaskInstanceStep / pauseTaskInstanceTimer (active-step timing) ────────--
+
+/**
+ * Start (or switch to) one step's timer on a non-terminal instance. Server time only — client
+ * durations are never trusted. Idempotent when the requested step is already active. When a
+ * different step is active it is closed first: its running interval (serverNow −
+ * activeStepStartedAt) is accumulated onto that step AND the instance, then the new step is
+ * pointed to and its firstStartedAt/lastStartedAt stamped — all in one transaction.
+ */
+async function startTaskInstanceStep(
+  input: StartTaskInstanceStepInput,
+): Promise<TaskInstanceTimingResult> {
+  const userId = input?.userId?.trim();
+  const instanceId = input?.instanceId?.trim();
+  const stepId = input?.stepId?.trim();
+  if (!userId) throw new ValidationError('userId is required and cannot be empty');
+  if (!instanceId) throw new ValidationError('instanceId is required and cannot be empty');
+  if (!stepId) throw new ValidationError('stepId is required and cannot be empty');
+
+  const parsed = parseInstanceId(instanceId);
+  if (!parsed) throw new ValidationError(`invalid instanceId "${instanceId}"`);
+  const instanceSk = taskInstanceSk(parsed.scheduledDate, parsed.scheduledTime, parsed.assignmentId);
+
+  // Re-read + re-plan on each attempt: the instance write is guarded on the active pointer we
+  // observed, so a concurrent close/switch fails the condition and we retry against fresh state.
+  for (let attempt = 0; ; attempt++) {
+    const instance = await getInstance(
+      userId,
+      parsed.scheduledDate,
+      parsed.scheduledTime,
+      parsed.assignmentId,
+    );
+    if (!instance) throw new NotFoundError(`task instance ${instanceId} not found for user ${userId}`);
+    const status = instance.status as PersistedTaskInstanceStatus;
+    if (TERMINAL_STATUSES.includes(status)) {
+      throw new ValidationError(`cannot change timing on a ${status} instance`);
+    }
+
+    const activeStepId = instance.activeStepId as string | undefined;
+    const now = new Date().toISOString();
+
+    // Idempotent: the requested step is already running — return current state untouched.
+    if (activeStepId === stepId) {
+      const step = await loadInstanceStep(userId, instanceId, stepId);
+      if (!step) throw new NotFoundError(`step ${stepId} not found for instance ${instanceId}`);
+      return { instance: presentInstance(instance), activeStep: presentStep(step), previousStep: null };
+    }
+
+    // The step being started must be a real snapshot on this instance.
+    const newStep = await loadInstanceStep(userId, instanceId, stepId);
+    if (!newStep) throw new NotFoundError(`step ${stepId} not found for instance ${instanceId}`);
+
+    // If a different step is running, close it first and accumulate its active seconds. A stale
+    // pointer (its snapshot is gone) is simply re-pointed to the new step, counting nothing.
+    let previousStep: Record<string, unknown> | undefined;
+    if (activeStepId && instance.activeStepStartedAt) {
+      previousStep = await loadInstanceStep(userId, instanceId, activeStepId);
+    }
+    const plan = planActiveStepClose(userId, instanceId, instance, previousStep, now);
+    const delta = plan?.delta ?? 0;
+    const guard = activePointerGuard(instance);
+
+    const txItems: NonNullable<
+      ConstructorParameters<typeof TransactWriteCommand>[0]['TransactItems']
+    > = [
+      {
+        // Point the instance's active pointer at the new step; fold in the closed step's delta.
+        Update: {
+          TableName: TABLE_NAME,
+          Key: { PK: userPk(userId), SK: instanceSk },
+          UpdateExpression:
+            'SET activeStepId = :stepId, activeStepStartedAt = :now, ' +
+            'activeDurationSeconds = if_not_exists(activeDurationSeconds, :zero) + :delta, ' +
+            'updatedAt = :now',
+          ExpressionAttributeValues: { ':stepId': stepId, ':now': now, ':zero': 0, ':delta': delta, ...guard.values },
+          ConditionExpression: `attribute_exists(PK) AND ${guard.condition}`,
+        },
+      },
+      {
+        // Start the new step: stamp firstStartedAt once, always refresh lastStartedAt.
+        Update: {
+          TableName: TABLE_NAME,
+          Key: { PK: userPk(userId), SK: taskInstanceStepSk(instanceId, stepId) },
+          UpdateExpression:
+            'SET firstStartedAt = if_not_exists(firstStartedAt, :now), lastStartedAt = :now, ' +
+            'activeDurationSeconds = if_not_exists(activeDurationSeconds, :zero), updatedAt = :now',
+          ExpressionAttributeValues: { ':now': now, ':zero': 0 },
+          ConditionExpression: 'attribute_exists(PK)',
+        },
+      },
+    ];
+    if (plan?.stepTxItem) {
+      txItems.push(plan.stepTxItem);
+    }
+
+    try {
+      await dynamo.send(new TransactWriteCommand({ TransactItems: txItems }));
+    } catch (err) {
+      if (isOptimisticConflict(err) && attempt < MAX_TIMING_RETRIES) continue;
+      throw err;
+    }
+
+    const instanceResult = presentInstance({
+      ...instance,
+      activeStepId: stepId,
+      activeStepStartedAt: now,
+      activeDurationSeconds: numberOr(instance.activeDurationSeconds, 0) + delta,
+      updatedAt: now,
+    });
+    const activeStepResult = presentStep({
+      ...newStep,
+      firstStartedAt: (newStep.firstStartedAt as string | undefined) ?? now,
+      lastStartedAt: now,
+      updatedAt: now,
+    });
+    // Only report a closed previous step when its snapshot actually existed (delta was accumulated).
+    const previousStepResult =
+      plan?.stepTxItem && previousStep
+        ? presentStep({
+            ...previousStep,
+            activeDurationSeconds: numberOr(previousStep.activeDurationSeconds, 0) + delta,
+            updatedAt: now,
+          })
+        : null;
+
+    return { instance: instanceResult, activeStep: activeStepResult, previousStep: previousStepResult };
+  }
+}
+
+/**
+ * Pause an instance's active-step timer (app backgrounded, task page left, screen locked, or a
+ * manual pause). Closes the active step — accumulating its running interval onto the step and the
+ * instance — and clears the active pointer, in one transaction. Idempotent when nothing is active.
+ * The instance write is guarded on the exact pointer observed, so a concurrent close can't cause
+ * the same interval to be counted twice; a lost race re-reads and converges (usually to a no-op).
+ */
+async function pauseTaskInstanceTimer(
+  input: PauseTaskInstanceTimerInput,
+): Promise<TaskInstanceTimingResult> {
+  const userId = input?.userId?.trim();
+  const instanceId = input?.instanceId?.trim();
+  if (!userId) throw new ValidationError('userId is required and cannot be empty');
+  if (!instanceId) throw new ValidationError('instanceId is required and cannot be empty');
+
+  const parsed = parseInstanceId(instanceId);
+  if (!parsed) throw new ValidationError(`invalid instanceId "${instanceId}"`);
+  const instanceSk = taskInstanceSk(parsed.scheduledDate, parsed.scheduledTime, parsed.assignmentId);
+
+  for (let attempt = 0; ; attempt++) {
+    const instance = await getInstance(
+      userId,
+      parsed.scheduledDate,
+      parsed.scheduledTime,
+      parsed.assignmentId,
+    );
+    if (!instance) throw new NotFoundError(`task instance ${instanceId} not found for user ${userId}`);
+    const status = instance.status as PersistedTaskInstanceStatus;
+    if (TERMINAL_STATUSES.includes(status)) {
+      throw new ValidationError(`cannot change timing on a ${status} instance`);
+    }
+
+    const activeStepId = instance.activeStepId as string | undefined;
+    const now = new Date().toISOString();
+
+    // Idempotent: no pointer at all. (A pointer with no startedAt is corrupt — it still needs
+    // clearing, so fall through rather than short-circuiting here.)
+    if (!activeStepId) {
+      return { instance: presentInstance(instance), activeStep: null, previousStep: null };
+    }
+
+    // Close the running step (a stale/corrupt pointer is simply cleared, uncounted).
+    const activeStep = instance.activeStepStartedAt
+      ? await loadInstanceStep(userId, instanceId, activeStepId)
+      : undefined;
+    const plan = planActiveStepClose(userId, instanceId, instance, activeStep, now);
+    const delta = plan?.delta ?? 0;
+    const guard = activePointerGuard(instance);
+
+    const txItems: NonNullable<
+      ConstructorParameters<typeof TransactWriteCommand>[0]['TransactItems']
+    > = [
+      {
+        Update: {
+          TableName: TABLE_NAME,
+          Key: { PK: userPk(userId), SK: instanceSk },
+          UpdateExpression:
+            'SET activeDurationSeconds = if_not_exists(activeDurationSeconds, :zero) + :delta, ' +
+            'updatedAt = :now REMOVE activeStepId, activeStepStartedAt',
+          ExpressionAttributeValues: { ':zero': 0, ':delta': delta, ':now': now, ...guard.values },
+          ConditionExpression: `attribute_exists(PK) AND ${guard.condition}`,
+        },
+      },
+    ];
+    if (plan?.stepTxItem) {
+      txItems.push(plan.stepTxItem);
+    }
+    try {
+      await dynamo.send(new TransactWriteCommand({ TransactItems: txItems }));
+    } catch (err) {
+      if (isOptimisticConflict(err) && attempt < MAX_TIMING_RETRIES) continue;
+      throw err;
+    }
+
+    const merged: Record<string, unknown> = {
+      ...instance,
+      activeDurationSeconds: numberOr(instance.activeDurationSeconds, 0) + delta,
+      updatedAt: now,
+    };
+    delete merged.activeStepId;
+    delete merged.activeStepStartedAt;
+    const previousStepResult =
+      plan?.stepTxItem && activeStep
+        ? presentStep({
+            ...activeStep,
+            activeDurationSeconds: numberOr(activeStep.activeDurationSeconds, 0) + delta,
+            updatedAt: now,
+          })
+        : null;
+
+    return { instance: presentInstance(merged), activeStep: null, previousStep: previousStepResult };
   }
 }
 
@@ -396,6 +697,8 @@ async function updateTaskInstanceStatus(input: UpdateTaskInstanceStatusInput): P
     throw new ValidationError(`cannot change status of a ${current} instance`);
   }
 
+  const now = new Date().toISOString();
+
   if (status === 'COMPLETED') {
     const steps = await loadInstanceSteps(userId, instanceId);
     if (steps.some((s) => !s.completed)) {
@@ -405,26 +708,19 @@ async function updateTaskInstanceStatus(input: UpdateTaskInstanceStatusInput): P
     }
   }
 
-  const now = new Date().toISOString();
-  const sets = ['#status = :status', '#updatedAt = :now'];
-  // Clear any lifecycle timestamp that no longer matches the new status, so a transition
-  // never leaves a stale completedAt/skippedAt behind.
-  const removes: string[] = [];
-  const values: Record<string, unknown> = { ':status': status, ':now': now };
-  if (status === 'COMPLETED') {
-    sets.push('completedAt = :now');
-    removes.push('skippedAt');
-  } else if (status === 'SKIPPED') {
-    sets.push('skippedAt = :now');
-    removes.push('completedAt');
-  } else {
-    // IN_PROGRESS: stamp startedAt the first time it begins; clear any terminal timestamps.
-    sets.push('startedAt = if_not_exists(startedAt, :now)');
-    removes.push('completedAt', 'skippedAt');
+  // COMPLETED and SKIPPED are terminal: both must finalize timing (close any running step, clear
+  // the active pointer) so a terminal instance never looks like a step timer is still active.
+  if (status === 'COMPLETED' || status === 'SKIPPED') {
+    return finalizeInstance(userId, parsed, instance, status);
   }
 
-  let updateExpression = `SET ${sets.join(', ')}`;
-  if (removes.length) updateExpression += ` REMOVE ${removes.join(', ')}`;
+  // IN_PROGRESS (incl. undo-skip): stamp startedAt the first time it begins; clear terminal
+  // timestamps. The active pointer is left as-is — re-affirming IN_PROGRESS must not drop a
+  // running timer (a SKIPPED instance already had its timer closed, so undo-skip has none).
+  const updateExpression =
+    'SET #status = :status, #updatedAt = :now, startedAt = if_not_exists(startedAt, :now) ' +
+    'REMOVE completedAt, skippedAt';
+  const values: Record<string, unknown> = { ':status': status, ':now': now };
 
   try {
     const result = await dynamo.send(
@@ -450,6 +746,119 @@ async function updateTaskInstanceStatus(input: UpdateTaskInstanceStatusInput): P
   }
 }
 
+/**
+ * Apply a terminal transition (COMPLETED or SKIPPED) and finalize timing: close any running step
+ * (accumulate its interval onto both the step and the instance), stamp the terminal timestamp,
+ * clear the active pointer, and clear the opposite terminal timestamp. COMPLETED additionally
+ * records `elapsedSeconds` (wall-clock startedAt→now). A stale active pointer (its snapshot is
+ * missing) is cleared WITHOUT counting; a genuinely running step is closed in one transaction so a
+ * terminal instance never leaves a step timer looking active.
+ *
+ * `instance0` is the row already read + validated by the caller (used on the first attempt). The
+ * instance write is guarded on the exact active pointer observed, so a concurrent close/switch can't
+ * double-count the interval; on a lost race we re-read and re-plan against fresh state.
+ */
+async function finalizeInstance(
+  userId: string,
+  parsed: { assignmentId: string; scheduledDate: string; scheduledTime: string },
+  instance0: Record<string, unknown>,
+  target: 'COMPLETED' | 'SKIPPED',
+): Promise<TaskInstance> {
+  const instanceSk = taskInstanceSk(parsed.scheduledDate, parsed.scheduledTime, parsed.assignmentId);
+  const instanceId = instance0.instanceId as string;
+  const isCompleted = target === 'COMPLETED';
+
+  for (let attempt = 0; ; attempt++) {
+    let instance = instance0;
+    if (attempt > 0) {
+      const reread = await getInstance(
+        userId,
+        parsed.scheduledDate,
+        parsed.scheduledTime,
+        parsed.assignmentId,
+      );
+      if (!reread) throw new NotFoundError(`task instance ${instanceId} not found for user ${userId}`);
+      // A concurrent writer already reached a terminal state — stop fighting; return current state.
+      if (TERMINAL_STATUSES.includes(reread.status as PersistedTaskInstanceStatus)) {
+        return presentInstance(reread);
+      }
+      instance = reread;
+    }
+
+    const now = new Date().toISOString();
+    const activeStepId = instance.activeStepId as string | undefined;
+    const activeStep =
+      activeStepId && instance.activeStepStartedAt
+        ? await loadInstanceStep(userId, instanceId, activeStepId)
+        : undefined;
+    const plan = planActiveStepClose(userId, instanceId, instance, activeStep, now);
+    const delta = plan?.delta ?? 0;
+
+    const elapsed =
+      isCompleted && instance.startedAt ? elapsedSecondsBetween(instance.startedAt as string, now) : 0;
+    const setStamp = isCompleted ? 'completedAt = :now, elapsedSeconds = :elapsed' : 'skippedAt = :now';
+    const removeStamp = isCompleted ? 'skippedAt' : 'completedAt';
+    const guard = activePointerGuard(instance);
+
+    const values: Record<string, unknown> = { ':status': target, ':now': now, ...guard.values };
+    if (isCompleted) values[':elapsed'] = elapsed;
+    // Only touch activeDurationSeconds when a real running step is being closed.
+    const accum = plan?.stepTxItem
+      ? ', activeDurationSeconds = if_not_exists(activeDurationSeconds, :zero) + :delta'
+      : '';
+    if (plan?.stepTxItem) {
+      values[':zero'] = 0;
+      values[':delta'] = delta;
+    }
+    const updateExpression =
+      `SET #status = :status, #updatedAt = :now, ${setStamp}${accum} ` +
+      `REMOVE ${removeStamp}, activeStepId, activeStepStartedAt`;
+    const instanceUpdate = {
+      TableName: TABLE_NAME,
+      Key: { PK: userPk(userId), SK: instanceSk },
+      UpdateExpression: updateExpression,
+      ExpressionAttributeNames: { '#status': 'status', '#updatedAt': 'updatedAt' },
+      ExpressionAttributeValues: values,
+      ConditionExpression: `attribute_exists(PK) AND ${guard.condition}`,
+    };
+
+    try {
+      // No running step to accumulate (nothing active, or a stale pointer we simply clear): one
+      // update. Otherwise close the step and finalize atomically.
+      if (!plan?.stepTxItem) {
+        const result = await dynamo.send(
+          new UpdateCommand({ ...instanceUpdate, ReturnValues: 'ALL_NEW' }),
+        );
+        return presentInstance(result.Attributes as Record<string, unknown>);
+      }
+      await dynamo.send(
+        new TransactWriteCommand({ TransactItems: [{ Update: instanceUpdate }, plan.stepTxItem] }),
+      );
+    } catch (err) {
+      if (isOptimisticConflict(err) && attempt < MAX_TIMING_RETRIES) continue;
+      throw err;
+    }
+
+    const merged: Record<string, unknown> = {
+      ...instance,
+      status: target,
+      activeDurationSeconds: numberOr(instance.activeDurationSeconds, 0) + delta,
+      updatedAt: now,
+    };
+    if (isCompleted) {
+      merged.completedAt = now;
+      merged.elapsedSeconds = elapsed;
+      delete merged.skippedAt;
+    } else {
+      merged.skippedAt = now;
+      delete merged.completedAt;
+    }
+    delete merged.activeStepId;
+    delete merged.activeStepStartedAt;
+    return presentInstance(merged);
+  }
+}
+
 // ── cancelTaskInstance ──────────────────────────────────────────────────────--
 
 /**
@@ -469,50 +878,116 @@ async function cancelTaskInstance(input: CancelTaskInstanceInput): Promise<TaskI
     );
   }
 
-  // A virtual occurrence (no row yet) is cancellable; an existing non-terminal one is too, but a
-  // terminal instance must not be flipped to CANCELLED.
-  const existing = await getInstance(userId, scheduledDate, scheduledTime, assignmentId);
-  if (existing) {
-    const current = existing.status as PersistedTaskInstanceStatus;
-    if (TERMINAL_STATUSES.includes(current)) {
-      throw new ValidationError(`cannot cancel a ${current} instance`);
-    }
-  }
-
   const instanceId = taskInstanceId(assignmentId, scheduledDate, scheduledTime);
-  const now = new Date().toISOString();
-  const result = await dynamo.send(
-    new UpdateCommand({
+  const instanceSk = taskInstanceSk(scheduledDate, scheduledTime, assignmentId);
+
+  for (let attempt = 0; ; attempt++) {
+    // A virtual occurrence (no row yet) is cancellable; an existing non-terminal one is too, but a
+    // terminal instance must not be flipped to CANCELLED.
+    const existing = await getInstance(userId, scheduledDate, scheduledTime, assignmentId);
+    if (existing) {
+      const current = existing.status as PersistedTaskInstanceStatus;
+      if (TERMINAL_STATUSES.includes(current)) {
+        throw new ValidationError(`cannot cancel a ${current} instance`);
+      }
+    }
+
+    const now = new Date().toISOString();
+
+    // If the existing instance has a step timer running, close it first (accumulating its final
+    // interval) so the cancelled instance never keeps a step looking active. A stale/corrupt pointer
+    // (or a virtual occurrence with no row) needs no accumulation — the SET/REMOVE below clears it.
+    const plan =
+      existing && existing.activeStepId
+        ? planActiveStepClose(
+            userId,
+            instanceId,
+            existing,
+            existing.activeStepStartedAt
+              ? await loadInstanceStep(userId, instanceId, existing.activeStepId as string)
+              : undefined,
+            now,
+          )
+        : null;
+    const delta = plan?.delta ?? 0;
+    // Guard the upsert on the exact active pointer we observed so a concurrent start can't slip a
+    // running timer past the cancel. NOTE: no `attribute_exists(PK)` — the upsert must be able to
+    // CREATE the row for a virtual occurrence, and `attribute_not_exists(activeStepId)` is satisfied
+    // by a nonexistent item.
+    const guard = activePointerGuard(existing ?? {});
+
+    const accum = plan?.stepTxItem
+      ? ', activeDurationSeconds = if_not_exists(activeDurationSeconds, :zero) + :delta'
+      : '';
+    // Upsert: create the exception row if it doesn't exist, or flip a non-terminal one to CANCELLED.
+    // REMOVE clears any startedAt/completedAt/skippedAt and the active-step pointer so no stale
+    // lifecycle timestamp or running timer survives the transition.
+    const updateExpression =
+      'SET #status = :cancelled, isException = :true, cancelledAt = :now, updatedAt = :now, ' +
+      'entityType = :entityType, instanceId = :instanceId, assignmentId = :assignmentId, ' +
+      'taskId = :taskId, userId = :userId, scheduledDate = :scheduledDate, ' +
+      'scheduledTime = :scheduledTime, scheduledFor = :scheduledFor, #tz = :timezone, ' +
+      `createdAt = if_not_exists(createdAt, :now)${accum} ` +
+      'REMOVE completedAt, skippedAt, activeStepId, activeStepStartedAt';
+    const values: Record<string, unknown> = {
+      ':cancelled': 'CANCELLED',
+      ':true': true,
+      ':now': now,
+      ':entityType': ENTITY.TASK_INSTANCE,
+      ':instanceId': instanceId,
+      ':assignmentId': assignmentId,
+      ':taskId': assignment.taskId,
+      ':userId': userId,
+      ':scheduledDate': scheduledDate,
+      ':scheduledTime': scheduledTime,
+      ':scheduledFor': occ.scheduledFor,
+      ':timezone': occ.timezone,
+      ...guard.values,
+    };
+    if (plan?.stepTxItem) {
+      values[':zero'] = 0;
+      values[':delta'] = delta;
+    }
+    const instanceUpdate = {
       TableName: TABLE_NAME,
-      Key: { PK: userPk(userId), SK: taskInstanceSk(scheduledDate, scheduledTime, assignmentId) },
-      // Upsert: create the exception row if it doesn't exist, or flip a non-terminal one to
-      // CANCELLED. REMOVE clears any startedAt/completedAt/skippedAt so no stale lifecycle
-      // timestamp survives the transition.
-      UpdateExpression:
-        'SET #status = :cancelled, isException = :true, cancelledAt = :now, updatedAt = :now, ' +
-        'entityType = :entityType, instanceId = :instanceId, assignmentId = :assignmentId, ' +
-        'taskId = :taskId, userId = :userId, scheduledDate = :scheduledDate, ' +
-        'scheduledTime = :scheduledTime, scheduledFor = :scheduledFor, #tz = :timezone, ' +
-        'createdAt = if_not_exists(createdAt, :now) REMOVE completedAt, skippedAt',
+      Key: { PK: userPk(userId), SK: instanceSk },
+      UpdateExpression: updateExpression,
       ExpressionAttributeNames: { '#status': 'status', '#tz': 'timezone' },
-      ExpressionAttributeValues: {
-        ':cancelled': 'CANCELLED',
-        ':true': true,
-        ':now': now,
-        ':entityType': ENTITY.TASK_INSTANCE,
-        ':instanceId': instanceId,
-        ':assignmentId': assignmentId,
-        ':taskId': assignment.taskId,
-        ':userId': userId,
-        ':scheduledDate': scheduledDate,
-        ':scheduledTime': scheduledTime,
-        ':scheduledFor': occ.scheduledFor,
-        ':timezone': occ.timezone,
-      },
-      ReturnValues: 'ALL_NEW',
-    }),
-  );
-  return presentInstance(result.Attributes as Record<string, unknown>);
+      ExpressionAttributeValues: values,
+      ConditionExpression: guard.condition,
+    };
+
+    try {
+      // No running step to close: a single upsert. Otherwise close the step in the same transaction.
+      if (!plan?.stepTxItem) {
+        const result = await dynamo.send(
+          new UpdateCommand({ ...instanceUpdate, ReturnValues: 'ALL_NEW' }),
+        );
+        return presentInstance(result.Attributes as Record<string, unknown>);
+      }
+      await dynamo.send(
+        new TransactWriteCommand({ TransactItems: [{ Update: instanceUpdate }, plan.stepTxItem] }),
+      );
+    } catch (err) {
+      if (isOptimisticConflict(err) && attempt < MAX_TIMING_RETRIES) continue;
+      throw err;
+    }
+
+    const merged: Record<string, unknown> = {
+      ...(existing ?? {}),
+      status: 'CANCELLED',
+      isException: true,
+      cancelledAt: now,
+      instanceId,
+      activeDurationSeconds: numberOr(existing?.activeDurationSeconds, 0) + delta,
+      updatedAt: now,
+    };
+    delete merged.completedAt;
+    delete merged.skippedAt;
+    delete merged.activeStepId;
+    delete merged.activeStepStartedAt;
+    return presentInstance(merged);
+  }
 }
 
 // ── endTaskAssignment ───────────────────────────────────────────────────────--
@@ -811,7 +1286,7 @@ async function listTaskInstanceSteps(
     page,
   );
   result.items = result.items
-    .map((s) => stripStorage(s as unknown as Record<string, unknown>) as unknown as TaskInstanceStep)
+    .map((s) => presentStep(s as unknown as Record<string, unknown>))
     .sort((a, b) => a.order - b.order);
   return result;
 }
@@ -956,6 +1431,124 @@ async function loadInstanceSteps(userId: string, instanceId: string): Promise<Ta
   return queryAllItems<TaskInstanceStep>(userPk(userId), taskInstanceStepPrefix(instanceId));
 }
 
+/** Read one TaskInstanceStep snapshot by (instanceId, stepId), or undefined if absent. */
+async function loadInstanceStep(
+  userId: string,
+  instanceId: string,
+  stepId: string,
+): Promise<Record<string, unknown> | undefined> {
+  const result = await dynamo.send(
+    new GetCommand({
+      TableName: TABLE_NAME,
+      Key: { PK: userPk(userId), SK: taskInstanceStepSk(instanceId, stepId) },
+    }),
+  );
+  return result.Item as Record<string, unknown> | undefined;
+}
+
+// ── Active-step timing helpers ────────────────────────────────────────────────
+/**
+ * Whole seconds between two server ISO instants, floored and clamped to ≥ 0. Both endpoints are
+ * server-generated (`new Date().toISOString()`); a malformed value yields 0 rather than NaN.
+ */
+function elapsedSecondsBetween(startIso: string, endIso: string): number {
+  const start = Date.parse(startIso);
+  const end = Date.parse(endIso);
+  if (Number.isNaN(start) || Number.isNaN(end)) return 0;
+  return Math.max(0, Math.floor((end - start) / 1000));
+}
+
+/** Coerce a stored value to a finite number, falling back (used to default legacy nulls to 0). */
+function numberOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+/**
+ * TransactWrite Update item that closes a running step: add its running interval (`delta`) to the
+ * step's accumulated `activeDurationSeconds`. `if_not_exists` defaults a legacy row missing the
+ * field to 0 before adding.
+ */
+function closeStepTxItem(userId: string, instanceId: string, stepId: string, delta: number, now: string) {
+  return {
+    Update: {
+      TableName: TABLE_NAME,
+      Key: { PK: userPk(userId), SK: taskInstanceStepSk(instanceId, stepId) },
+      UpdateExpression:
+        'SET activeDurationSeconds = if_not_exists(activeDurationSeconds, :zero) + :delta, updatedAt = :now',
+      ExpressionAttributeValues: { ':zero': 0, ':delta': delta, ':now': now },
+      ConditionExpression: 'attribute_exists(PK)',
+    },
+  };
+}
+
+interface ActiveStepClosePlan {
+  /** Seconds to add to BOTH the step and the instance (0 when the pointer is stale). */
+  delta: number;
+  /** The active step's id (the pointer being closed). */
+  activeStepId: string;
+  /** The step's TransactWrite Update item, or null when its snapshot is missing (nothing to add). */
+  stepTxItem: ReturnType<typeof closeStepTxItem> | null;
+}
+
+/**
+ * Plan how to close an instance's currently-running step. `activeStepRow` is the already-loaded
+ * step snapshot (undefined when the pointer is stale/corrupt or when there is no startedAt to load
+ * against). Returns null only when there is no active pointer at all.
+ *
+ * A pointer that can't be counted — no `activeStepStartedAt` (corrupt partial pointer) or a missing
+ * step snapshot (stale pointer) — still yields a plan with `delta 0` and no step write, so the
+ * pointer is CLEARED without counting. This keeps the instance's `activeDurationSeconds` equal to
+ * the sum of its steps' (no silent divergence, no transaction-condition failure on a nonexistent
+ * row) and self-heals a corrupt pointer. Every close path uses this for identical handling.
+ */
+function planActiveStepClose(
+  userId: string,
+  instanceId: string,
+  instance: Record<string, unknown>,
+  activeStepRow: Record<string, unknown> | undefined,
+  now: string,
+): ActiveStepClosePlan | null {
+  const activeStepId = instance.activeStepId as string | undefined;
+  if (!activeStepId) return null;
+  const startedAt = instance.activeStepStartedAt as string | undefined;
+  // Corrupt (no startedAt) or stale (snapshot gone): clear the pointer, count nothing.
+  if (!startedAt || !activeStepRow) return { delta: 0, activeStepId, stepTxItem: null };
+  const delta = elapsedSecondsBetween(startedAt, now);
+  return { delta, activeStepId, stepTxItem: closeStepTxItem(userId, instanceId, activeStepId, delta, now) };
+}
+
+/** True for the DynamoDB errors a lost optimistic-concurrency (active-pointer) race surfaces as. */
+function isOptimisticConflict(err: unknown): boolean {
+  const name = (err as { name?: string }).name;
+  return name === 'ConditionalCheckFailedException' || name === 'TransactionCanceledException';
+}
+
+/**
+ * Optimistic-concurrency guard for the instance write in an active-step close path: the write only
+ * lands if the active pointer is still EXACTLY what we read (same step + same start, or still
+ * absent). This prevents two overlapping close paths (e.g. pause racing setTaskInstanceStepCompletion)
+ * from both reading the same pointer and both counting the same interval. Returns the condition
+ * fragment to AND onto `attribute_exists(PK)` plus the expected-value bindings to merge in.
+ */
+function activePointerGuard(instance: Record<string, unknown>): {
+  condition: string;
+  values: Record<string, unknown>;
+} {
+  const activeStepId = instance.activeStepId as string | undefined;
+  const startedAt = instance.activeStepStartedAt as string | undefined;
+  if (!activeStepId) return { condition: 'attribute_not_exists(activeStepId)', values: {} };
+  if (!startedAt) {
+    return {
+      condition: 'activeStepId = :expActiveStepId AND attribute_not_exists(activeStepStartedAt)',
+      values: { ':expActiveStepId': activeStepId },
+    };
+  }
+  return {
+    condition: 'activeStepId = :expActiveStepId AND activeStepStartedAt = :expActiveStepStartedAt',
+    values: { ':expActiveStepId': activeStepId, ':expActiveStepStartedAt': startedAt },
+  };
+}
+
 /**
  * Derive the API-facing status for an occurrence/instance. A non-terminal occurrence whose
  * scheduledFor is in the past surfaces as OVERDUE; terminal statuses pass through unchanged.
@@ -1003,9 +1596,25 @@ function stripStorage(item: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
-/** Project a stored TaskInstance row into the API shape (storage attributes stripped). */
+/**
+ * Project a stored TaskInstance row into the API shape (storage attributes stripped).
+ * `activeDurationSeconds` is defaulted to 0 so a legacy row missing it never violates the
+ * GraphQL `Int!` contract.
+ */
 function presentInstance(item: Record<string, unknown>): TaskInstance {
-  return stripStorage(item) as unknown as TaskInstance;
+  const out = stripStorage(item);
+  out.activeDurationSeconds = numberOr(out.activeDurationSeconds, 0);
+  return out as unknown as TaskInstance;
+}
+
+/**
+ * Project a stored TaskInstanceStep row into the API shape (storage attributes stripped).
+ * `activeDurationSeconds` is defaulted to 0 for legacy snapshots (GraphQL `Int!`).
+ */
+function presentStep(item: Record<string, unknown>): TaskInstanceStep {
+  const out = stripStorage(item);
+  out.activeDurationSeconds = numberOr(out.activeDurationSeconds, 0);
+  return out as unknown as TaskInstanceStep;
 }
 
 /**
