@@ -127,6 +127,8 @@ export class Api extends Construct {
       { typeName: 'Mutation', fieldName: 'createTaskAssignment' },
       { typeName: 'Mutation', fieldName: 'startTaskInstance' },
       { typeName: 'Mutation', fieldName: 'setTaskInstanceStepCompletion' },
+      { typeName: 'Mutation', fieldName: 'startTaskInstanceStep' },
+      { typeName: 'Mutation', fieldName: 'pauseTaskInstanceTimer' },
       { typeName: 'Mutation', fieldName: 'updateTaskInstanceStatus' },
       { typeName: 'Mutation', fieldName: 'cancelTaskInstance' },
       { typeName: 'Mutation', fieldName: 'endTaskAssignment' },

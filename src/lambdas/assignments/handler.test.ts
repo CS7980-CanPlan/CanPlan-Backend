@@ -37,6 +37,7 @@ interface DbState {
   instance?: Rec; // TASK_INSTANCE# GET
   taskMeta?: Rec; // #META GET (title / existence)
   instancesInRange?: Rec[]; // QueryCommand BETWEEN (real instances)
+  steps?: Record<string, Rec>; // TASK_INSTANCE_STEP# GET, keyed by stepId
 }
 let db: DbState = {};
 
@@ -50,6 +51,11 @@ beforeEach(() => {
       const sk: string = input.Key.SK;
       if (sk === '#META') return Promise.resolve({ Item: db.taskMeta });
       if (sk.startsWith('TASK_ASSIGNMENT#')) return Promise.resolve({ Item: db.assignment });
+      // TASK_INSTANCE_STEP# must be checked before TASK_INSTANCE# (the latter is not a prefix of it).
+      if (sk.startsWith('TASK_INSTANCE_STEP#')) {
+        const stepId = sk.split('#STEP#')[1];
+        return Promise.resolve({ Item: db.steps?.[stepId] });
+      }
       if (sk.startsWith('TASK_INSTANCE#')) return Promise.resolve({ Item: db.instance });
       return Promise.resolve({});
     }
@@ -67,7 +73,10 @@ beforeEach(() => {
     return Promise.resolve({});
   });
 });
-afterEach(() => jest.clearAllMocks());
+afterEach(() => {
+  jest.clearAllMocks();
+  jest.useRealTimers();
+});
 
 /** Crudely reconstruct an ALL_NEW echo from an UpdateCommand's expression values. */
 function echoUpdate(input: Rec): Rec {
@@ -227,16 +236,21 @@ describe('startTaskInstance', () => {
     expect(instance.SK).toBe('TASK_INSTANCE#2099-07-02#09:00#a1');
     expect(instance.status).toBe('IN_PROGRESS');
     expect(instance.startedAt).toBeDefined();
+    // Active timing starts at zero, with no step active yet.
+    expect(instance.activeDurationSeconds).toBe(0);
+    expect(instance.activeStepId).toBeUndefined();
     // Instance Put is guarded so steps snapshot exactly once.
     const instancePut = tx[0].TransactItems.find((t: Rec) => t.Put.Item.entityType === 'TaskInstance');
     expect(instancePut.Put.ConditionExpression).toBe('attribute_not_exists(PK)');
-    // One step snapshot per TaskStep, text only (NOT media), completed=false.
+    // One step snapshot per TaskStep, text only (NOT media), completed=false, timing at zero.
     const steps = items.filter((i: Rec) => i.entityType === 'TaskInstanceStep');
     expect(steps).toHaveLength(2);
     expect(steps[0].SK).toBe('TASK_INSTANCE_STEP#a1#2099-07-02#09:00#STEP#s1');
     expect(steps[0].mediaAssets).toBeUndefined();
     expect(steps.every((s: Rec) => s.completed === false)).toBe(true);
+    expect(steps.every((s: Rec) => s.activeDurationSeconds === 0)).toBe(true);
     expect(result.status).toBe('IN_PROGRESS');
+    expect(result.activeDurationSeconds).toBe(0);
   });
 
   it('is idempotent — an existing instance is returned without re-snapshotting steps', async () => {
@@ -286,11 +300,392 @@ describe('setTaskInstanceStepCompletion', () => {
     expect(byCommand('UpdateCommand')).toHaveLength(0);
   });
 
+  it('closes the active step before completing it, accumulating its active seconds', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2099-07-02T09:10:00.000Z'));
+    db.instance = {
+      status: 'IN_PROGRESS',
+      instanceId: 'a1#2099-07-02#09:00',
+      scheduledDate: '2099-07-02',
+      scheduledTime: '09:00',
+      activeStepId: 's1',
+      activeStepStartedAt: '2099-07-02T09:00:00.000Z', // 600s before "now"
+      activeDurationSeconds: 0,
+    };
+    db.steps = { s1: { stepId: 's1', completed: false, activeDurationSeconds: 0 } };
+
+    const result = (await handler(
+      event('setTaskInstanceStepCompletion', { input: args }),
+    )) as TaskInstanceStep;
+
+    // A transaction (step + instance), not a lone UpdateCommand, since it closes the timer.
+    const tx = byCommand('TransactWriteCommand');
+    expect(tx).toHaveLength(1);
+    expect(byCommand('UpdateCommand')).toHaveLength(0);
+    const stepUpdate = tx[0].TransactItems.find((t: Rec) => t.Update.Key.SK.includes('STEP#s1')).Update;
+    expect(stepUpdate.UpdateExpression).toContain('completed = :true');
+    expect(stepUpdate.ExpressionAttributeValues[':delta']).toBe(600);
+    const instUpdate = tx[0].TransactItems.find((t: Rec) => t.Update.Key.SK === 'TASK_INSTANCE#2099-07-02#09:00#a1')!.Update;
+    expect(instUpdate.UpdateExpression).toContain('REMOVE activeStepId, activeStepStartedAt');
+    expect(instUpdate.ExpressionAttributeValues[':delta']).toBe(600);
+    // The instance write is guarded on the exact pointer observed (prevents double-counting).
+    expect(instUpdate.ConditionExpression).toContain('activeStepStartedAt = :expActiveStepStartedAt');
+    // Returned step reflects the closed timer.
+    expect(result.completed).toBe(true);
+    expect(result.completedAt).toBe('2099-07-02T09:10:00.000Z');
+    expect(result.activeDurationSeconds).toBe(600);
+  });
+
+  it('falls back to plain completion (no extra duration) when it loses the close race', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2099-07-02T09:10:00.000Z'));
+    // First read: s1 is the active step. A concurrent pause closes it before our transaction lands,
+    // so the retry read shows it no longer active — we then just mark it completed, adding nothing.
+    const active = {
+      status: 'IN_PROGRESS', instanceId: 'a1#2099-07-02#09:00',
+      scheduledDate: '2099-07-02', scheduledTime: '09:00',
+      activeStepId: 's1', activeStepStartedAt: '2099-07-02T09:00:00.000Z', activeDurationSeconds: 0,
+    };
+    const closed = { ...active, activeDurationSeconds: 600 };
+    delete (closed as Rec).activeStepId;
+    delete (closed as Rec).activeStepStartedAt;
+    let instanceGets = 0;
+    let transacts = 0;
+    let updates = 0;
+    mockSend.mockImplementation((command: { constructor: { name: string }; input: Rec }) => {
+      const name = command.constructor.name;
+      if (name === 'GetCommand') {
+        const sk: string = command.input.Key.SK;
+        if (sk.startsWith('TASK_INSTANCE_STEP#')) return Promise.resolve({ Item: { stepId: 's1', completed: false, activeDurationSeconds: 600 } });
+        if (sk.startsWith('TASK_INSTANCE#')) return Promise.resolve({ Item: instanceGets++ === 0 ? active : closed });
+      }
+      if (name === 'TransactWriteCommand') {
+        transacts++;
+        return Promise.reject(Object.assign(new Error('conflict'), { name: 'TransactionCanceledException' }));
+      }
+      if (name === 'UpdateCommand') {
+        updates++;
+        return Promise.resolve({ Attributes: { stepId: 's1', completed: true, completedAt: '2099-07-02T09:10:00.000Z', activeDurationSeconds: 600 } });
+      }
+      return Promise.resolve({});
+    });
+
+    const result = (await handler(
+      event('setTaskInstanceStepCompletion', { input: args }),
+    )) as TaskInstanceStep;
+
+    expect(transacts).toBe(1); // the losing active-close attempt
+    expect(updates).toBe(1); // fallback plain completion (no duration added)
+    expect(result.completed).toBe(true);
+    expect(result.activeDurationSeconds).toBe(600); // the winner's accumulation, not doubled
+  });
+
+  it('adds no duration when completing a non-active step', async () => {
+    db.instance = { status: 'IN_PROGRESS', activeStepId: 's2', activeStepStartedAt: 'x' };
+    mockSend.mockImplementationOnce(() => Promise.resolve({ Item: db.instance })); // getInstance
+    mockSend.mockImplementationOnce(() =>
+      Promise.resolve({ Attributes: { stepId: 's1', completed: true, completedAt: 'now' } }),
+    );
+    const result = (await handler(
+      event('setTaskInstanceStepCompletion', { input: args }),
+    )) as TaskInstanceStep;
+    // Plain UpdateCommand path — no transaction, no duration accumulation.
+    expect(byCommand('TransactWriteCommand')).toHaveLength(0);
+    expect(byCommand('UpdateCommand')).toHaveLength(1);
+    expect(result.completed).toBe(true);
+  });
+
   it('404s when the instance does not exist', async () => {
     db.instance = undefined;
     await expect(handler(event('setTaskInstanceStepCompletion', { input: args }))).rejects.toThrow(
       'task instance a1#2099-07-02#09:00 not found',
     );
+  });
+});
+
+// ── startTaskInstanceStep / pauseTaskInstanceTimer (active-step timing) ────────
+describe('startTaskInstanceStep', () => {
+  const instanceId = 'a1#2099-07-02#09:00';
+  const runningInstance = (over: Rec = {}): Rec => ({
+    status: 'IN_PROGRESS',
+    instanceId,
+    scheduledDate: '2099-07-02',
+    scheduledTime: '09:00',
+    activeDurationSeconds: 0,
+    ...over,
+  });
+  const txItems = (): Rec[] => byCommand('TransactWriteCommand')[0].TransactItems;
+  const txUpdate = (skPart: string): Rec =>
+    txItems().find((t) => t.Update?.Key.SK.includes(skPart))!.Update;
+
+  it('starts a step when none is active (no previous step to close)', async () => {
+    db.instance = runningInstance();
+    db.steps = { s1: { stepId: 's1', activeDurationSeconds: 0 } };
+
+    const result = (await handler(
+      event('startTaskInstanceStep', { input: { userId: 'u1', instanceId, stepId: 's1' } }),
+    )) as import('../../shared/types').TaskInstanceTimingResult;
+
+    expect(byCommand('TransactWriteCommand')).toHaveLength(1);
+    expect(txItems()).toHaveLength(2); // instance + new step, no previous to close
+    const inst = txUpdate('TASK_INSTANCE#2099-07-02#09:00#a1');
+    expect(inst.ExpressionAttributeValues[':stepId']).toBe('s1');
+    expect(inst.ExpressionAttributeValues[':delta']).toBe(0);
+    const step = txUpdate('STEP#s1');
+    expect(step.UpdateExpression).toContain('firstStartedAt = if_not_exists(firstStartedAt, :now)');
+    expect(step.UpdateExpression).toContain('lastStartedAt = :now');
+    expect(result.instance.activeStepId).toBe('s1');
+    expect(result.activeStep?.stepId).toBe('s1');
+    expect(result.activeStep?.firstStartedAt).toBeDefined();
+    expect(result.previousStep).toBeNull();
+  });
+
+  it('switches from step1 to step2 and accumulates step1 active seconds', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2099-07-02T09:10:00.000Z'));
+    db.instance = runningInstance({
+      activeStepId: 's1',
+      activeStepStartedAt: '2099-07-02T09:00:00.000Z', // 600s ago
+      activeDurationSeconds: 0,
+    });
+    db.steps = {
+      s1: { stepId: 's1', activeDurationSeconds: 0, firstStartedAt: '2099-07-02T09:00:00.000Z' },
+      s2: { stepId: 's2', activeDurationSeconds: 0 },
+    };
+
+    const result = (await handler(
+      event('startTaskInstanceStep', { input: { userId: 'u1', instanceId, stepId: 's2' } }),
+    )) as import('../../shared/types').TaskInstanceTimingResult;
+
+    expect(txItems()).toHaveLength(3); // instance + new step (s2) + closed step (s1)
+    const inst = txUpdate('TASK_INSTANCE#2099-07-02#09:00#a1');
+    expect(inst.ExpressionAttributeValues[':stepId']).toBe('s2');
+    expect(inst.ExpressionAttributeValues[':delta']).toBe(600);
+    const closed = txUpdate('STEP#s1');
+    expect(closed.ExpressionAttributeValues[':delta']).toBe(600);
+    // Instance total and previous step both accumulate the 600s the timer ran on step1.
+    expect(result.instance.activeStepId).toBe('s2');
+    expect(result.instance.activeDurationSeconds).toBe(600);
+    expect(result.previousStep?.stepId).toBe('s1');
+    expect(result.previousStep?.activeDurationSeconds).toBe(600);
+    expect(result.activeStep?.stepId).toBe('s2');
+  });
+
+  it('is idempotent when the same step is already active (no write)', async () => {
+    db.instance = runningInstance({
+      activeStepId: 's1',
+      activeStepStartedAt: '2099-07-02T09:00:00.000Z',
+      activeDurationSeconds: 42,
+    });
+    db.steps = { s1: { stepId: 's1', activeDurationSeconds: 30 } };
+
+    const result = (await handler(
+      event('startTaskInstanceStep', { input: { userId: 'u1', instanceId, stepId: 's1' } }),
+    )) as import('../../shared/types').TaskInstanceTimingResult;
+
+    expect(byCommand('TransactWriteCommand')).toHaveLength(0);
+    expect(byCommand('UpdateCommand')).toHaveLength(0);
+    expect(result.instance.activeStepId).toBe('s1');
+    expect(result.instance.activeDurationSeconds).toBe(42); // unchanged
+    expect(result.activeStep?.stepId).toBe('s1');
+    expect(result.previousStep).toBeNull();
+  });
+
+  it('rejects starting a step on a terminal (COMPLETED) instance', async () => {
+    db.instance = runningInstance({ status: 'COMPLETED' });
+    await expect(
+      handler(event('startTaskInstanceStep', { input: { userId: 'u1', instanceId, stepId: 's1' } })),
+    ).rejects.toThrow('cannot change timing on a COMPLETED instance');
+    expect(byCommand('TransactWriteCommand')).toHaveLength(0);
+  });
+
+  it('404s when the requested step snapshot does not exist', async () => {
+    db.instance = runningInstance();
+    db.steps = {}; // no s1 snapshot
+    await expect(
+      handler(event('startTaskInstanceStep', { input: { userId: 'u1', instanceId, stepId: 's1' } })),
+    ).rejects.toThrow('step s1 not found');
+  });
+
+  it('re-points a stale previous pointer without counting its delta on the instance', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2099-07-02T09:10:00.000Z'));
+    db.instance = runningInstance({
+      activeStepId: 'gone', // previous active step whose snapshot no longer exists
+      activeStepStartedAt: '2099-07-02T09:00:00.000Z',
+      activeDurationSeconds: 15,
+    });
+    db.steps = { s2: { stepId: 's2', activeDurationSeconds: 0 } }; // only the new step exists
+
+    const result = (await handler(
+      event('startTaskInstanceStep', { input: { userId: 'u1', instanceId, stepId: 's2' } }),
+    )) as import('../../shared/types').TaskInstanceTimingResult;
+
+    // Only instance + new step are written (no close of the missing 'gone' snapshot), delta 0 —
+    // the instance total stays consistent with the sum of real steps rather than diverging.
+    expect(txItems()).toHaveLength(2);
+    const inst = txUpdate('TASK_INSTANCE#2099-07-02#09:00#a1');
+    expect(inst.ExpressionAttributeValues[':delta']).toBe(0);
+    expect(result.instance.activeStepId).toBe('s2');
+    expect(result.instance.activeDurationSeconds).toBe(15); // unchanged — nothing accumulated
+    expect(result.previousStep).toBeNull();
+  });
+});
+
+describe('pauseTaskInstanceTimer', () => {
+  const instanceId = 'a1#2099-07-02#09:00';
+  const txItems = (): Rec[] => byCommand('TransactWriteCommand')[0].TransactItems;
+
+  it('closes the active step, accumulates its seconds, and clears activeStepId', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2099-07-02T09:10:00.000Z'));
+    db.instance = {
+      status: 'IN_PROGRESS',
+      instanceId,
+      scheduledDate: '2099-07-02',
+      scheduledTime: '09:00',
+      activeStepId: 's1',
+      activeStepStartedAt: '2099-07-02T09:00:00.000Z', // 600s ago
+      activeDurationSeconds: 5,
+    };
+    db.steps = { s1: { stepId: 's1', activeDurationSeconds: 10 } };
+
+    const result = (await handler(
+      event('pauseTaskInstanceTimer', { input: { userId: 'u1', instanceId } }),
+    )) as import('../../shared/types').TaskInstanceTimingResult;
+
+    expect(byCommand('TransactWriteCommand')).toHaveLength(1);
+    const inst = txItems().find((t) => t.Update.Key.SK === 'TASK_INSTANCE#2099-07-02#09:00#a1')!.Update;
+    expect(inst.UpdateExpression).toContain('REMOVE activeStepId, activeStepStartedAt');
+    expect(inst.ExpressionAttributeValues[':delta']).toBe(600);
+    // Instance total = 5 + 600; the step it closed = 10 + 600. No active step remains.
+    expect(result.instance.activeDurationSeconds).toBe(605);
+    expect(result.instance.activeStepId).toBeUndefined();
+    expect(result.activeStep).toBeNull();
+    expect(result.previousStep?.stepId).toBe('s1');
+    expect(result.previousStep?.activeDurationSeconds).toBe(610);
+  });
+
+  it('is idempotent when nothing is active (no write)', async () => {
+    db.instance = {
+      status: 'IN_PROGRESS',
+      instanceId,
+      scheduledDate: '2099-07-02',
+      scheduledTime: '09:00',
+      activeDurationSeconds: 7,
+    };
+    const result = (await handler(
+      event('pauseTaskInstanceTimer', { input: { userId: 'u1', instanceId } }),
+    )) as import('../../shared/types').TaskInstanceTimingResult;
+
+    expect(byCommand('TransactWriteCommand')).toHaveLength(0);
+    expect(result.instance.activeDurationSeconds).toBe(7);
+    expect(result.activeStep).toBeNull();
+    expect(result.previousStep).toBeNull();
+  });
+
+  it('clears a stale active pointer without counting when its step snapshot is missing', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2099-07-02T09:10:00.000Z'));
+    db.instance = {
+      status: 'IN_PROGRESS',
+      instanceId,
+      scheduledDate: '2099-07-02',
+      scheduledTime: '09:00',
+      activeStepId: 'gone',
+      activeStepStartedAt: '2099-07-02T09:00:00.000Z',
+      activeDurationSeconds: 12,
+    };
+    db.steps = {}; // the pointed-to snapshot no longer exists
+
+    const result = (await handler(
+      event('pauseTaskInstanceTimer', { input: { userId: 'u1', instanceId } }),
+    )) as import('../../shared/types').TaskInstanceTimingResult;
+
+    // The instance pointer is cleared, but nothing is added anywhere (no step to attribute it to).
+    const tx = byCommand('TransactWriteCommand')[0];
+    expect(tx.TransactItems).toHaveLength(1); // instance only; no step write
+    expect(tx.TransactItems[0].Update.ExpressionAttributeValues[':delta']).toBe(0);
+    expect(result.instance.activeDurationSeconds).toBe(12); // unchanged
+    expect(result.instance.activeStepId).toBeUndefined();
+    expect(result.previousStep).toBeNull();
+  });
+
+  it('guards the instance write on the exact active pointer it observed (optimistic concurrency)', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2099-07-02T09:10:00.000Z'));
+    db.instance = {
+      status: 'IN_PROGRESS', instanceId, scheduledDate: '2099-07-02', scheduledTime: '09:00',
+      activeStepId: 's1', activeStepStartedAt: '2099-07-02T09:00:00.000Z', activeDurationSeconds: 0,
+    };
+    db.steps = { s1: { stepId: 's1', activeDurationSeconds: 0 } };
+
+    await handler(event('pauseTaskInstanceTimer', { input: { userId: 'u1', instanceId } }));
+
+    const inst = txItems().find((t) => t.Update.Key.SK === 'TASK_INSTANCE#2099-07-02#09:00#a1')!.Update;
+    expect(inst.ConditionExpression).toContain('activeStepId = :expActiveStepId');
+    expect(inst.ConditionExpression).toContain('activeStepStartedAt = :expActiveStepStartedAt');
+    expect(inst.ExpressionAttributeValues[':expActiveStepId']).toBe('s1');
+    expect(inst.ExpressionAttributeValues[':expActiveStepStartedAt']).toBe('2099-07-02T09:00:00.000Z');
+  });
+
+  it('retries and converges to an idempotent no-op when it loses the close race', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2099-07-02T09:10:00.000Z'));
+    // First read: a step is active. A concurrent writer closes it, so the retry read has none.
+    const active = {
+      status: 'IN_PROGRESS', instanceId, scheduledDate: '2099-07-02', scheduledTime: '09:00',
+      activeStepId: 's1', activeStepStartedAt: '2099-07-02T09:00:00.000Z', activeDurationSeconds: 5,
+    };
+    const closed = { ...active, activeDurationSeconds: 605 };
+    delete (closed as Rec).activeStepId;
+    delete (closed as Rec).activeStepStartedAt;
+    let instanceGets = 0;
+    let transacts = 0;
+    mockSend.mockImplementation((command: { constructor: { name: string }; input: Rec }) => {
+      const name = command.constructor.name;
+      if (name === 'GetCommand') {
+        const sk: string = command.input.Key.SK;
+        if (sk.startsWith('TASK_INSTANCE_STEP#')) return Promise.resolve({ Item: { stepId: 's1', activeDurationSeconds: 5 } });
+        if (sk.startsWith('TASK_INSTANCE#')) return Promise.resolve({ Item: instanceGets++ === 0 ? active : closed });
+      }
+      if (name === 'TransactWriteCommand') {
+        transacts++;
+        return Promise.reject(Object.assign(new Error('conflict'), { name: 'TransactionCanceledException' }));
+      }
+      return Promise.resolve({});
+    });
+
+    const result = (await handler(
+      event('pauseTaskInstanceTimer', { input: { userId: 'u1', instanceId } }),
+    )) as import('../../shared/types').TaskInstanceTimingResult;
+
+    expect(transacts).toBe(1); // the losing attempt; the retry re-read found nothing to close
+    expect(result.instance.activeStepId).toBeUndefined();
+    expect(result.instance.activeDurationSeconds).toBe(605); // reflects the winner's write
+    expect(result.previousStep).toBeNull();
+  });
+
+  it('clears a corrupt active pointer that has no activeStepStartedAt (self-healing)', async () => {
+    db.instance = {
+      status: 'IN_PROGRESS', instanceId, scheduledDate: '2099-07-02', scheduledTime: '09:00',
+      activeStepId: 's1', // present, but activeStepStartedAt missing (corrupt/legacy partial pointer)
+      activeDurationSeconds: 3,
+    };
+
+    const result = (await handler(
+      event('pauseTaskInstanceTimer', { input: { userId: 'u1', instanceId } }),
+    )) as import('../../shared/types').TaskInstanceTimingResult;
+
+    const tx = byCommand('TransactWriteCommand')[0];
+    expect(tx.TransactItems).toHaveLength(1); // no step write — nothing to attribute
+    const inst = tx.TransactItems[0].Update;
+    expect(inst.ExpressionAttributeValues[':delta']).toBe(0);
+    // Guard matches the corrupt shape: pointer present, no start.
+    expect(inst.ConditionExpression).toContain('attribute_not_exists(activeStepStartedAt)');
+    expect(result.instance.activeStepId).toBeUndefined(); // cleared, not left dangling
+    expect(result.instance.activeDurationSeconds).toBe(3); // nothing counted
+    expect(result.previousStep).toBeNull();
+  });
+
+  it('rejects pausing a terminal (CANCELLED) instance', async () => {
+    db.instance = { status: 'CANCELLED', instanceId, scheduledDate: '2099-07-02', scheduledTime: '09:00' };
+    await expect(
+      handler(event('pauseTaskInstanceTimer', { input: { userId: 'u1', instanceId } })),
+    ).rejects.toThrow('cannot change timing on a CANCELLED instance');
+    expect(byCommand('TransactWriteCommand')).toHaveLength(0);
   });
 });
 
@@ -309,6 +704,59 @@ describe('updateTaskInstanceStatus', () => {
     // A status change never leaves a stale opposite-terminal timestamp behind.
     expect(update.UpdateExpression).toContain('REMOVE skippedAt');
     expect(result.status).toBe('COMPLETED');
+  });
+
+  it('records elapsedSeconds (startedAt→now) when completing with no active step', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2099-07-02T09:10:00.000Z'));
+    db.instance = {
+      status: 'IN_PROGRESS',
+      instanceId: 'a1#2099-07-02#09:00',
+      startedAt: '2099-07-02T09:00:00.000Z', // 600s before "now"
+      activeDurationSeconds: 250,
+    };
+    mockQueryAllItems.mockResolvedValue([{ completed: true }]);
+    const result = (await handler(
+      event('updateTaskInstanceStatus', { input: { ...base, status: 'COMPLETED' } }),
+    )) as TaskInstance;
+    // Single in-place update (no timer running), stamping elapsedSeconds and clearing any pointer.
+    expect(byCommand('TransactWriteCommand')).toHaveLength(0);
+    const update = byCommand('UpdateCommand')[0];
+    expect(update.UpdateExpression).toContain('elapsedSeconds = :elapsed');
+    expect(update.UpdateExpression).toContain('REMOVE skippedAt, activeStepId, activeStepStartedAt');
+    expect(update.ExpressionAttributeValues[':elapsed']).toBe(600);
+    expect(result.status).toBe('COMPLETED');
+  });
+
+  it('closes a running step and sets elapsedSeconds when completing', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2099-07-02T09:10:00.000Z'));
+    db.instance = {
+      status: 'IN_PROGRESS',
+      instanceId: 'a1#2099-07-02#09:00',
+      scheduledDate: '2099-07-02',
+      scheduledTime: '09:00',
+      startedAt: '2099-07-02T09:00:00.000Z', // elapsed = 600s
+      activeStepId: 's1',
+      activeStepStartedAt: '2099-07-02T09:05:00.000Z', // step delta = 300s
+      activeDurationSeconds: 100,
+    };
+    mockQueryAllItems.mockResolvedValue([{ completed: true }]);
+    db.steps = { s1: { stepId: 's1', activeDurationSeconds: 100 } };
+
+    const result = (await handler(
+      event('updateTaskInstanceStatus', { input: { ...base, status: 'COMPLETED' } }),
+    )) as TaskInstance;
+
+    const tx = byCommand('TransactWriteCommand');
+    expect(tx).toHaveLength(1);
+    const inst = tx[0].TransactItems.find((t: Rec) => t.Update.Key.SK === 'TASK_INSTANCE#2099-07-02#09:00#a1')!.Update;
+    expect(inst.ExpressionAttributeValues[':elapsed']).toBe(600);
+    expect(inst.ExpressionAttributeValues[':delta']).toBe(300);
+    expect(inst.UpdateExpression).toContain('REMOVE skippedAt, activeStepId, activeStepStartedAt');
+    // elapsedSeconds is wall-clock (600); activeDurationSeconds accumulates the 300s step run.
+    expect(result.status).toBe('COMPLETED');
+    expect(result.elapsedSeconds).toBe(600);
+    expect(result.activeDurationSeconds).toBe(400);
+    expect(result.activeStepId).toBeUndefined();
   });
 
   it('clears completedAt/skippedAt when moving to IN_PROGRESS', async () => {
@@ -338,6 +786,48 @@ describe('updateTaskInstanceStatus', () => {
       handler(event('updateTaskInstanceStatus', { input: { ...base, status: 'COMPLETED' } })),
     ).rejects.toThrow('one or more steps are incomplete');
     expect(byCommand('UpdateCommand')).toHaveLength(0);
+  });
+
+  it('SKIPPED with no active step is a single update that clears any stale active pointer', async () => {
+    db.instance = { status: 'IN_PROGRESS', instanceId: 'a1#2099-07-02#09:00' };
+    const result = (await handler(
+      event('updateTaskInstanceStatus', { input: { ...base, status: 'SKIPPED' } }),
+    )) as TaskInstance;
+    expect(byCommand('TransactWriteCommand')).toHaveLength(0);
+    const update = byCommand('UpdateCommand')[0];
+    expect(update.UpdateExpression).toContain('skippedAt = :now');
+    expect(update.UpdateExpression).toContain('REMOVE completedAt, activeStepId, activeStepStartedAt');
+    expect(result.status).toBe('SKIPPED');
+  });
+
+  it('SKIPPED closes a running step and clears activeStepId (no stale timer on a terminal instance)', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2099-07-02T09:10:00.000Z'));
+    db.instance = {
+      status: 'IN_PROGRESS',
+      instanceId: 'a1#2099-07-02#09:00',
+      scheduledDate: '2099-07-02',
+      scheduledTime: '09:00',
+      activeStepId: 's1',
+      activeStepStartedAt: '2099-07-02T09:00:00.000Z', // 600s ago
+      activeDurationSeconds: 40,
+    };
+    db.steps = { s1: { stepId: 's1', activeDurationSeconds: 40 } };
+
+    const result = (await handler(
+      event('updateTaskInstanceStatus', { input: { ...base, status: 'SKIPPED' } }),
+    )) as TaskInstance;
+
+    const tx = byCommand('TransactWriteCommand');
+    expect(tx).toHaveLength(1);
+    const inst = tx[0].TransactItems.find((t: Rec) => t.Update.Key.SK === 'TASK_INSTANCE#2099-07-02#09:00#a1')!.Update;
+    expect(inst.ExpressionAttributeValues[':delta']).toBe(600);
+    expect(inst.UpdateExpression).toContain('skippedAt = :now');
+    expect(inst.UpdateExpression).toContain('REMOVE completedAt, activeStepId, activeStepStartedAt');
+    // Final active time accumulated; no active pointer survives onto the terminal instance.
+    expect(result.status).toBe('SKIPPED');
+    expect(result.activeDurationSeconds).toBe(640);
+    expect(result.activeStepId).toBeUndefined();
+    expect(result.activeStepStartedAt).toBeUndefined();
   });
 
   it('rejects changing the status of a terminal (COMPLETED) instance — no rewinding', async () => {
@@ -416,6 +906,31 @@ describe('cancelTaskInstance', () => {
     expect(byCommand('UpdateCommand')).toHaveLength(1);
     expect(result.status).toBe('CANCELLED');
     expect(result.isException).toBe(true);
+  });
+
+  it('closes a running step and clears activeStepId when cancelling an active instance', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2099-07-02T09:10:00.000Z'));
+    db.assignment = RECURRING;
+    db.instance = {
+      instanceId: 'a1#2099-07-02#09:00', status: 'IN_PROGRESS',
+      scheduledDate: '2099-07-02', scheduledTime: '09:00', startedAt: 'earlier',
+      activeStepId: 's1', activeStepStartedAt: '2099-07-02T09:00:00.000Z', // 600s ago
+      activeDurationSeconds: 20,
+    };
+    db.steps = { s1: { stepId: 's1', activeDurationSeconds: 20 } };
+
+    const result = (await handler(event('cancelTaskInstance', { input: cancelArgs }))) as TaskInstance;
+
+    // Cancelling an active instance closes the step transactionally rather than via a lone upsert.
+    const tx = byCommand('TransactWriteCommand');
+    expect(tx).toHaveLength(1);
+    const inst = tx[0].TransactItems.find((t: Rec) => t.Update.Key.SK === 'TASK_INSTANCE#2099-07-02#09:00#a1')!.Update;
+    expect(inst.ExpressionAttributeValues[':delta']).toBe(600);
+    expect(inst.UpdateExpression).toContain('REMOVE completedAt, skippedAt, activeStepId, activeStepStartedAt');
+    expect(result.status).toBe('CANCELLED');
+    expect(result.isException).toBe(true);
+    expect(result.activeDurationSeconds).toBe(620); // 20 + 600
+    expect(result.activeStepId).toBeUndefined();
   });
 });
 
@@ -739,6 +1254,31 @@ describe('read APIs derive OVERDUE consistently with getTaskInstanceViews', () =
       )) as TaskInstance;
       expect(result.status).toBe(status);
     }
+  });
+});
+
+// ── backward compatibility (legacy rows without activeDurationSeconds) ─────────
+describe('legacy rows missing activeDurationSeconds default to 0', () => {
+  it('getTaskInstance returns activeDurationSeconds: 0 for a legacy instance row', async () => {
+    // storedInstance() carries no activeDurationSeconds (pre-timing row).
+    db.instance = storedInstance();
+    const result = (await handler(
+      event('getTaskInstance', { instanceId: 'a1#2099-07-02#09:00' }, 'u1'),
+    )) as TaskInstance;
+    expect(result.activeDurationSeconds).toBe(0);
+  });
+
+  it('listTaskInstanceSteps returns activeDurationSeconds: 0 for legacy step snapshots', async () => {
+    mockSend.mockImplementation((command: { constructor: { name: string }; input: Rec }) => {
+      if (command.constructor.name === 'QueryCommand') {
+        return Promise.resolve({ Items: [{ stepId: 's1', order: 1, text: 'x', completed: false }] });
+      }
+      return Promise.resolve({});
+    });
+    const result = (await handler(
+      event('listTaskInstanceSteps', { userId: 'u1', instanceId: 'a1#2099-07-02#09:00' }),
+    )) as Connection<TaskInstanceStep>;
+    expect(result.items[0].activeDurationSeconds).toBe(0);
   });
 });
 

@@ -184,7 +184,8 @@ type TaskAssignment {
 }
 
 # One concrete occurrence of a scheduled assignment — created lazily when a user acts on it.
-# Stores status + lifecycle timestamps. instanceId = <assignmentId>#<scheduledDate>#<scheduledTime>.
+# Stores status + lifecycle timestamps and server-calculated active timing. instanceId =
+# <assignmentId>#<scheduledDate>#<scheduledTime>.
 type TaskInstance {
   instanceId: ID!
   assignmentId: ID!
@@ -199,6 +200,17 @@ type TaskInstance {
   completedAt: String
   skippedAt: String
   cancelledAt: String
+  # Active timing (server-calculated; clients never supply durations). `activeStepId` is the
+  # step the timer is currently running on (null when paused or nothing is active);
+  # `activeStepStartedAt` is the server ISO instant that step's current run began.
+  activeStepId: ID
+  activeStepStartedAt: String
+  # Total active seconds accumulated across all of this instance's steps (running interval
+  # excluded until closed). Always present — 0 for a freshly started or legacy instance.
+  activeDurationSeconds: Int!
+  # Wall-clock seconds from startedAt to completedAt, set only when the instance is COMPLETED
+  # (null otherwise). Unlike activeDurationSeconds this includes paused/idle time.
+  elapsedSeconds: Int
   # True when the instance diverges from the plain schedule (e.g. a cancelled occurrence).
   isException: Boolean
   createdAt: String!
@@ -206,7 +218,8 @@ type TaskInstance {
 }
 
 # An immutable snapshot of one TaskStep captured into one TaskInstance when it is started.
-# Per-occurrence completion lives here. Carries text/completion only — NOT media.
+# Per-occurrence completion and server-calculated active timing live here. Carries
+# text/completion/timing only — NOT media.
 type TaskInstanceStep {
   instanceId: ID!
   assignmentId: ID!
@@ -216,8 +229,24 @@ type TaskInstanceStep {
   text: String!
   completed: Boolean!
   completedAt: String
+  # Active timing (server-calculated). `firstStartedAt` is when the step was first started
+  # (stamped once), `lastStartedAt` the most recent start; both null until first started.
+  firstStartedAt: String
+  lastStartedAt: String
+  # Total active seconds this step has accumulated. Always present — 0 until first started or
+  # for a legacy snapshot.
+  activeDurationSeconds: Int!
   createdAt: String!
   updatedAt: String!
+}
+
+# Returned by startTaskInstanceStep / pauseTaskInstanceTimer. `instance` is the updated
+# TaskInstance; `activeStep` is the step now running (null after a pause); `previousStep` is
+# the step that was just closed and had its active duration accumulated (null when none was).
+type TaskInstanceTimingResult {
+  instance: TaskInstance!
+  activeStep: TaskInstanceStep
+  previousStep: TaskInstanceStep
 }
 
 # A calendar cell for getTaskInstanceViews: a real TaskInstance overlaid on its scheduled
@@ -553,12 +582,30 @@ input StartTaskInstanceInput {
   scheduledTime: String!
 }
 
-# Toggle one TaskInstanceStep's completion on an existing, non-terminal instance.
+# Toggle one TaskInstanceStep's completion on an existing, non-terminal instance. Completing
+# the step that is currently active first closes the timer and accumulates its active seconds.
 input SetTaskInstanceStepCompletionInput {
   userId: ID!
   instanceId: ID!
   stepId: ID!
   completed: Boolean!
+}
+
+# Start (or switch to) the timer for one step of a non-terminal instance. Uses server time
+# only — no client duration. Idempotent when the step is already active; switching from a
+# different active step first closes that step and accumulates its active seconds.
+input StartTaskInstanceStepInput {
+  userId: ID!
+  instanceId: ID!
+  stepId: ID!
+}
+
+# Pause the active-step timer for an instance (app backgrounded, task page left, screen locked,
+# or manual pause): closes the active step, accumulates its active seconds, and clears the active
+# pointer. Idempotent when nothing is active. Uses server time only.
+input PauseTaskInstanceTimerInput {
+  userId: ID!
+  instanceId: ID!
 }
 
 # Set a TaskInstance's status. Accepts IN_PROGRESS, COMPLETED, SKIPPED (OVERDUE rejected —
@@ -855,8 +902,16 @@ type Mutation {
   # Materialize one occurrence (status IN_PROGRESS) and snapshot the task's current steps into
   # TaskInstanceStep rows, atomically. Idempotent when the instance already exists.
   startTaskInstance(input: StartTaskInstanceInput!): TaskInstance!
-  # Toggle one instance step's completion. Rejected on a terminal (COMPLETED/SKIPPED/CANCELLED) instance.
+  # Toggle one instance step's completion. Completing the currently-active step first closes its
+  # timer (accumulating its active seconds). Rejected on a terminal (COMPLETED/SKIPPED/CANCELLED) instance.
   setTaskInstanceStepCompletion(input: SetTaskInstanceStepCompletionInput!): TaskInstanceStep!
+  # Start (or switch to) a step's timer on a non-terminal instance (server time only). Idempotent
+  # when the step is already active; switching closes the previously-active step first. Rejected
+  # on a terminal instance.
+  startTaskInstanceStep(input: StartTaskInstanceStepInput!): TaskInstanceTimingResult!
+  # Pause an instance's active-step timer (background/leave/lock/manual): closes the active step,
+  # accumulates its active seconds, and clears the active pointer. Idempotent when nothing is active.
+  pauseTaskInstanceTimer(input: PauseTaskInstanceTimerInput!): TaskInstanceTimingResult!
   # Set an instance's status (IN_PROGRESS/COMPLETED/SKIPPED). COMPLETED requires all steps complete;
   # SKIPPED can be undone by setting IN_PROGRESS.
   updateTaskInstanceStatus(input: UpdateTaskInstanceStatusInput!): TaskInstance!

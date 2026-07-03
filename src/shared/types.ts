@@ -207,8 +207,9 @@ export interface TaskAssignment {
 
 /**
  * One concrete occurrence of a scheduled TaskAssignment — created lazily (startTaskInstance,
- * cancelTaskInstance) when a user acts on an occurrence. Stores status + lifecycle timestamps.
- * PK = USER#<userId>, SK = TASK_INSTANCE#<scheduledDate>#<scheduledTime>#<assignmentId>;
+ * cancelTaskInstance) when a user acts on an occurrence. Stores status + lifecycle timestamps
+ * and server-calculated active timing. PK = USER#<userId>,
+ * SK = TASK_INSTANCE#<scheduledDate>#<scheduledTime>#<assignmentId>;
  * instanceId = <assignmentId>#<scheduledDate>#<scheduledTime>.
  */
 export interface TaskInstance {
@@ -232,6 +233,19 @@ export interface TaskInstance {
   completedAt?: string;
   skippedAt?: string;
   cancelledAt?: string;
+  /**
+   * Active timing (server-calculated — clients never supply durations). `activeStepId` is the
+   * step whose timer is currently running (absent when paused / nothing active) and
+   * `activeStepStartedAt` the server ISO instant that run began. `activeDurationSeconds` is the
+   * accumulated active time across all steps (the currently-running interval is excluded until
+   * the step is closed); it is always present on presented rows, defaulting to 0 for freshly
+   * started or legacy instances. `elapsedSeconds` is wall-clock startedAt→completedAt, set only
+   * when the instance is COMPLETED (it includes paused/idle time, unlike activeDurationSeconds).
+   */
+  activeStepId?: string;
+  activeStepStartedAt?: string;
+  activeDurationSeconds: number;
+  elapsedSeconds?: number;
   /** True when this instance diverges from the plain schedule (e.g. a cancelled occurrence). */
   isException?: boolean;
   createdAt: string;
@@ -240,8 +254,8 @@ export interface TaskInstance {
 
 /**
  * An immutable snapshot of one TaskStep captured into one TaskInstance when the instance is
- * started. Per-occurrence completion lives here. PK = USER#<userId>,
- * SK = TASK_INSTANCE_STEP#<instanceId>#STEP#<stepId>.
+ * started. Per-occurrence completion and server-calculated active timing live here.
+ * PK = USER#<userId>, SK = TASK_INSTANCE_STEP#<instanceId>#STEP#<stepId>.
  */
 export interface TaskInstanceStep {
   instanceId: string;
@@ -252,8 +266,28 @@ export interface TaskInstanceStep {
   text: string;
   completed: boolean;
   completedAt?: string;
+  /**
+   * Active timing (server-calculated). `firstStartedAt` is stamped once when the step is first
+   * started; `lastStartedAt` refreshes on every start. `activeDurationSeconds` is the step's
+   * accumulated active time — always present on presented rows, defaulting to 0 until the step
+   * is first started (or for a legacy snapshot).
+   */
+  firstStartedAt?: string;
+  lastStartedAt?: string;
+  activeDurationSeconds: number;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * Result of startTaskInstanceStep / pauseTaskInstanceTimer. `instance` is the updated
+ * TaskInstance; `activeStep` is the step now running (null after a pause); `previousStep` is the
+ * step that was just closed with its active duration accumulated (null when none was closed).
+ */
+export interface TaskInstanceTimingResult {
+  instance: TaskInstance;
+  activeStep: TaskInstanceStep | null;
+  previousStep: TaskInstanceStep | null;
 }
 
 /**
@@ -520,12 +554,36 @@ export interface StartTaskInstanceInput {
   scheduledTime: string;
 }
 
-/** Toggle one TaskInstanceStep's completion on an existing, non-terminal instance. */
+/**
+ * Toggle one TaskInstanceStep's completion on an existing, non-terminal instance. Completing the
+ * step that is currently active first closes its timer and accumulates its active seconds.
+ */
 export interface SetTaskInstanceStepCompletionInput {
   userId: string;
   instanceId: string;
   stepId: string;
   completed: boolean;
+}
+
+/**
+ * Start (or switch to) one step's timer on a non-terminal instance. Server time only — no client
+ * duration. Idempotent when the step is already active; switching from a different active step
+ * first closes it and accumulates its active seconds.
+ */
+export interface StartTaskInstanceStepInput {
+  userId: string;
+  instanceId: string;
+  stepId: string;
+}
+
+/**
+ * Pause an instance's active-step timer (app backgrounded, task page left, screen locked, or
+ * manual pause): close the active step, accumulate its active seconds, clear the active pointer.
+ * Idempotent when nothing is active. Server time only.
+ */
+export interface PauseTaskInstanceTimerInput {
+  userId: string;
+  instanceId: string;
 }
 
 /**
