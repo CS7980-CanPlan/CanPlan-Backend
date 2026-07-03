@@ -1,6 +1,6 @@
 # CanPlan 2.0 — Frontend API Reference
 
-_Last updated: 2026-07-04. Version: SupportPerson delegation (schedules, categories, task templates) + organization management._
+_Last updated: 2026-07-06. Version: SupportPerson delegation (schedules, categories, task templates) + organization management + AI progress reports._
 
 > ## 🚨 Breaking change — categories, default category, Task status, TaskStep keys
 >
@@ -48,6 +48,11 @@ human-readable companion.
 > stored `ownerId`; and `createMediaAsset` stores the task's owner as the asset owner (a
 > client-supplied `ownerId` is ignored). Delegated writes always land under the target
 > **primary user's** account, never the SupportPerson's. Anyone else gets `NOT_AUTHORIZED`.
+>
+> The **report operations** (`generateReport`, `listReports`, `getReportDownloadUrl`) use a
+> separate delegated check: the caller must hold an **ACTIVE `SupportLink`** to the target
+> `userId` and is denied otherwise (an interim rule until the general permission model lands —
+> see [AI progress reports](#ai-progress-reports--generatereport--listreports--getreportdownloadurl)).
 >
 > **Self-scoped TaskInstance reads.** `getTaskInstance`, `listTaskInstances`, and
 > `batchGetTaskInstances` take **no `userId`** — they derive the owner from the caller's `sub`
@@ -204,6 +209,7 @@ GraphQL types below. The key layout (for reference):
 | TaskInstance | `USER#<userId>` | `TASK_INSTANCE#<scheduledDate>#<scheduledTime>#<assignmentId>` |
 | TaskInstanceStep | `USER#<userId>` | `TASK_INSTANCE_STEP#<instanceId>#STEP#<stepId>` |
 | MediaAsset | `TASK#<taskId>` | `MEDIA#<assetId>` |
+| Report | `USER#<primaryUserId>` | `REPORT#<createdAt>#<reportId>` (chronological, so `listReports` reads newest-first) |
 
 Seven GSIs serve the cross-cutting lists: `supporterIndex` (users managed by a
 supporter), `primaryUserSupportLinkIndex` (`SupportLink`s by primary user — keyed on
@@ -290,6 +296,10 @@ object instead is the most common mistake here and is rejected at the AppSync ed
 In practice: `accessibilitySettings: JSON.stringify(settings)` on the way in.
 **Responses are symmetric** — these fields come back as JSON strings, so
 `JSON.parse(profile.accessibilitySettings)` on the way out.
+
+`Report.scope` and `Report.dateRange` are also `AWSJSON`, but **output-only** — there is
+nothing to encode on the way in; on the way out they are JSON strings like the others:
+`JSON.parse(report.scope)` → `{ userId }`, `JSON.parse(report.dateRange)` → `{ from, to }`.
 
 ---
 
@@ -1357,6 +1367,113 @@ mutation CreateAiTask($input: CreateAiTaskInput!) {
 
 ---
 
+### AI progress reports — `generateReport` / `listReports` / `getReportDownloadUrl`
+
+Lets a **support person** generate an AI progress report about a cared-for primary
+user over a date range, list that user's reports, and download one. Every number is
+**computed in code** from the user's task data; the AI (Bedrock) writes only the
+**narrative** prose over those pre-computed stats — it is instructed not to invent
+numbers and not to give medical/clinical/behavioral advice.
+
+| Operation | Input | Returns |
+|---|---|---|
+| `generateReport` (mutation) | `input: { userId!, from!, to! }` | `Report!` · **synchronous**: gathers the user's instances in `[from, to]`, computes the stats, has the AI write the narrative, then persists the full JSON to S3 (`reports/<userId>/<reportId>.json` in the private media bucket) plus a DynamoDB index row. `from`/`to` are plain `YYYY-MM-DD` (inclusive); `from ≤ to` and the span is capped at **366 days** — violations are `VALIDATION` errors. If stats or narrative generation fails, **nothing is persisted** (no half-saved report). Expect a few seconds of latency (one Bedrock call). `createdBy` records the caller. |
+| `listReports` (query) | `userId!, limit, nextToken` | `ReportConnection!` · the user's report metadata rows, **newest-first**, paginated like every other list. |
+| `getReportDownloadUrl` (query) | `userId!, reportId!` | `MediaDownloadTarget!` · short-lived presigned **GET** for the report's JSON document (same `{ downloadUrl, s3Key, expiresIn }` shape and TTL as media downloads). Only signs reports that actually exist for that user — an unknown `reportId` is a not-found error, never an arbitrary-key signature. |
+
+> **Authorization — enforced, and different from everything else.** All three
+> operations require the caller to hold an **ACTIVE `SupportLink` to `userId`** — the
+> API's first *delegated* check (every other enforced rule is strict self-ownership).
+> No link, or a `PENDING`/`REVOKED` one, is denied (surfaced per the
+> [error-handling stability caveat](#errortype-codes)). Note the corollary: under this
+> interim rule a primary user **cannot** call these on themselves — reports are a
+> supporter-facing feature. The rule is a seam that will be swapped for the team's
+> general permission model without changing the API shape.
+
+> **`Report` (GraphQL) is only the metadata row** — `{ reportId, scope, dateRange,
+> s3Key, createdBy, createdAt }`. The stats and narrative are **not** exposed through
+> GraphQL. `scope` and `dateRange` are `AWSJSON`, so they arrive as JSON **strings**
+> (see [the `AWSJSON` foot-gun](#awsjson-fields--encoding-foot-gun)):
+> `JSON.parse(scope)` → `{ userId }`, `JSON.parse(dateRange)` → `{ from, to }`.
+>
+> To read the actual report, call `getReportDownloadUrl` and `GET` the `downloadUrl`.
+> The body is one JSON document (here `scope`/`dateRange` are plain nested objects —
+> it's a raw S3 object, not a GraphQL response):
+>
+> ```jsonc
+> {
+>   "reportId": "…",
+>   "scope": { "userId": "…" },
+>   "dateRange": { "from": "2026-06-01", "to": "2026-06-30" },
+>   "createdBy": "<caller's sub>",
+>   "createdAt": "2026-07-03T…Z",
+>   "stats": { /* see below */ },
+>   "narrative": "2–4 short paragraphs of plain-language AI summary"
+> }
+> ```
+
+> **What's in `stats`.** Deterministic aggregations over the user's **materialized**
+> `TaskInstance` rows (and their step snapshots) in the range:
+>
+> - `meta` — `userId`, `from`, `to`, `basis: "attempted-instances-only"` (see below),
+>   `totalInstances`.
+> - `completion` — instance counts by status (`completed` / `skipped` / `cancelled` /
+>   `overdue` / `inProgress` / `toDo`; `OVERDUE` derived at read time exactly like the
+>   instance queries) plus an overall `completionRate`.
+> - `trend` — weekly completion (`weekStart` = ISO Monday): `completed`, `total`,
+>   `completionRate` per week.
+> - `byCategory` / `byTask` — `completed` / `total` / `completionRate` per category and
+>   per task template (with names/titles resolved).
+> - `stepDwell` — per task step (grouped by task + step order): `samples` and
+>   `avgSeconds` of **server-measured active time**
+>   (`TaskInstanceStep.activeDurationSeconds` — see the **Active-step timing** note in
+>   the scheduling section; pauses/idle excluded). A step is a sample once it was ever
+>   started, completed or not — effort sunk into an abandoned step is exactly the
+>   sticking-point signal. Never-started and pre-timing (legacy) steps are not samples.
+> - `focus` — per-task average **instance-level** active seconds (`byTask`), plus one
+>   overall `focusRatio` = active ÷ wall-clock seconds summed over `COMPLETED`
+>   instances (`null` when none qualify). A low ratio means the task was often
+>   interrupted or left idle.
+> - `skipPatterns` — skips per task plus a 24-bucket `byHour` histogram (hour of
+>   `skippedAt` in the instance's own timezone).
+> - `abandonment` — instances that were started but never finished (status neither
+>   `COMPLETED` nor `CANCELLED` at report time — includes skipped-after-starting), each
+>   with `stalledAtStepOrder` (the first incomplete step, or `null`).
+> - `timeOfDay` — 24-bucket histogram of the hour each completed instance finished.
+>
+> **Basis foot-gun — engagement, not adherence.** Rates cover only instances the user
+> actually **acted on** (real rows). Scheduled occurrences that were never started or
+> cancelled don't exist as rows and are **not counted as misses** — recurrence is not
+> expanded. So `completionRate` means "of what was attempted, how much got done", not
+> "how much of the schedule was followed". The narrative is instructed to say so
+> whenever it mentions rates; surface the same framing in the UI.
+
+```graphql
+mutation GenerateReport($input: GenerateReportInput!) {
+  # input: { userId: "<primary user's sub>", from: "2026-06-01", to: "2026-06-30" }
+  generateReport(input: $input) {
+    reportId
+    scope       # AWSJSON string — JSON.parse → { userId }
+    dateRange   # AWSJSON string — JSON.parse → { from, to }
+    createdBy
+    createdAt
+  }
+}
+
+query ReadReports($userId: ID!, $reportId: ID!) {
+  listReports(userId: $userId) {
+    items { reportId dateRange createdAt }
+    nextToken
+  }
+  getReportDownloadUrl(userId: $userId, reportId: $reportId) {
+    downloadUrl   # GET this URL → the full JSON document (stats + narrative)
+    expiresIn
+  }
+}
+```
+
+---
+
 ## Error handling
 
 GraphQL does **not** use HTTP status codes for field-level problems. A request that
@@ -1425,8 +1542,6 @@ Planned but not implemented — don't build against them:
   (`updateCategory`), tasks (`updateTask`), task steps (`updateTaskStep`), task-step ordering
   (`reorderTaskSteps`), whole-owner task ordering (`updateTaskOrder`), and task-instance
   status (`updateTaskInstanceStatus`); other entities have no update yet.
-- **Report generation** — the `Report` type exists in the schema, but no query or
-  mutation is exposed for it yet.
 - **Streaming AI responses** — `generateTaskSteps` is request/response only.
 
 ---
