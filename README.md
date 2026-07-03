@@ -21,7 +21,7 @@ TaskInstance, TaskInstanceStep, MediaAsset, Report. The item-key conventions liv
 | `createUserProfile`, `updateMyUserProfile`, `createSupportLink`, `getUserProfile`, `listUsersByOrganization`, `listPrimaryUsersBySupporter` | Query/Mutation | `canplan-users-<env>` Lambda + DynamoDB (createUserProfile also creates the user's default category atomically) |
 | `createCategory`, `updateCategory`, `deleteCategory`, `listMyCategories` | Query/Mutation | `canplan-categories-<env>` Lambda + DynamoDB (owner derived from the Cognito identity; deleteCategory reparents tasks to the default category) |
 | `getTask`, `listTaskSteps`, `listTasksByOwner`, `listTasksByCategory`, `updateTask`, `createTaskStep`, `updateTaskStep`, `deleteTaskStep`, `reorderTaskSteps`, `deleteTask` | Query/Mutation | `canplan-tasks-<env>` Lambda + DynamoDB + S3 (media cleanup) |
-| `createTaskAssignment`, `startTaskInstance`, `setTaskInstanceStepCompletion`, `updateTaskInstanceStatus`, `cancelTaskInstance`, `endTaskAssignment`, `deleteTaskAssignment`, `listTaskAssignmentsForUser`, `getTaskInstanceViews`, `listTaskInstanceSteps` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB (TaskAssignment schedule rules; lazily-materialized TaskInstances; calendar feed) |
+| `createTaskAssignment`, `startTaskInstance`, `setTaskInstanceStepCompletion`, `updateTaskInstanceStatus`, `cancelTaskInstance`, `endTaskAssignment`, `deleteTaskAssignment`, `listTaskAssignmentsForUser`, `getTaskInstanceViews`, `getTaskInstance`, `listTaskInstances`, `batchGetTaskInstances`, `listTaskInstanceSteps` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB (TaskAssignment schedule rules; lazily-materialized TaskInstances; calendar feed; self-scoped instance reads) |
 | `createMediaUploadUrl`, `createTaskCoverImageUploadUrl`, `createMediaAsset`, `deleteMediaAsset`, `getMediaDownloadUrl`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB + S3 media bucket (presigned upload/download, cover images, cascade delete) |
 | `listAllUsers`, `listAllTasks` | Query | `canplan-admin-<env>` Lambda + DynamoDB `entityTypeIndex` (SystemAdmin only, paginated) |
 | `inviteSupportPerson`, `inviteOrganizationAdmin`, `setUserBaseRole`, `setSystemAdmin`, `adminDeleteTask`, `adminDeleteUser` | Mutation | `canplan-admin-<env>` Lambda + Cognito + DynamoDB + S3 (SystemAdmin only — manage Cognito roles, delete any task, full user deletion) |
@@ -71,9 +71,12 @@ Cognito sign-in flow. **Task and Category operations are owner-scoped** — ever
 `getTask`/`list*`/`updateTask`/`deleteTask`/`*TaskStep`/`reorderTaskSteps` and all category
 operations require the caller's Cognito `sub` to equal the resource's `ownerId` (strict
 self-ownership via [src/shared/authz.ts](src/shared/authz.ts); a foreign owner is rejected).
-Per-role/delegated authorization (e.g. a support person acting for a primary user) and
-owner checks on the remaining profile/assignment/support-link operations are **not enforced
-yet**.
+The **self-scoped TaskInstance reads** (`getTaskInstance`, `listTaskInstances`,
+`batchGetTaskInstances`) are likewise enforced — they take no `userId`, derive the owner from
+the caller's `sub`, and reject an unauthenticated caller. Per-role/delegated authorization
+(e.g. a support person acting for a primary user) and owner checks on the remaining
+profile/assignment/support-link operations that take a `userId`/`ownerId` argument are **not
+enforced yet**.
 
 Self-registered users who verify their email and confirm sign-up are automatically
 added to the `PrimaryUser` group — a Cognito Post Confirmation trigger
@@ -152,7 +155,11 @@ schedule). A `TaskAssignment` is the schedule rule binding a template to a user,
 `startTaskInstance` lazily materializes a `TaskInstance` (status + lifecycle timestamps) and
 snapshots the task's current steps into immutable `TaskInstanceStep` rows. `cancelTaskInstance`
 writes a `CANCELLED` exception; `endTaskAssignment`/`deleteTaskAssignment` end an assignment
-(soft delete). An active assignment carries a sparse `activeTaskAssignmentTaskId` marker
+(soft delete). For reading back **materialized** instances there are three **self-scoped** queries
+(owner derived from the Cognito identity, no `userId` argument, real rows only — never virtual):
+`getTaskInstance(instanceId)`, `listTaskInstances(startDate, endDate)` (date-range page), and
+`batchGetTaskInstances(instanceIds)` (≤ 100 ids, results in request order). An active assignment
+carries a sparse `activeTaskAssignmentTaskId` marker
 (`activeTaskAssignmentTaskIndex` GSI), so `deleteTask` is rejected while any active assignment
 still references the template. See [docs/API.md](docs/API.md) for the full contract.
 

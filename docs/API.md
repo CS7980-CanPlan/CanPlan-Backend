@@ -31,20 +31,27 @@ The schema lives at [graphql/schema.graphql](../graphql/schema.graphql) — it i
 canonical source of truth for exact types and nullability; this doc is its
 human-readable companion.
 
-> ## ⚠️ Authorization: Task & Category operations are owner-scoped; the rest are not yet
+> ## ⚠️ Authorization: Task, Category & self-scoped instance reads are owner-scoped; most assignment ops are not yet
 >
 > **Enforced today:** the `SystemAdmin` admin queries; the **identity-scoped** creators
 > (`createUserProfile`, `createTask`) and **all category** operations, which derive the
-> owner from the caller's Cognito `sub` and ignore any client-supplied owner id; and
+> owner from the caller's Cognito `sub` and ignore any client-supplied owner id;
 > **every Task / TaskStep operation** — `getTask`, `listTaskSteps`, `listTasksByOwner`,
 > `listTasksByCategory`, `updateTask`, `deleteTask`, `createTaskStep`, `updateTaskStep`,
 > `deleteTaskStep`, `reorderTaskSteps` — which require the caller's `sub` to equal the
-> task's (or requested) `ownerId`, returning `NOT_AUTHORIZED` otherwise. There is no
-> delegated-role model yet, so this is strict self-ownership.
+> task's (or requested) `ownerId`, returning `NOT_AUTHORIZED` otherwise; and the
+> **self-scoped TaskInstance reads** — `getTaskInstance`, `listTaskInstances`,
+> `batchGetTaskInstances` — which take **no `userId`**, derive the owner from the caller's
+> `sub`, and return `NOT_AUTHORIZED` for an unauthenticated caller (so a caller can only
+> ever read their own instances). There is no delegated-role model yet, so this is strict
+> self-ownership.
 >
-> **Not enforced yet:** profile reads and the assignment / support-link operations still
+> **Not enforced yet:** profile reads and the remaining assignment / support-link operations
+> that take a `userId`/`ownerId` **argument** (`createTaskAssignment`, `startTaskInstance`,
+> `getTaskInstanceViews`, `listTaskInstanceSteps`, the instance-status mutations, …) still
 > let any authenticated caller act on any `id` (read another user's profile, assign a task
-> to any `userId`, link any supporter to any primary user). The schema and keys are
+> to any `userId`, link any supporter to any primary user). This does **not** apply to the
+> three self-scoped instance reads above, which are already enforced. The schema and keys are
 > structured to support per-role rules there, but they are **not implemented in this phase**.
 >
 > **Do not bake "the server lets me, so it's allowed" into the client.** When
@@ -73,6 +80,9 @@ of how data is keyed and read back:
   `listTaskInstanceSteps`, …) take a `userId`/`ownerId` **argument**. If you pass
   anything other than your own `sub` there, you will write rows you can never read
   back through your own profile, or read an empty result — silently, with no error.
+  (The newer `getTaskInstance` / `listTaskInstances` / `batchGetTaskInstances` reads
+  are the exception — they take **no `userId`** and always resolve the owner from your
+  identity, so there is nothing to get wrong.)
 
 **Rule of thumb:** decode the `sub` claim from your Cognito ID token once at sign-in
 and use it as the `userId`/`ownerId` for everything that is "about me." Treat ids
@@ -706,6 +716,9 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 | `deleteTaskAssignment` | `input: { userId!, assignmentId! }` | `TaskAssignment!` · **soft delete** — `active: false`, `endedAt` set, `activeTaskAssignmentTaskId` removed (unblocking `deleteTask`). 404s if missing. |
 | `listTaskAssignmentsForUser` | `userId!, limit, nextToken` | `TaskAssignmentConnection!` · a user's schedule rules (active + ended). |
 | `getTaskInstanceViews` | `userId!, startDate!, endDate!` | `TaskInstanceViewConnection!` · the calendar feed (both dates `YYYY-MM-DD`, **max 370-day** span). See below. |
+| `getTaskInstance` | `instanceId!` | `TaskInstance` · **self-scoped** — reads one of your **own** materialized instances; the owner is the Cognito identity (**no `userId` argument**). `null` when it doesn't exist for you. `status` is derived (`OVERDUE` surfaced). See below. |
+| `listTaskInstances` | `startDate!, endDate!, limit, nextToken` | `TaskInstanceConnection!` · **self-scoped** — your **own** real/materialized instances in `[startDate, endDate]` (`YYYY-MM-DD`, same **max 370-day** span). **Only real rows** — never virtual occurrences. Truly paginated. See below. |
+| `batchGetTaskInstances` | `instanceIds!` | `[TaskInstanceLookupResult!]!` · **self-scoped** — batch-reads up to **100** of your **own** instances by id; returns one entry per id **in request order**, with `item: null` for ids that don't exist for you. `status` derived. See below. |
 | `listTaskInstanceSteps` | `userId!, instanceId!, limit, nextToken` | `TaskInstanceStepConnection!` · one instance's step snapshots, sorted by `order`. |
 
 > **`getTaskInstanceViews` is the calendar feed.** For `[startDate, endDate]` it (1) queries
@@ -722,6 +735,36 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 > query Calendar($userId: ID!, $startDate: String!, $endDate: String!) {
 >   getTaskInstanceViews(userId: $userId, startDate: $startDate, endDate: $endDate) {
 >     items { instanceId assignmentId taskId title scheduledDate scheduledTime status isVirtual isException }
+>   }
+> }
+> ```
+
+> **Self-scoped instance reads (`getTaskInstance` / `listTaskInstances` / `batchGetTaskInstances`).**
+> These three return **only real, materialized `TaskInstance` rows** and are **self-scoped**: the
+> owner is always the authenticated caller's Cognito identity, so — unlike the `userId`-argument
+> operations above — they take **no `userId`** and a caller can only ever read their **own**
+> instances (SupportPerson/delegated access is not wired for them yet). An unauthenticated caller
+> gets `NOT_AUTHORIZED`. Unlike `getTaskInstanceViews`, they **never synthesize virtual
+> occurrences** — use `getTaskInstanceViews` for the virtual + real calendar feed. `status` is
+> derived identically (`OVERDUE` surfaced for a past-due non-terminal instance; never written back).
+>
+> - `getTaskInstance(instanceId)` → the instance, or `null` if it doesn't exist for you. An
+>   invalid `instanceId` is a `VALIDATION` error.
+> - `listTaskInstances(startDate, endDate, limit, nextToken)` → your real instances whose
+>   `scheduledDate` falls in the window (date-sorted SK `BETWEEN`), paged by an opaque `nextToken`.
+> - `batchGetTaskInstances(instanceIds)` → one `TaskInstanceLookupResult { instanceId, item }` per
+>   requested id, **in the same order**, with `item: null` for ids missing for you. Requires a
+>   non-empty list of **≤ 100** ids; an empty list, > 100 ids, or any invalid id is a `VALIDATION` error.
+>
+> ```graphql
+> query MyInstances($startDate: String!, $endDate: String!, $ids: [ID!]!) {
+>   listTaskInstances(startDate: $startDate, endDate: $endDate) {
+>     items { instanceId assignmentId taskId scheduledDate scheduledTime status }
+>     nextToken
+>   }
+>   batchGetTaskInstances(instanceIds: $ids) {
+>     instanceId
+>     item { instanceId status scheduledFor }
 >   }
 > }
 > ```
@@ -1099,12 +1142,16 @@ Planned but not implemented — don't build against them:
   There is no delivery engine (EventBridge), no device-token registration, and no
   push-notification Lambda in this phase.
 - **Per-role/owner authorization on domain operations** — the `SystemAdmin` admin
-  queries are group-gated (enforced), and `createUserProfile` is self-scoped (it
-  derives `userId`/`email`/`role` from the caller's Cognito session). The other
-  create/get/list resolvers don't yet verify the caller (e.g. that a primary user
-  only reads their own data, or that a supporter owns the task). The schema and
-  single-table keys are structured to support these rules. **See the authorization
-  warning at the top of this doc** — when these land, currently-succeeding calls on
+  queries are group-gated (enforced), `createUserProfile` is self-scoped (it
+  derives `userId`/`email`/`role` from the caller's Cognito session), the Task/TaskStep
+  and category operations are owner-scoped, and the self-scoped TaskInstance reads
+  (`getTaskInstance`, `listTaskInstances`, `batchGetTaskInstances`) derive the owner from
+  the caller's `sub`. The **remaining** create/get/list resolvers that take a
+  `userId`/`ownerId` argument (profile reads, `getTaskInstanceViews`,
+  `listTaskInstanceSteps`, the assignment mutations, support-link ops) don't yet verify the
+  caller (e.g. that a primary user only reads their own data, or that a supporter owns the
+  task). The schema and single-table keys are structured to support these rules. **See the
+  authorization warning at the top of this doc** — when these land, currently-succeeding calls on
   someone else's id will start returning a `NOT_AUTHORIZED` error.
 - **Stable resolver `errorType` codes** — `VALIDATION` / `NOT_FOUND` / `NOT_AUTHORIZED`
   / `INTERNAL` (see [Error handling](#error-handling)) are the intended contract, but
@@ -1210,7 +1257,9 @@ model: `TaskAssignment` (schedule rule), `TaskInstance` (one occurrence with sta
   `TaskInstanceStep` rows exactly once (idempotent).
 - Operations: `startTaskInstance`, `updateTaskInstanceStatus`, `cancelTaskInstance`,
   `setTaskInstanceStepCompletion`, `getTaskInstanceViews` (the calendar feed),
-  `listTaskInstanceSteps`.
+  `listTaskInstanceSteps`, and the **self-scoped** materialized-instance reads
+  `getTaskInstance`, `listTaskInstances`, `batchGetTaskInstances` (owner derived from the
+  Cognito identity — no `userId` — real rows only, `OVERDUE` derived on read).
 
 **Recurrence**
 
