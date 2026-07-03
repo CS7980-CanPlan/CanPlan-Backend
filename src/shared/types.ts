@@ -977,6 +977,7 @@ export interface ReportStats {
     total: number;
     completionRate: number;
   }>;
+  /** Per-step average ACTIVE seconds (server-measured; pauses excluded). */
   stepDwell: Array<{
     taskId: string;
     title: string;
@@ -985,6 +986,11 @@ export interface ReportStats {
     samples: number;
     avgSeconds: number;
   }>;
+  /** Instance-level active time per task + overall active÷wall-clock ratio. */
+  focus: {
+    byTask: Array<{ taskId: string; title: string; samples: number; avgActiveSeconds: number }>;
+    focusRatio: number | null;
+  };
   skipPatterns: {
     byTask: Array<{ taskId: string; title: string; skipped: number }>;
     byHour: number[];

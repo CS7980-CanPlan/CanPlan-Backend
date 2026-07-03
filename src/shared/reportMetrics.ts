@@ -132,44 +132,38 @@ function stepsByInstance(steps: TaskInstanceStep[]): Map<string, TaskInstanceSte
   return map;
 }
 
+/**
+ * Per-step average ACTIVE time, from the server-authoritative step timers
+ * (`TaskInstanceStep.activeDurationSeconds` — paused/idle gaps excluded). A step is a
+ * sample once it has been started (`firstStartedAt`), completed or not: effort sunk into
+ * an abandoned step is exactly the sticking-point signal this metric exists to surface.
+ * Never-started steps and pre-timing (legacy) snapshots are not samples — raw legacy rows
+ * lack the timing attributes entirely, so the `?? 0` covers reading them.
+ */
 export function aggregateStepDwell(
-  instances: TaskInstance[],
   steps: TaskInstanceStep[],
   tasks: Task[],
 ): ReportStats['stepDwell'] {
   const titleOf = new Map(tasks.map((t) => [t.taskId, t.title]));
-  const byInstance = stepsByInstance(steps);
-  const instById = new Map(instances.map((i) => [i.instanceId, i]));
   // key = `${taskId}#${order}` → accumulated seconds + sample count + step text
   const acc = new Map<
     string,
     { taskId: string; stepOrder: number; stepText: string; totalSeconds: number; samples: number }
   >();
 
-  for (const [instanceId, instSteps] of byInstance.entries()) {
-    const inst = instById.get(instanceId);
-    if (!inst) continue;
-    let prev = inst.startedAt; // first step is measured from instance start
-    for (const s of instSteps) {
-      if (s.completedAt && prev) {
-        const seconds = (Date.parse(s.completedAt) - Date.parse(prev)) / 1000;
-        if (seconds >= 0) {
-          const key = `${s.taskId}#${s.order}`;
-          const a = acc.get(key) ?? {
-            taskId: s.taskId,
-            stepOrder: s.order,
-            stepText: s.text,
-            totalSeconds: 0,
-            samples: 0,
-          };
-          a.totalSeconds += seconds;
-          a.samples++;
-          acc.set(key, a);
-        }
-      }
-      // Advance the cursor only when this step has a timestamp and is not out-of-order.
-      if (s.completedAt && (!prev || s.completedAt >= prev)) prev = s.completedAt;
-    }
+  for (const s of steps) {
+    if (!s.firstStartedAt) continue;
+    const key = `${s.taskId}#${s.order}`;
+    const a = acc.get(key) ?? {
+      taskId: s.taskId,
+      stepOrder: s.order,
+      stepText: s.text,
+      totalSeconds: 0,
+      samples: 0,
+    };
+    a.totalSeconds += s.activeDurationSeconds ?? 0;
+    a.samples++;
+    acc.set(key, a);
   }
 
   return [...acc.values()]
@@ -182,6 +176,45 @@ export function aggregateStepDwell(
       samples: a.samples,
       avgSeconds: Math.round(a.totalSeconds / a.samples),
     }));
+}
+
+/**
+ * Per-task focused time from the instance-level timers, plus one overall focus ratio.
+ * An instance is a sample when its raw row carries `activeDurationSeconds` (written from
+ * materialization once server timing exists); pre-timing rows lack the attribute and are
+ * excluded rather than counted as zero. The ratio is active ÷ wall-clock seconds summed
+ * over COMPLETED instances with `elapsedSeconds` — low = the task was often interrupted
+ * or left idle; null when no instance qualifies.
+ */
+export function aggregateFocus(instances: TaskInstance[], tasks: Task[]): ReportStats['focus'] {
+  const titleOf = new Map(tasks.map((t) => [t.taskId, t.title]));
+  const acc = new Map<string, { taskId: string; totalSeconds: number; samples: number }>();
+  let activeSum = 0;
+  let elapsedSum = 0;
+
+  for (const inst of instances) {
+    if (typeof inst.activeDurationSeconds !== 'number') continue; // legacy raw row
+    const a = acc.get(inst.taskId) ?? { taskId: inst.taskId, totalSeconds: 0, samples: 0 };
+    a.totalSeconds += inst.activeDurationSeconds;
+    a.samples++;
+    acc.set(inst.taskId, a);
+    if (inst.status === 'COMPLETED' && typeof inst.elapsedSeconds === 'number' && inst.elapsedSeconds > 0) {
+      activeSum += inst.activeDurationSeconds;
+      elapsedSum += inst.elapsedSeconds;
+    }
+  }
+
+  return {
+    byTask: [...acc.values()]
+      .sort((a, b) => a.taskId.localeCompare(b.taskId))
+      .map((a) => ({
+        taskId: a.taskId,
+        title: titleOf.get(a.taskId) ?? a.taskId,
+        samples: a.samples,
+        avgActiveSeconds: Math.round(a.totalSeconds / a.samples),
+      })),
+    focusRatio: elapsedSum === 0 ? null : rate(activeSum, elapsedSum),
+  };
 }
 
 export function aggregateAbandonment(
@@ -257,7 +290,8 @@ export function computeReportStats(input: ReportComputeInput): ReportStats {
     trend: aggregateTrend(instances),
     byCategory: aggregateByCategory(instances, tasks, categories),
     byTask: aggregateByTask(instances, tasks),
-    stepDwell: aggregateStepDwell(instances, steps, tasks),
+    stepDwell: aggregateStepDwell(steps, tasks),
+    focus: aggregateFocus(instances, tasks),
     skipPatterns: aggregateSkipPatterns(instances, tasks),
     abandonment: aggregateAbandonment(instances, steps, tasks),
     timeOfDay: aggregateTimeOfDay(instances),

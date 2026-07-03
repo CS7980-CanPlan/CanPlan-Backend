@@ -4,6 +4,7 @@ import {
   aggregateByCategory,
   aggregateTrend,
   aggregateStepDwell,
+  aggregateFocus,
   aggregateAbandonment,
   aggregateSkipPatterns,
   aggregateTimeOfDay,
@@ -31,9 +32,18 @@ function inst(p: Partial<TaskInstance>): TaskInstance {
     scheduledFor: '2026-06-01T09:00:00.000Z',
     timezone: 'America/Toronto',
     status: 'COMPLETED',
+    activeDurationSeconds: 0,
     createdAt: NOW,
     ...p,
   };
+}
+
+/** A pre-timing row read raw from DynamoDB: the *DurationSeconds attributes don't exist. */
+function legacy<T extends TaskInstance | TaskInstanceStep>(row: T): T {
+  const r = row as unknown as Record<string, unknown>;
+  delete r.activeDurationSeconds;
+  delete r.elapsedSeconds;
+  return row;
 }
 
 describe('aggregateCompletion', () => {
@@ -118,36 +128,69 @@ function step(p: Partial<TaskInstanceStep>): TaskInstanceStep {
     order: 0,
     text: 'Step',
     completed: true,
+    activeDurationSeconds: 0,
     createdAt: NOW,
     updatedAt: NOW,
     ...p,
   };
 }
 
+const STARTED = '2026-06-01T09:00:00.000Z';
+
 describe('aggregateStepDwell', () => {
-  it('derives per-step seconds (first step from startedAt, later from prev completedAt)', () => {
-    const instances = [
-      inst({
-        instanceId: 'i1',
-        taskId: 't1',
-        startedAt: '2026-06-01T09:00:00.000Z',
-      }),
-    ];
+  it('averages server-measured active seconds per (task, step order) across instances', () => {
     const steps = [
-      step({ instanceId: 'i1', stepId: 's1', order: 0, text: 'A', completedAt: '2026-06-01T09:00:30.000Z' }),
-      step({ instanceId: 'i1', stepId: 's2', order: 1, text: 'B', completedAt: '2026-06-01T09:01:30.000Z' }),
+      step({ instanceId: 'i1', stepId: 's1', order: 0, text: 'A', firstStartedAt: STARTED, activeDurationSeconds: 30 }),
+      step({ instanceId: 'i2', stepId: 's1', order: 0, text: 'A', firstStartedAt: STARTED, activeDurationSeconds: 90 }),
+      step({ instanceId: 'i1', stepId: 's2', order: 1, text: 'B', firstStartedAt: STARTED, activeDurationSeconds: 60 }),
     ];
     const tasks = [{ taskId: 't1', title: 'Brush' } as Task];
-    expect(aggregateStepDwell(instances, steps, tasks)).toEqual([
-      { taskId: 't1', title: 'Brush', stepOrder: 0, stepText: 'A', samples: 1, avgSeconds: 30 },
+    expect(aggregateStepDwell(steps, tasks)).toEqual([
+      { taskId: 't1', title: 'Brush', stepOrder: 0, stepText: 'A', samples: 2, avgSeconds: 60 },
       { taskId: 't1', title: 'Brush', stepOrder: 1, stepText: 'B', samples: 1, avgSeconds: 60 },
     ]);
   });
 
-  it('skips steps with missing/negative gaps', () => {
-    const instances = [inst({ instanceId: 'i1' })]; // no startedAt
-    const steps = [step({ instanceId: 'i1', order: 0, completedAt: '2026-06-01T09:00:30.000Z' })];
-    expect(aggregateStepDwell(instances, steps, [])).toEqual([]);
+  it('counts started-but-never-completed steps (effort on abandoned steps is signal)', () => {
+    const steps = [
+      step({ order: 0, completed: false, firstStartedAt: STARTED, activeDurationSeconds: 120 }),
+    ];
+    expect(aggregateStepDwell(steps, [])).toEqual([
+      { taskId: 't1', title: 't1', stepOrder: 0, stepText: 'Step', samples: 1, avgSeconds: 120 },
+    ]);
+  });
+
+  it('excludes never-started steps and legacy snapshots without timing', () => {
+    const steps = [
+      step({ order: 0 }), // timing era, but the step was never started
+      legacy(step({ order: 1, completedAt: '2026-06-01T09:00:30.000Z' })), // pre-timing row
+    ];
+    expect(aggregateStepDwell(steps, [])).toEqual([]);
+  });
+});
+
+describe('aggregateFocus', () => {
+  it('averages per-task active seconds and computes the overall focus ratio', () => {
+    const instances = [
+      inst({
+        instanceId: 'i1',
+        taskId: 't1',
+        status: 'COMPLETED',
+        activeDurationSeconds: 300,
+        elapsedSeconds: 600,
+      }),
+      inst({ instanceId: 'i2', taskId: 't1', status: 'IN_PROGRESS', activeDurationSeconds: 100 }),
+    ];
+    const tasks = [{ taskId: 't1', title: 'Brush' } as Task];
+    expect(aggregateFocus(instances, tasks)).toEqual({
+      byTask: [{ taskId: 't1', title: 'Brush', samples: 2, avgActiveSeconds: 200 }],
+      focusRatio: 0.5, // only i1 qualifies (COMPLETED with elapsedSeconds)
+    });
+  });
+
+  it('excludes legacy instances and returns a null ratio when nothing qualifies', () => {
+    const instances = [legacy(inst({ status: 'COMPLETED' }))];
+    expect(aggregateFocus(instances, [])).toEqual({ byTask: [], focusRatio: null });
   });
 });
 
@@ -227,6 +270,8 @@ describe('computeReportStats', () => {
     expect(stats.byTask).toHaveLength(1);
     expect(stats.byCategory).toHaveLength(1);
     expect(stats.timeOfDay).toHaveLength(24);
+    expect(stats.focus.byTask).toHaveLength(1);
+    expect(stats.focus.focusRatio).toBeNull(); // no COMPLETED instance carries elapsedSeconds
   });
 
   it('produces a valid zeroed report for an empty range', () => {
@@ -243,6 +288,7 @@ describe('computeReportStats', () => {
     expect(stats.meta.totalInstances).toBe(0);
     expect(stats.completion.completionRate).toBe(0);
     expect(stats.trend).toEqual([]);
+    expect(stats.focus).toEqual({ byTask: [], focusRatio: null });
   });
 });
 

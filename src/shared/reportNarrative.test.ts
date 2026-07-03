@@ -17,6 +17,7 @@ const STATS: ReportStats = {
   byCategory: [],
   byTask: [],
   stepDwell: [],
+  focus: { byTask: [], focusRatio: null },
   skipPatterns: { byTask: [], byHour: new Array(24).fill(0) },
   abandonment: [],
   timeOfDay: new Array(24).fill(0),
