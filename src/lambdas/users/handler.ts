@@ -698,11 +698,6 @@ async function selectPrimaryUser(
     ':active': 'ACTIVE',
     ':now': now,
   };
-  // Permissions: set only when supplied (omitted ⇒ leave any prior value untouched).
-  if (input?.permissions !== undefined) {
-    setParts.push('permissions = :permissions');
-    values[':permissions'] = input.permissions ?? null;
-  }
 
   const result = await dynamo.send(
     new UpdateCommand({

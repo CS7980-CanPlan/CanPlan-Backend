@@ -90,13 +90,15 @@ type UserProfile {
   updatedAt: String
 }
 
+# A supporter↔primary-user delegation link. An ACTIVE link (plus a shared organization and a
+# PRIMARY_USER target) is what grants a SupportPerson delegated access — there are no
+# fine-grained per-link permissions.
 type SupportLink {
   supporterId: ID!
   primaryUserId: ID!
   # Mirror of primaryUserId — the supporterIndex sort key.
   userId: ID!
   status: SupportLinkStatus!
-  permissions: AWSJSON
   createdAt: String!
   updatedAt: String
 }
@@ -427,7 +429,6 @@ input UpdateMyUserProfileInput {
 # currently in the caller's organization.
 input SelectPrimaryUserInput {
   primaryUserId: ID!
-  permissions: AWSJSON
 }
 
 # A SupportPerson un-selects a previously selected PRIMARY_USER. The supporter is the

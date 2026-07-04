@@ -68,7 +68,6 @@ export interface SupportLink {
   /** Mirror of primaryUserId — the supporterIndex sort key. */
   userId: string;
   status: SupportLinkStatus;
-  permissions?: Record<string, unknown>;
   createdAt: string;
   updatedAt?: string;
 }
@@ -395,7 +394,6 @@ export interface UpdateMyUserProfileInput {
 /** A SupportPerson selects a primary user (supporter derived from identity). Writes ACTIVE. */
 export interface SelectPrimaryUserInput {
   primaryUserId: string;
-  permissions?: Record<string, unknown>;
 }
 
 /** A SupportPerson un-selects a primary user (supporter derived from identity). Soft-revokes. */

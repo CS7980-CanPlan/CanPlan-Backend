@@ -263,7 +263,7 @@ real Category row. Categories also keep an internal, transactionally-maintained 
 
 ### `AWSJSON` fields — encoding (foot-gun)
 
-Free-form object fields (`accessibilitySettings`, `permissions`, `metadata`) are the
+Free-form object fields (`accessibilitySettings`, `metadata`) are the
 AppSync `AWSJSON` scalar. **`AWSJSON` is transported as a JSON-encoded _string_, not
 a nested object.** In your `variables`, the value must be a string whose contents are
 valid JSON — AppSync parses that string before the resolver sees it. Passing a nested
@@ -287,8 +287,7 @@ object instead is the most common mistake here and is rejected at the AppSync ed
 }
 ```
 
-In practice: `accessibilitySettings: JSON.stringify(settings)` on the way in. The same
-applies to `permissions` (`selectPrimaryUser`).
+In practice: `accessibilitySettings: JSON.stringify(settings)` on the way in.
 **Responses are symmetric** — these fields come back as JSON strings, so
 `JSON.parse(profile.accessibilitySettings)` on the way out.
 
@@ -440,7 +439,7 @@ fields are marked `!` and everything else is optional; see
 | `updateMyUserProfile` | `input: { displayName, accessibilitySettings, organizationId }` (`UpdateMyUserProfileInput`) | `UserProfile!` — **partial** update of the **caller's own** profile; `organizationId` is editable but must reference an **existing, non-deleting Organization** (or `null` to clear); see below |
 | `getUserProfile` | `userId!` | `UserProfile` · `null` if not found |
 | `listMyOrganizationUsers` | `limit, nextToken` | `UserProfileConnection!` — **the caller's OWN** org roster (orgIndex projection: `userId`, `displayName`, `role`). The org is read from the caller's profile (no `organizationId` argument), so a SupportPerson can only ever list their own org. `VALIDATION` if the caller has no current org |
-| `selectPrimaryUser` | `input: { primaryUserId!, permissions }` (`SelectPrimaryUserInput`) | `SupportLink!` — a **SupportPerson** selects an in-org `PRIMARY_USER` (supporter = caller); writes/restores the link **ACTIVE**; see below |
+| `selectPrimaryUser` | `input: { primaryUserId! }` (`SelectPrimaryUserInput`) | `SupportLink!` — a **SupportPerson** selects an in-org `PRIMARY_USER` (supporter = caller); writes/restores the link **ACTIVE**; see below |
 | `unselectPrimaryUser` | `input: { primaryUserId! }` (`UnselectPrimaryUserInput`) | `SupportLink!` — soft-revokes the link (**REVOKED**, never deleted); see below |
 | `listMySupportList` | `limit, nextToken` | `SupportLinkConnection!` — the caller's OWN support list (every primary user they selected, ACTIVE + REVOKED), via supporterIndex on the caller's sub |
 
@@ -509,8 +508,9 @@ fields are marked `!` and everything else is optional; see
 > target must exist, be a `PRIMARY_USER`, and currently share the caller's `organizationId`
 > (else `NOT_AUTHORIZED`/`VALIDATION`). `unselectPrimaryUser` **soft-revokes** (status
 > `REVOKED`) — it never hard-deletes, so re-selecting restores the row; `NOT_FOUND` if no link
-> exists. **Only a SupportPerson** may call either (a primary user gets `NOT_AUTHORIZED`).
-> Optional `permissions` (`AWSJSON`) is stored on the link. List your selections with
+> exists. **Only a SupportPerson** may call either (a primary user gets `NOT_AUTHORIZED`). An
+> **ACTIVE** link (plus the same-organization + `PRIMARY_USER` checks) is what grants delegated
+> access — there are **no fine-grained per-link permissions**. List your selections with
 > `listMySupportList`.
 >
 **Categories** (self by default; a SupportPerson may manage a selected primary user's
