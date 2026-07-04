@@ -806,9 +806,6 @@ describe('users handler — selectPrimaryUser / unselectPrimaryUser', () => {
     expect(upsert.ExpressionAttributeValues[':supporterId']).toBe(SP); // derived from identity
     // createdAt preserved on restore (if_not_exists) so a REVOKED→ACTIVE keeps the original.
     expect(upsert.UpdateExpression).toContain('createdAt = if_not_exists(createdAt, :now)');
-    // No fine-grained permissions are stored on the link (field removed).
-    expect(upsert.UpdateExpression).not.toContain('permissions');
-    expect(upsert.ExpressionAttributeValues[':permissions']).toBeUndefined();
     expect(result.status).toBe('ACTIVE');
     // The returned link is stripped of storage attributes.
     expect((result as Record<string, unknown>).PK).toBeUndefined();

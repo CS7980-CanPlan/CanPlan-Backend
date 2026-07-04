@@ -510,8 +510,7 @@ fields are marked `!` and everything else is optional; see
 > `REVOKED`) — it never hard-deletes, so re-selecting restores the row; `NOT_FOUND` if no link
 > exists. **Only a SupportPerson** may call either (a primary user gets `NOT_AUTHORIZED`). An
 > **ACTIVE** link (plus the same-organization + `PRIMARY_USER` checks) is what grants delegated
-> access — there are **no fine-grained per-link permissions**. List your selections with
-> `listMySupportList`.
+> access. List your selections with `listMySupportList`.
 >
 **Categories** (self by default; a SupportPerson may manage a selected primary user's
 categories via the optional `userId` — see below)
