@@ -1,6 +1,6 @@
 # CanPlan 2.0 — Frontend API Reference
 
-_Last updated: 2026-07-01. Version: SupportPerson delegation + organization management._
+_Last updated: 2026-07-04. Version: SupportPerson delegation (schedules, categories, task templates) + organization management._
 
 > ## 🚨 Breaking change — categories, default category, Task status, TaskStep keys
 >
@@ -97,24 +97,28 @@ human-readable companion.
 
 ## Identity & the `userId` field
 
-**Invariant: for any self-scoped operation, the `id` you pass MUST equal your own
-Cognito `sub`.** This is not currently enforced — it is load-bearing anyway, because
-of how data is keyed and read back:
+**Invariant: for any operation that takes a `userId`/`ownerId`, the id you pass is either
+your own Cognito `sub` or the id of a user you may act for through delegation.** For Task,
+category, scheduling, and media operations this is now **enforced** — passing an id you
+neither own nor hold active SupportPerson delegation for returns `NOT_AUTHORIZED` (see the
+authorization model above). It is also load-bearing in how data is keyed and read back:
 
 - A user's profile is stored at the key derived from their Cognito `sub`
   (`USER#<sub>`), and `getUserProfile(userId)` looks it up by **exactly that
   `userId`**. There is no secondary lookup.
-- `createUserProfile` does the right thing automatically — it ignores any
-  client-supplied id and uses your `sub` from the session (see below). So your
-  profile always lands at `USER#<sub>`.
-- But the **read** and every other self-scoped write (`getUserProfile`,
-  `createTaskAssignment`, `startTaskInstance`, `getTaskInstanceViews`,
-  `listTaskInstanceSteps`, …) take a `userId`/`ownerId` **argument**. If you pass
-  anything other than your own `sub` there, you will write rows you can never read
-  back through your own profile, or read an empty result — silently, with no error.
-  (The newer `getTaskInstance` / `listTaskInstances` / `batchGetTaskInstances` reads
-  are the exception — they take **no `userId`** and always resolve the owner from your
-  identity, so there is nothing to get wrong.)
+- `createUserProfile` ignores any client-supplied id and uses your `sub` from the
+  session (see below), so your profile always lands at `USER#<sub>`.
+- The `userId`/`ownerId`-argument operations (`createTaskAssignment`, `startTaskInstance`,
+  `getTaskInstanceViews`, `listTaskInstanceSteps`, and the Task/category/media writes) are
+  authorized against that id: it must be your own, or one you may act for as a delegated
+  SupportPerson. A non-self id you have no active delegation for is rejected — it will
+  **not** silently write to another partition. (The newer `getTaskInstance` /
+  `listTaskInstances` / `batchGetTaskInstances` reads take **no `userId`** and always
+  resolve the owner from your identity.)
+- **The exception is `getUserProfile(userId)`**, which is still readable by any
+  authenticated caller (per-relationship gating isn't implemented — see
+  [Not available yet](#not-available-yet)); passing another user's id returns their
+  profile rather than an error.
 
 **Rule of thumb:** decode the `sub` claim from your Cognito ID token once at sign-in
 and use it as the `userId`/`ownerId` for everything that is "about me." Treat ids
@@ -961,8 +965,9 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 > 2. **`PUT` the raw file bytes to `uploadUrl`** with the same `Content-Type` you
 >    passed as `contentType` (direct browser/mobile upload to S3 — the bucket allows
 >    CORS PUT). No GraphQL, no credentials.
-> 3. **`createMediaAsset({ taskId, s3Key, type, mimeType, ownerId, size? })`**
->    → registers the now-uploaded object's metadata. Attach it in a standalone
+> 3. **`createMediaAsset({ taskId, s3Key, type, mimeType, size? })`**
+>    → registers the now-uploaded object's metadata (the asset owner is derived from the
+>    task; a client-supplied `ownerId` is ignored). Attach it in a standalone
 >    `createTaskStep({ media: [{ type, assetId }] })` or later with
 >    `updateTaskStep({ media: [{ type, assetId }] })`.
 >
@@ -1383,8 +1388,10 @@ stable contract and may be reworded at any time.
 > `NotFoundError` / `UnauthorizedError`); wiring them through to the codes above is
 > tracked under [Not available yet](#not-available-yet). Until then, if you must
 > branch today, do so defensively (e.g. fall back to matching `message`) and migrate
-> to `errorType` once the codes land. `NOT_AUTHORIZED` in particular does **not** fire
-> yet — see the authorization warning at the top.
+> to `errorType` once the codes land. Note this is only about the **code**: authorization
+> **is** enforced (a denied owner/delegation check throws a real `UnauthorizedError`), but
+> the distinct `NOT_AUTHORIZED` `errorType` does **not** fire yet — the denial currently
+> arrives as `Lambda:Unhandled` with the reason in `message`.
 
 ---
 

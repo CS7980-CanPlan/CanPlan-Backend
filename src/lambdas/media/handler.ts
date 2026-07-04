@@ -155,7 +155,8 @@ async function createTaskCoverImageUploadUrl(
   identity: AppSyncIdentity | undefined,
 ): Promise<MediaUploadTarget> {
   // No taskId exists yet (the task may not exist), so this is authenticated-only; the pending
-  // upload is promoted to a task-owned asset later by the owner-scoped createTask/updateTask.
+  // upload is promoted to a task-owned asset later by createTask/updateTask, which authorize
+  // the target owner (owner or delegated SupportPerson).
   requireCaller(identity);
   const contentType = input?.contentType?.trim().toLowerCase();
   if (!contentType) {

@@ -152,8 +152,9 @@ async function getTask(
   if (!taskId?.trim()) throw new ValidationError('taskId is required');
   const task = await readTaskMeta(taskId.trim());
   if (!task) return null;
-  // Read access: the owner, OR a user holding an active assignment that references this task
-  // (an assigned primary user may read a SupportPerson's template). Mutations stay owner-only.
+  // Read access: the owner, a delegated SupportPerson, OR a user holding an active assignment
+  // that references this task (an assigned primary user may read a SupportPerson's template).
+  // Mutations require manage access (owner or delegated SupportPerson) via loadManageableTask.
   await assertCanReadTask(identity, task);
   return task;
 }
@@ -1216,11 +1217,11 @@ async function updateTaskOrder(
 }
 
 /**
- * deleteTask — owner-scoped delete of a Task and ALL of its owned children (the `#META`
- * item, every TaskStep, every MediaAsset + S3 binary). Enforces ownership, then delegates
- * the cascade to the shared `deleteTaskCascade` (the same path the SystemAdmin
- * `adminDeleteTask` uses without an ownership check). Rejected while an active TaskAssignment
- * references the task; existing TaskInstance/TaskInstanceStep rows are never deleted.
+ * deleteTask — delete a Task and ALL of its owned children (the `#META` item, every TaskStep,
+ * every MediaAsset + S3 binary). Requires manage access (owner or delegated SupportPerson) via
+ * loadManageableTask, then delegates the cascade to the shared `deleteTaskCascade` (the same
+ * path the SystemAdmin `adminDeleteTask` uses without an access check). Rejected while an active
+ * TaskAssignment references the task; existing TaskInstance/TaskInstanceStep rows are never deleted.
  */
 async function deleteTask(
   identity: AppSyncIdentity | undefined,
