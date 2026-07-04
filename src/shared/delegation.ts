@@ -160,10 +160,30 @@ export async function assertCanActForUser(
 }
 
 /**
+ * Non-throwing form of `assertCanActForUser`: returns true when the caller may act for
+ * `targetUserId` (self or active SupportPerson delegation), false when a delegation check
+ * denies it. Any non-authorization error still propagates.
+ */
+export async function canActForUser(
+  identity: AppSyncIdentity | undefined,
+  targetUserId: string,
+): Promise<boolean> {
+  try {
+    await assertCanActForUser(identity, targetUserId);
+    return true;
+  } catch (err) {
+    if (err instanceof UnauthorizedError) return false;
+    throw err;
+  }
+}
+
+/**
  * Assert the caller may READ a task's template/steps/media, given an already-loaded task (its
- * `taskId` + `ownerId`). Returns the caller id. The owner always may; otherwise the caller must
- * hold an ACTIVE assignment referencing the task (read-only delegated access). This NEVER
- * grants write access — mutations stay owner-only via `assertCallerOwns`.
+ * `taskId` + `ownerId`). Returns the caller id. Read access is granted to: the owner; a
+ * SupportPerson with delegated access to the owner (they can manage it, so they can read it);
+ * or a user holding an ACTIVE assignment referencing the task (an assigned primary user may
+ * read a SupportPerson's template). The assignment path is read-only — it NEVER grants write
+ * access; writes require `assertCanActForUser` on the task's owner.
  */
 export async function assertCanReadTask(
   identity: AppSyncIdentity | undefined,
@@ -171,9 +191,13 @@ export async function assertCanReadTask(
 ): Promise<string> {
   const caller = requireCaller(identity);
   if (caller === task.ownerId) return caller;
+  // A delegated manager (SupportPerson with an active link to the owner) may read.
+  if (await canActForUser(identity, task.ownerId)) return caller;
+  // An assigned user (active assignment referencing this task) may read — read-only.
   if (await hasActiveAssignmentForTask(caller, task.taskId)) return caller;
   throw new UnauthorizedError(
-    'Unauthorized: caller does not own this task and has no assignment referencing it',
+    'Unauthorized: caller does not own this task, cannot act for its owner, and has no ' +
+      'assignment referencing it',
   );
 }
 

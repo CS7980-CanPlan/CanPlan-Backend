@@ -68,11 +68,17 @@ The only fields with auth directives:
 
 The frontend needs the `UserPoolId` and `UserPoolClientId` deploy outputs to run the
 Cognito sign-in flow. **Most user-facing data is self-owned or delegated explicitly.**
-Category and task mutations derive the owner from the caller's Cognito `sub`; task and
-media writes are owner-only. Task/media reads also allow a user with an active
-TaskAssignment referencing the task. Assignment and task-instance operations require the
-caller to act on their own schedule, or to be a `SupportPerson` with an ACTIVE selected
-primary user in the same organization (see [src/shared/delegation.ts](src/shared/delegation.ts)).
+Category, task, task-step, and media **writes** are authorized against the target owner via
+`assertCanActForUser`: the owner themselves, or a `SupportPerson` with an ACTIVE selected
+primary user in the same organization may manage that primary user's categories and task
+templates (create/update/delete tasks and steps, reorder, and manage task media). `createTask`
+and `updateTaskOrder` take an optional `userId` (omitted ⇒ the caller); the `taskId`-scoped
+mutations authorize against the loaded task's `ownerId`. Task/media **reads** allow the owner,
+a delegated SupportPerson, or a user holding an active TaskAssignment referencing the task
+(read-only — assignment-based read access never becomes write access). Assignment and
+task-instance operations require the caller to act on their own schedule, or to be a
+`SupportPerson` with an ACTIVE selected primary user in the same organization (see
+[src/shared/delegation.ts](src/shared/delegation.ts)).
 The **self-scoped TaskInstance reads** (`getTaskInstance`, `listTaskInstances`,
 `batchGetTaskInstances`) take no `userId`, derive the owner from the caller's `sub`, and reject
 an unauthenticated caller. Profile writes are self-only via `createUserProfile` /

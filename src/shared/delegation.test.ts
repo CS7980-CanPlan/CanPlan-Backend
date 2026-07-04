@@ -2,6 +2,7 @@ import {
   assertCanActForUser,
   assertCanReadTask,
   assertCanReadTaskById,
+  canActForUser,
   hasActiveAssignmentForTask,
 } from './delegation';
 import { dynamo } from './dynamodb';
@@ -186,6 +187,25 @@ describe('assertCanActForUser — delegated (SupportPerson)', () => {
   });
 });
 
+describe('canActForUser (non-throwing)', () => {
+  it('is true for self', async () => {
+    await expect(canActForUser(identity('me'), 'me')).resolves.toBe(true);
+  });
+
+  it('is true for a SupportPerson with an ACTIVE link in the same org', async () => {
+    db.profiles = {
+      [SP]: { userId: SP, role: 'SUPPORT_PERSON', organizationId: 'org-1' },
+      [PU]: { userId: PU, role: 'PRIMARY_USER', organizationId: 'org-1' },
+    };
+    db.links = { [`${SP}->${PU}`]: { status: 'ACTIVE' } };
+    await expect(canActForUser(identity(SP, ['SupportPerson']), PU)).resolves.toBe(true);
+  });
+
+  it('is false (not thrown) when delegation is denied', async () => {
+    await expect(canActForUser(identity('intruder'), PU)).resolves.toBe(false);
+  });
+});
+
 describe('assertCanReadTask', () => {
   it('allows the owner without an assignment query', async () => {
     await expect(assertCanReadTask(identity('owner-1'), { taskId: 't1', ownerId: 'owner-1' })).resolves.toBe(
@@ -194,14 +214,25 @@ describe('assertCanReadTask', () => {
     expect(mockSend).not.toHaveBeenCalled();
   });
 
+  it('allows a delegated SupportPerson (active link to the owner) to read', async () => {
+    db.profiles = {
+      [SP]: { userId: SP, role: 'SUPPORT_PERSON', organizationId: 'org-1' },
+      ['owner-1']: { userId: 'owner-1', role: 'PRIMARY_USER', organizationId: 'org-1' },
+    };
+    db.links = { [`${SP}->owner-1`]: { status: 'ACTIVE' } };
+    await expect(
+      assertCanReadTask(identity(SP, ['SupportPerson']), { taskId: 't1', ownerId: 'owner-1' }),
+    ).resolves.toBe(SP);
+  });
+
   it('allows a non-owner who holds an active assignment referencing the task', async () => {
     db.activeAssignments = [{ PK: 'USER#primary-1', taskId: 't1', active: true }];
     await expect(assertCanReadTask(identity(PU), { taskId: 't1', ownerId: 'owner-1' })).resolves.toBe(PU);
   });
 
-  it('rejects a non-owner with no assignment referencing the task', async () => {
+  it('rejects a non-owner who cannot act for the owner and has no assignment', async () => {
     await expect(assertCanReadTask(identity(PU), { taskId: 't1', ownerId: 'owner-1' })).rejects.toThrow(
-      /does not own this task and has no assignment/,
+      /does not own this task/,
     );
   });
 });

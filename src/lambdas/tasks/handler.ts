@@ -8,9 +8,9 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import { assertNoActiveAssignmentsForTask } from '../../shared/assignment';
 import { queryAll, queryAllItems } from '../../shared/batch';
-import { assertCallerOwns, requireCaller } from '../../shared/authz';
+import { requireCaller } from '../../shared/authz';
 import { assertUsableCategory, categoryCountDelta } from '../../shared/category';
-import { assertCanReadTask } from '../../shared/delegation';
+import { assertCanActForUser, assertCanReadTask } from '../../shared/delegation';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import { MAX_TASKS_PER_OWNER } from '../../shared/task';
 import {
@@ -69,8 +69,11 @@ const MAX_STEPS_PER_TASK = 99;
  * step can be reordered in place and a reorder is one atomic transaction. List/read paths
  * therefore sort by the numeric `order`, never by DynamoDB key order.
  *
- * Authorization: Task and TaskStep operations are scoped to the task's owner — the caller's
- * Cognito `sub` must equal `task.ownerId` (there is no delegated-role model yet).
+ * Authorization: Task and TaskStep operations are scoped to the task's owner via
+ * `assertCanActForUser(identity, task.ownerId)` — the owner themselves, OR a SupportPerson with
+ * an ACTIVE SupportLink to that owner (a PRIMARY_USER in the same organization). Reads
+ * (getTask/listTaskSteps) additionally allow a user holding an active assignment referencing
+ * the task (read-only). List APIs resolve the target owner the same delegated way.
  */
 export const handler = async (
   event: AppSyncEvent<Record<string, unknown>>,
@@ -112,14 +115,34 @@ export const handler = async (
 };
 
 /**
- * Load a task #META, asserting it exists and the caller owns it. Shared by every Task/
- * TaskStep mutation (and reads) located by taskId.
+ * Load a task #META, asserting it exists and the caller may MANAGE it — i.e. is the task's
+ * owner, or a SupportPerson with delegated access to the owner (`assertCanActForUser`). Shared
+ * by every Task/TaskStep mutation located by taskId. This is the write boundary; read-only
+ * access (assigned users) is handled separately via `assertCanReadTask`.
  */
-async function loadOwnedTask(identity: AppSyncIdentity | undefined, taskId: string): Promise<Task> {
+async function loadManageableTask(
+  identity: AppSyncIdentity | undefined,
+  taskId: string,
+): Promise<Task> {
   const task = await readTaskMeta(taskId);
   if (!task) throw new NotFoundError(`task ${taskId} not found`);
-  assertCallerOwns(identity, task.ownerId);
+  await assertCanActForUser(identity, task.ownerId);
   return task;
+}
+
+/**
+ * Resolve whose tasks a whole-owner operation acts on and authorize it. An omitted/null/blank
+ * `requestedUserId` means the caller's own tasks; a non-self value targets that primary user
+ * and requires SupportPerson delegated access. Returns the resolved target owner id.
+ */
+async function resolveTaskOwner(
+  identity: AppSyncIdentity | undefined,
+  requestedUserId?: string | null,
+): Promise<string> {
+  const caller = requireCaller(identity);
+  const target = requestedUserId?.trim() || caller;
+  await assertCanActForUser(identity, target);
+  return target;
 }
 
 async function getTask(
@@ -192,7 +215,8 @@ async function listTasksByOwner(
   page: PageArgs,
 ): Promise<Connection<Task>> {
   if (!ownerId?.trim()) throw new ValidationError('ownerId is required');
-  assertCallerOwns(identity, ownerId.trim());
+  // Self, or a SupportPerson with delegated access to this owner.
+  await assertCanActForUser(identity, ownerId.trim());
 
   const all = await queryAllOwnedTasks(ownerId.trim());
   all.sort(
@@ -239,7 +263,8 @@ async function listTasksByCategory(
   // Every task belongs to a real category, so a category id is required (there is no
   // implicit "uncategorized" bucket anymore).
   if (!categoryId?.trim()) throw new ValidationError('categoryId is required');
-  assertCallerOwns(identity, ownerId.trim());
+  // Self, or a SupportPerson with delegated access to this owner.
+  await assertCanActForUser(identity, ownerId.trim());
   // Validate the category exists, belongs to the owner, and isn't mid-deletion — a bad
   // category id is a NOT_FOUND/VALIDATION error, not a silently-empty result.
   await assertUsableCategory(ownerId.trim(), categoryId.trim());
@@ -278,7 +303,7 @@ async function updateTask(
     throw new ValidationError('categoryId cannot be blank; omit it to leave it unchanged');
   }
 
-  const stored = await loadOwnedTask(identity, taskId);
+  const stored = await loadManageableTask(identity, taskId);
 
   // Validate a category change against the task's OWNER (read from the stored row, never
   // the client) so a caller cannot move a task into a category they don't own.
@@ -470,7 +495,7 @@ async function createTaskStep(
   }
 
   // The task must exist and belong to the caller before we add a step (no orphan steps).
-  const task = await loadOwnedTask(identity, taskId);
+  const task = await loadManageableTask(identity, taskId);
 
   // Step metadata is required (createTask sets it; the migration backfills legacy rows).
   if (
@@ -634,7 +659,7 @@ async function updateTaskStep(
       throw new ValidationError('description cannot be empty; use null to clear it');
   }
   // The task must exist and belong to the caller (after pure-input validation, before IO).
-  const task = await loadOwnedTask(identity, taskId);
+  const task = await loadManageableTask(identity, taskId);
 
   // Drain any prior failed remove/replace cleanup before making another media change.
   // This makes a client retry of the same update converge rather than accumulating
@@ -928,7 +953,7 @@ async function reorderTaskSteps(
   }
 
   // The task must exist and belong to the caller.
-  const task = await loadOwnedTask(identity, taskId);
+  const task = await loadManageableTask(identity, taskId);
 
   const n = steps.length;
   const orderByStepId = new Map<string, number>();
@@ -1038,7 +1063,7 @@ async function deleteTaskStep(
   if (!stepId) throw new ValidationError('stepId is required and cannot be empty');
 
   // The task must exist and belong to the caller.
-  const task = await loadOwnedTask(identity, taskId);
+  const task = await loadManageableTask(identity, taskId);
 
   // Finish an earlier failed binary cleanup before looking up the step. A previous
   // attempt leaves the step in place (but detached) until its durable S3 journal has
@@ -1106,18 +1131,20 @@ async function deleteTaskStep(
 }
 
 /**
- * updateTaskOrder — atomically reorder ALL of the caller's tasks. The request must carry the
+ * updateTaskOrder — atomically reorder ALL of a target owner's tasks. The request must carry the
  * owner's COMPLETE current task set: every owned taskId exactly once, with positive,
  * mutually-unique `order` values (gaps allowed; NOT required to be contiguous 1..N — that is
  * the one relaxation from reorderTaskSteps). Every task's `order` is updated in one transaction
- * (all-or-nothing), each guarded on the task still being owned by the caller. The owner is the
- * authenticated identity — never the input. Returns the tasks sorted by ascending order.
+ * (all-or-nothing), each guarded on the task still being owned by the resolved owner. The owner
+ * is the caller by default; a non-self `input.userId` targets a primary user and requires
+ * SupportPerson delegated access — never an arbitrary client-supplied owner. Returns the tasks
+ * sorted by ascending order.
  */
 async function updateTaskOrder(
   identity: AppSyncIdentity | undefined,
   input: UpdateTaskOrderInput,
 ): Promise<Task[]> {
-  const ownerId = requireCaller(identity);
+  const ownerId = await resolveTaskOwner(identity, input?.userId);
   const tasks = input?.tasks;
   if (!Array.isArray(tasks) || tasks.length === 0) {
     throw new ValidationError('tasks is required and must list the complete current task set');
@@ -1203,9 +1230,9 @@ async function deleteTask(
   if (!id) throw new ValidationError('taskId is required and cannot be empty');
 
   // Existence + ownership, then the shared cascade (task already loaded, so it won't re-read).
-  const stored = await loadOwnedTask(identity, id);
+  const stored = await loadManageableTask(identity, id);
   // Refuse while any ACTIVE TaskAssignment still schedules this template for a user.
   await assertNoActiveAssignmentsForTask(id);
-  // loadOwnedTask proved the task exists, so the cascade returns the deleted task (never null).
+  // loadManageableTask proved the task exists, so the cascade returns the deleted task (never null).
   return (await deleteTaskCascade(id, { task: stored })) as Task;
 }

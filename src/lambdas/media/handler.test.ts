@@ -1,6 +1,8 @@
 import { handler } from './handler';
 import { dynamo } from '../../shared/dynamodb';
+import { assertCanActForUser } from '../../shared/delegation';
 import { purgeMediaAsset } from '../../shared/media';
+import { UnauthorizedError } from '../../shared/response';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { Connection, MediaAsset, MediaDownloadTarget, MediaUploadTarget } from '../../shared/types';
 
@@ -8,6 +10,15 @@ jest.mock('../../shared/dynamodb', () => ({
   dynamo: { send: jest.fn() },
   TABLE_NAME: 'CanPlan-test',
 }));
+
+// Manage-access authorization (owner or delegated SupportPerson) for media WRITES is
+// unit-tested in shared/delegation.test.ts; here `assertCanActForUser` is mocked to resolve by
+// default and overridden to reject for denial tests. The READ path (`assertCanReadTaskById` /
+// `assertCanReadTask`) keeps its real implementation via requireActual, driven by mocked dynamo.
+jest.mock('../../shared/delegation', () => {
+  const actual = jest.requireActual('../../shared/delegation');
+  return { ...actual, assertCanActForUser: jest.fn() };
+});
 
 // S3 presigning is mocked: no real client, fixed bucket/TTL, fake signed URL.
 jest.mock('../../shared/s3', () => ({
@@ -31,6 +42,7 @@ jest.mock('@aws-sdk/s3-request-presigner', () => ({
 const mockSend = dynamo.send as jest.Mock;
 const mockGetSignedUrl = getSignedUrl as jest.Mock;
 const mockPurge = purgeMediaAsset as jest.Mock;
+const mockAssertCanAct = assertCanActForUser as jest.Mock;
 
 const OWNER = 'o1';
 
@@ -56,6 +68,8 @@ beforeEach(() => {
   db = { taskMeta: { taskId: 't1', ownerId: OWNER } };
   mockGetSignedUrl.mockResolvedValue('https://signed.example/upload');
   mockPurge.mockResolvedValue(true);
+  // Default: the caller may manage the task's owner (self or active delegation).
+  mockAssertCanAct.mockResolvedValue(OWNER);
   mockSend.mockImplementation((cmd: { constructor: { name: string }; input: Rec }) => {
     const name = cmd.constructor.name;
     const input = cmd.input;
@@ -100,7 +114,7 @@ function mediaInput(overrides: Record<string, unknown> = {}) {
   return { taskId: 't1', s3Key: 'media/t1/a.bin', type: 'IMAGE', mimeType: 'image/png', ownerId: 'o1', ...overrides };
 }
 
-describe('media handler — createMediaAsset (owner-only)', () => {
+describe('media handler — createMediaAsset (owner or delegated SupportPerson)', () => {
   it('writes PK=TASK#<id>, SK=MEDIA#<assetId>, UNATTACHED (no stepId)', async () => {
     const result = (await handler(
       event('createMediaAsset', { input: mediaInput({ size: 2048 }) }),
@@ -136,15 +150,34 @@ describe('media handler — createMediaAsset (owner-only)', () => {
     await expect(handler(event('createMediaAsset', { input: mediaInput({ s3Key: '' }) }))).rejects.toThrow(
       's3Key is required',
     );
-    await expect(handler(event('createMediaAsset', { input: mediaInput({ ownerId: '' }) }))).rejects.toThrow(
-      'ownerId is required',
-    );
   });
 
-  it('rejects a non-owner (media writes are owner-only)', async () => {
+  it('derives the asset owner from the task, ignoring a client-supplied ownerId', async () => {
+    db.taskMeta = { taskId: 't1', ownerId: 'pu-1' };
+    // A malicious/mismatched input.ownerId must NOT be trusted — the stored owner is the task's.
+    const result = (await handler(
+      event('createMediaAsset', { input: mediaInput({ ownerId: 'victim' }) }, 'sup-1'),
+    )) as MediaAsset;
+    expect(byCommand('PutCommand')[0].Item.ownerId).toBe('pu-1');
+    expect(result.ownerId).toBe('pu-1');
+  });
+
+  it('lets a delegated SupportPerson register media under a primary user’s task', async () => {
+    db.taskMeta = { taskId: 't1', ownerId: 'pu-1' };
+    const result = (await handler(
+      event('createMediaAsset', { input: mediaInput({ ownerId: undefined }) }, 'sup-1'),
+    )) as MediaAsset;
+    // Authorized against the task's owner (pu-1), not the caller; asset owner is pu-1.
+    expect(mockAssertCanAct).toHaveBeenCalledWith(expect.objectContaining({ sub: 'sup-1' }), 'pu-1');
+    expect(byCommand('PutCommand')[0].Item.ownerId).toBe('pu-1');
+    expect(result.ownerId).toBe('pu-1');
+  });
+
+  it('rejects a caller who cannot manage the task, writing nothing', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
     await expect(
       handler(event('createMediaAsset', { input: mediaInput() }, 'intruder')),
-    ).rejects.toThrow('does not own this resource');
+    ).rejects.toThrow('no active support link');
     expect(byCommand('PutCommand')).toHaveLength(0);
   });
 
@@ -176,12 +209,12 @@ describe('media handler — listMediaForTask (owner or assigned)', () => {
 
   it('rejects a non-owner with no assignment referencing the task', async () => {
     await expect(handler(event('listMediaForTask', { taskId: 't1' }, 'intruder'))).rejects.toThrow(
-      'does not own this task and has no assignment',
+      'does not own this task',
     );
   });
 });
 
-describe('media handler — createMediaUploadUrl (owner-only)', () => {
+describe('media handler — createMediaUploadUrl (owner or delegated SupportPerson)', () => {
   it('mints a presigned PUT URL + server-owned s3Key under media/<taskId>/', async () => {
     const result = (await handler(
       event('createMediaUploadUrl', { input: { taskId: 't1', contentType: 'image/png', fileName: 'photo.png' } }),
@@ -218,11 +251,21 @@ describe('media handler — createMediaUploadUrl (owner-only)', () => {
     expect(mockGetSignedUrl).not.toHaveBeenCalled();
   });
 
-  it('rejects a non-owner', async () => {
+  it('rejects a caller who cannot manage the task', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
     await expect(
       handler(event('createMediaUploadUrl', { input: { taskId: 't1', contentType: 'image/png' } }, 'intruder')),
-    ).rejects.toThrow('does not own this resource');
+    ).rejects.toThrow('no active support link');
     expect(mockGetSignedUrl).not.toHaveBeenCalled();
+  });
+
+  it('lets a delegated SupportPerson mint an upload URL for a primary user’s task', async () => {
+    db.taskMeta = { taskId: 't1', ownerId: 'pu-1' };
+    const result = (await handler(
+      event('createMediaUploadUrl', { input: { taskId: 't1', contentType: 'image/png' } }, 'sup-1'),
+    )) as MediaUploadTarget;
+    expect(mockAssertCanAct).toHaveBeenCalledWith(expect.objectContaining({ sub: 'sup-1' }), 'pu-1');
+    expect(result.uploadUrl).toBeDefined();
   });
 });
 
@@ -258,7 +301,7 @@ describe('media handler — getMediaDownloadUrl (owner or assigned)', () => {
     db.asset = { assetId: 'a1', taskId: 't1', s3Key: 'media/t1/abc.png' };
     await expect(
       handler(event('getMediaDownloadUrl', { taskId: 't1', assetId: 'a1' }, 'intruder')),
-    ).rejects.toThrow('does not own this task and has no assignment');
+    ).rejects.toThrow('does not own this task');
     expect(mockGetSignedUrl).not.toHaveBeenCalled();
   });
 
@@ -316,7 +359,7 @@ describe('media handler — createTaskCoverImageUploadUrl', () => {
   });
 });
 
-describe('media handler — deleteMediaAsset (owner-only)', () => {
+describe('media handler — deleteMediaAsset (owner or delegated SupportPerson)', () => {
   const asset = { PK: 'TASK#t1', SK: 'MEDIA#a1', entityType: 'MediaAsset', assetId: 'a1', taskId: 't1', s3Key: 'media/t1/a1.png', type: 'IMAGE', ownerId: 'o1' };
 
   // The cleanup mechanics (ref clearing, row + S3 delete, partial-failure logging) are
@@ -343,12 +386,24 @@ describe('media handler — deleteMediaAsset (owner-only)', () => {
     expect(result.assetId).toBe('a1');
   });
 
-  it('rejects a non-owner (media writes are owner-only)', async () => {
+  it('rejects a caller who cannot manage the task', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
     db.asset = { ...asset };
     await expect(
       handler(event('deleteMediaAsset', { input: { taskId: 't1', assetId: 'a1' } }, 'intruder')),
-    ).rejects.toThrow('does not own this resource');
+    ).rejects.toThrow('no active support link');
     expect(mockPurge).not.toHaveBeenCalled();
+  });
+
+  it('lets a delegated SupportPerson delete media on a primary user’s task', async () => {
+    db.taskMeta = { taskId: 't1', ownerId: 'pu-1' };
+    db.asset = { ...asset, ownerId: 'pu-1' };
+    const result = (await handler(
+      event('deleteMediaAsset', { input: { taskId: 't1', assetId: 'a1' } }, 'sup-1'),
+    )) as MediaAsset;
+    expect(mockAssertCanAct).toHaveBeenCalledWith(expect.objectContaining({ sub: 'sup-1' }), 'pu-1');
+    expect(result.assetId).toBe('a1');
+    expect(mockPurge).toHaveBeenCalled();
   });
 
   it('surfaces a retryable error when the durable S3 cleanup is still pending', async () => {

@@ -1,12 +1,19 @@
 import { handler } from './handler';
 import { dynamo } from '../../shared/dynamodb';
+import { assertCanActForUser } from '../../shared/delegation';
 import { deleteS3ObjectBestEffort, prepareCoverImageAsset } from '../../shared/media';
+import { UnauthorizedError } from '../../shared/response';
 
 // Mock the DynamoDB document client so tests never hit AWS.
 jest.mock('../../shared/dynamodb', () => ({
   dynamo: { send: jest.fn() },
   TABLE_NAME: 'CanPlan-test',
 }));
+
+// Delegated-access authorization is unit-tested in shared/delegation.test.ts; here it is
+// mocked to resolve by default (caller may act for the target). Specific tests override it to
+// assert it is invoked and that a denial blocks the create without any write.
+jest.mock('../../shared/delegation', () => ({ assertCanActForUser: jest.fn() }));
 
 // Cover-image S3 work (HeadObject/CopyObject/DeleteObject) is unit-tested in
 // shared/media.test.ts; here we stub it to focus on the create transaction + rollback.
@@ -16,6 +23,7 @@ jest.mock('../../shared/media', () => ({
 }));
 
 const mockSend = dynamo.send as jest.Mock;
+const mockAssertCanAct = assertCanActForUser as jest.Mock;
 const mockPrepare = prepareCoverImageAsset as jest.Mock;
 const mockDeleteS3 = deleteS3ObjectBestEffort as jest.Mock;
 
@@ -58,7 +66,11 @@ function stubDb(
   );
 }
 
-beforeEach(() => stubDb());
+beforeEach(() => {
+  stubDb();
+  // Default: the caller is allowed to act for the resolved target owner (self or delegation).
+  mockAssertCanAct.mockResolvedValue(undefined);
+});
 afterEach(() => jest.clearAllMocks());
 
 type Input = Parameters<typeof handler>[0]['arguments']['input'];
@@ -102,6 +114,46 @@ describe('createTask handler', () => {
     );
     expect(result.ownerId).toBe('me');
     expect(writtenItems().find((i) => i.SK === '#META')!.ownerId).toBe('me');
+  });
+
+  it('creates the task UNDER a primary user when a SupportPerson passes input.userId (delegation allowed)', async () => {
+    // The caller (SupportPerson) targets primary user "pu-1"; delegated auth resolves.
+    const result = await handler(makeEvent({ userId: 'pu-1', title: 'Take meds' }, 'sup-1'));
+
+    // Delegated authorization is checked for the RESOLVED target owner, not the caller.
+    expect(mockAssertCanAct).toHaveBeenCalledWith(
+      expect.objectContaining({ sub: 'sup-1' }),
+      'pu-1',
+    );
+    // The task lands under the target primary user's account, never the SupportPerson's.
+    const meta = writtenItems().find((i) => i.SK === '#META')!;
+    expect(meta.ownerId).toBe('pu-1');
+    expect(meta.PK).toBe(`TASK#${result.taskId}`);
+    expect(result.ownerId).toBe('pu-1');
+  });
+
+  it('falls back to the caller when input.userId is blank/whitespace', async () => {
+    const result = await handler(makeEvent({ userId: '   ', title: 'T' }, 'sup-1'));
+    expect(mockAssertCanAct).toHaveBeenCalledWith(expect.objectContaining({ sub: 'sup-1' }), 'sup-1');
+    expect(result.ownerId).toBe('sup-1');
+  });
+
+  it('rejects a delegated create when authorization fails, writing nothing', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
+
+    await expect(handler(makeEvent({ userId: 'pu-1', title: 'T' }, 'sup-1'))).rejects.toThrow(
+      'no active support link',
+    );
+    // Denied before any DynamoDB access — no profile read, no transaction.
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unauthenticated caller before any authorization or write', async () => {
+    await expect(handler(makeEvent({ title: 'T' }, null))).rejects.toThrow(
+      'authenticated user is required',
+    );
+    expect(mockAssertCanAct).not.toHaveBeenCalled();
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
   it('writes each nested step as its own STEP#<stepId> item with 1-based order', async () => {

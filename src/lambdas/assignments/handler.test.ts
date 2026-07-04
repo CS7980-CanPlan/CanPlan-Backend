@@ -609,6 +609,26 @@ describe('startTaskInstanceStep', () => {
     expect(result.instance.activeDurationSeconds).toBe(15); // unchanged — nothing accumulated
     expect(result.previousStep).toBeNull();
   });
+
+  it('checks delegated authorization for the provided userId', async () => {
+    db.instance = runningInstance();
+    db.steps = { s1: { stepId: 's1', activeDurationSeconds: 0 } };
+
+    await handler(event('startTaskInstanceStep', { input: { userId: 'u1', instanceId, stepId: 's1' } }));
+
+    expect(mockAssertCanAct).toHaveBeenCalledWith(expect.objectContaining({ sub: 'assigner-1' }), 'u1');
+  });
+
+  it('rejects when the caller may not act for the target user, without reading or writing DynamoDB', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
+    db.instance = runningInstance();
+    db.steps = { s1: { stepId: 's1', activeDurationSeconds: 0 } };
+
+    await expect(
+      handler(event('startTaskInstanceStep', { input: { userId: 'u1', instanceId, stepId: 's1' } })),
+    ).rejects.toThrow('no active support link');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
 });
 
 describe('pauseTaskInstanceTimer', () => {
@@ -769,6 +789,38 @@ describe('pauseTaskInstanceTimer', () => {
       handler(event('pauseTaskInstanceTimer', { input: { userId: 'u1', instanceId } })),
     ).rejects.toThrow('cannot change timing on a CANCELLED instance');
     expect(byCommand('TransactWriteCommand')).toHaveLength(0);
+  });
+
+  it('checks delegated authorization for the provided userId', async () => {
+    db.instance = {
+      status: 'IN_PROGRESS',
+      instanceId,
+      scheduledDate: '2099-07-02',
+      scheduledTime: '09:00',
+      activeDurationSeconds: 0,
+    };
+
+    await handler(event('pauseTaskInstanceTimer', { input: { userId: 'u1', instanceId } }));
+
+    expect(mockAssertCanAct).toHaveBeenCalledWith(expect.objectContaining({ sub: 'assigner-1' }), 'u1');
+  });
+
+  it('rejects when the caller may not act for the target user, without reading or writing DynamoDB', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
+    db.instance = {
+      status: 'IN_PROGRESS',
+      instanceId,
+      scheduledDate: '2099-07-02',
+      scheduledTime: '09:00',
+      activeStepId: 's1',
+      activeStepStartedAt: '2099-07-02T09:00:00.000Z',
+      activeDurationSeconds: 0,
+    };
+
+    await expect(
+      handler(event('pauseTaskInstanceTimer', { input: { userId: 'u1', instanceId } })),
+    ).rejects.toThrow('no active support link');
+    expect(mockSend).not.toHaveBeenCalled();
   });
 });
 

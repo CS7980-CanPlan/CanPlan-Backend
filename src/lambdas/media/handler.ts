@@ -2,8 +2,8 @@ import { randomUUID } from 'crypto';
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { assertCallerOwns, requireCaller } from '../../shared/authz';
-import { assertCanReadTaskById } from '../../shared/delegation';
+import { requireCaller } from '../../shared/authz';
+import { assertCanActForUser, assertCanReadTaskById } from '../../shared/delegation';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import { ENTITY, MEDIA_PREFIX, mediaSk, taskPk } from '../../shared/keys';
 import {
@@ -27,6 +27,7 @@ import type {
   MediaAsset,
   MediaDownloadTarget,
   MediaUploadTarget,
+  Task,
 } from '../../shared/types';
 
 /**
@@ -39,11 +40,13 @@ import type {
  * Download: getMediaDownloadUrl returns a short-lived presigned GET for private media.
  *
  * Authorization: media operations are scoped to the task's owner. Write/mint operations
- * (createMediaUploadUrl, createMediaAsset, deleteMediaAsset) are owner-only — the caller's
- * Cognito `sub` must equal the task's `ownerId`. Reads (getMediaDownloadUrl, listMediaForTask)
- * additionally allow a caller who holds an ACTIVE TaskAssignment referencing the task (an
- * assigned primary user can view a SupportPerson's task media), but never mutate it.
- * createTaskCoverImageUploadUrl only requires an authenticated caller (no task exists yet).
+ * (createMediaUploadUrl, createMediaAsset, deleteMediaAsset) authorize against the task's
+ * authoritative `ownerId` via `assertCanActForUser` — the owner, OR a SupportPerson with an
+ * ACTIVE SupportLink to that owner (a PRIMARY_USER in the same org). The stored asset owner is
+ * always the task's owner (a client-supplied ownerId is ignored). Reads (getMediaDownloadUrl,
+ * listMediaForTask) additionally allow a caller who holds an ACTIVE TaskAssignment referencing
+ * the task (an assigned primary user can view a SupportPerson's task media), but never mutate
+ * it. createTaskCoverImageUploadUrl only requires an authenticated caller (no task exists yet).
  */
 export const handler = async (
   event: AppSyncEvent<Record<string, unknown>>,
@@ -68,16 +71,19 @@ export const handler = async (
 };
 
 /**
- * Assert the caller OWNS the task a media write targets (media writes are owner-only). Reads the
- * authoritative owner from the task #META row, not a client-supplied ownerId.
+ * Load the task a media write targets and assert the caller may MANAGE it — the owner, or a
+ * SupportPerson with delegated access to the owner (`assertCanActForUser`). Reads the
+ * authoritative owner from the task #META row (never a client-supplied ownerId) and returns the
+ * task so callers can derive the asset owner from it.
  */
-async function assertOwnsTask(
+async function assertCanManageTask(
   identity: AppSyncIdentity | undefined,
   taskId: string,
-): Promise<void> {
+): Promise<Task> {
   const task = await readTaskMeta(taskId);
   if (!task) throw new NotFoundError(`task ${taskId} not found`);
-  assertCallerOwns(identity, task.ownerId);
+  await assertCanActForUser(identity, task.ownerId);
+  return task;
 }
 
 /**
@@ -118,8 +124,8 @@ async function createMediaUploadUrl(
   const contentType = input?.contentType?.trim();
   if (!taskId) throw new ValidationError('taskId is required and cannot be empty');
   if (!contentType) throw new ValidationError('contentType is required (e.g. image/png)');
-  // Minting an upload URL for a task is owner-only.
-  await assertOwnsTask(identity, taskId);
+  // Minting an upload URL requires manage access to the task (owner or delegated SupportPerson).
+  await assertCanManageTask(identity, taskId);
 
   // Server-owned key under the task's prefix; the random id avoids collisions and
   // keeps clients from choosing arbitrary paths.
@@ -185,14 +191,14 @@ async function createMediaAsset(
   const taskId = input?.taskId?.trim();
   const s3Key = input?.s3Key?.trim();
   const mimeType = input?.mimeType?.trim();
-  const ownerId = input?.ownerId?.trim();
   if (!taskId) throw new ValidationError('taskId is required and cannot be empty');
   if (!s3Key) throw new ValidationError('s3Key is required and cannot be empty');
   if (!input?.type) throw new ValidationError('type is required (IMAGE, AUDIO, or VIDEO)');
   if (!mimeType) throw new ValidationError('mimeType is required and cannot be empty');
-  if (!ownerId) throw new ValidationError('ownerId is required and cannot be empty');
-  // Registering media under a task is owner-only.
-  await assertOwnsTask(identity, taskId);
+  // Registering media requires manage access to the task (owner or delegated SupportPerson).
+  // The asset owner is derived from the task's authoritative ownerId — any client-supplied
+  // input.ownerId is ignored — so a delegated SupportPerson stores the primary user as owner.
+  const task = await assertCanManageTask(identity, taskId);
 
   const now = new Date().toISOString();
   // Newly registered media is UNATTACHED (no stepId) — it is bound to a step only via
@@ -203,7 +209,7 @@ async function createMediaAsset(
     s3Key,
     type: input.type,
     mimeType,
-    ownerId,
+    ownerId: task.ownerId,
     size: input.size,
     createdAt: now,
     updatedAt: now,
@@ -243,8 +249,8 @@ async function deleteMediaAsset(
   const assetId = input?.assetId?.trim();
   if (!taskId) throw new ValidationError('taskId is required and cannot be empty');
   if (!assetId) throw new ValidationError('assetId is required and cannot be empty');
-  // Deleting media is owner-only.
-  await assertOwnsTask(identity, taskId);
+  // Deleting media requires manage access to the task (owner or delegated SupportPerson).
+  await assertCanManageTask(identity, taskId);
 
   const result = await dynamo.send(
     new GetCommand({ TableName: TABLE_NAME, Key: { PK: taskPk(taskId), SK: mediaSk(assetId) } }),

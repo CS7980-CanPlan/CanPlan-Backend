@@ -16,8 +16,9 @@ _Last updated: 2026-07-01. Version: SupportPerson delegation + organization mana
 >   `listCategoriesByOwner` is replaced by **`listMyCategories`**. New: **`updateCategory`**,
 >   **`deleteCategory`**. Each defaults to the caller's own categories; an optional `userId`
 >   lets a **SupportPerson** manage a selected primary user's categories (delegated access).
-> - **`createTask` no longer takes `ownerId`** (derived from the identity), and a supplied
->   `categoryId` must be a real, owned category.
+> - **`createTask` takes no free-form `ownerId`** — the owner is the caller, or an optional
+>   `userId` target when the caller is a delegated SupportPerson — and a supplied `categoryId`
+>   must be a real, owned category.
 > - **`TaskStep.description`** added; **`reorderTaskSteps`** mutation added.
 >
 > Scheduling was also reworked — a `Task` is now a template only and scheduling lives on
@@ -34,14 +35,19 @@ human-readable companion.
 
 > ## ⚠️ Authorization model: self-ownership + SupportPerson delegation
 >
-> **Owner-scoped (caller `sub` must equal the resource owner).** The **identity-scoped**
-> creators (`createUserProfile`, `createTask`) and **all category** operations derive the
-> owner from the caller's Cognito `sub` and ignore any client-supplied owner id; **every
-> Task / TaskStep write** (`updateTask`, `deleteTask`, `createTaskStep`, `updateTaskStep`,
-> `deleteTaskStep`, `reorderTaskSteps`, `updateTaskOrder`) and the owner-scoped lists
-> (`listTasksByOwner`, `listTasksByCategory`) require the caller to be the owner; and **media
-> writes** (`createMediaUploadUrl`, `createMediaAsset`, `deleteMediaAsset`) are owner-only.
-> A non-owner gets `NOT_AUTHORIZED`.
+> **Owner-scoped, with SupportPerson delegation (caller is the owner, or their delegate).**
+> `createUserProfile` derives the owner from the caller's Cognito `sub` and ignores any
+> client-supplied owner id. **All category** operations, **every Task / TaskStep write**
+> (`createTask`, `updateTask`, `deleteTask`, `createTaskStep`, `updateTaskStep`,
+> `deleteTaskStep`, `reorderTaskSteps`, `updateTaskOrder`), the task lists (`listTasksByOwner`,
+> `listTasksByCategory`), and the **media writes** (`createMediaUploadUrl`, `createMediaAsset`,
+> `deleteMediaAsset`) authorize against the **target owner** via delegated access: the caller is
+> either that owner, or a `SupportPerson` who has selected that `PRIMARY_USER` (see below). The
+> owner is resolved server-side — `createTask` / `updateTaskOrder` take an optional `userId`
+> (omitted ⇒ the caller); the `taskId`-scoped mutations load the task and authorize against its
+> stored `ownerId`; and `createMediaAsset` stores the task's owner as the asset owner (a
+> client-supplied `ownerId` is ignored). Delegated writes always land under the target
+> **primary user's** account, never the SupportPerson's. Anyone else gets `NOT_AUTHORIZED`.
 >
 > **Self-scoped TaskInstance reads.** `getTaskInstance`, `listTaskInstances`, and
 > `batchGetTaskInstances` take **no `userId`** — they derive the owner from the caller's `sub`
@@ -57,14 +63,20 @@ human-readable companion.
 > **every assignment / instance operation** for the selected user (`createTaskAssignment`,
 > `startTaskInstance`, `setTaskInstanceStepCompletion`, `updateTaskInstanceStatus`,
 > `cancelTaskInstance`, `endTaskAssignment`, `deleteTaskAssignment`,
-> `listTaskAssignmentsForUser`, `getTaskInstanceViews`, `listTaskInstanceSteps`). A **stale**
-> link (after either party changes org, the target's role
+> `listTaskAssignmentsForUser`, `getTaskInstanceViews`, `listTaskInstanceSteps`), **manage that
+> user's categories**, and **fully manage that user's own task templates** — create tasks under
+> them, edit/delete their tasks, add/edit/delete/reorder their task steps, manage their task
+> media, and list their tasks (`createTask` with `userId`, `updateTask`, `deleteTask`,
+> `createTaskStep`, `updateTaskStep`, `deleteTaskStep`, `reorderTaskSteps`, `updateTaskOrder`,
+> `createMediaUploadUrl`, `createMediaAsset`, `deleteMediaAsset`, `listTasksByOwner`,
+> `listTasksByCategory`). A **stale** link (after either party changes org, the target's role
 > changes, or the link is revoked) stops granting access immediately.
 >
 > **Read-only access for assigned templates/media.** A user who holds an **active
 > assignment referencing a task** may READ that task and its resources even though they don't
 > own it: `getTask`, `listTaskSteps`, `getMediaDownloadUrl`, and `listMediaForTask`. This is
-> **read-only** — it never permits mutating the task, its steps, or its media.
+> **read-only** — it never permits mutating the task, its steps, or its media. (A delegated
+> SupportPerson may also read the tasks they can manage.)
 >
 > **Assignments are owner-of-template + delegated-for-user.** `createTaskAssignment` requires
 > the caller to **own the referenced Task template** AND be allowed to act for the target
@@ -303,23 +315,27 @@ curl -s "$GRAPHQL_URL" \
 
 ### `createTask` — mutation
 
-Creates a **reusable task template** owned by the authenticated caller, plus one
-`TaskStep` item per nested step (each stored as its own row). A `Task` carries **no
-schedule** — scheduling a task for a user is a separate operation, see `createTaskAssignment`.
+Creates a **reusable task template**, plus one `TaskStep` item per nested step (each stored as
+its own row). By default the task is owned by the authenticated caller; a `SupportPerson` may
+create it **under a selected primary user** by passing that user's id as `userId`. A `Task`
+carries **no schedule** — scheduling a task for a user is a separate operation, see
+`createTaskAssignment`.
 
 **Input — `CreateTaskInput`**
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
+| `userId` | `ID` | — | Optional target owner. Omitted/null/blank ⇒ the caller. A non-self value requires SupportPerson delegated access (`NOT_AUTHORIZED` otherwise); the task is created under that primary user |
 | `title` | `String!` | ✅ | Non-empty after trimming |
-| `categoryId` | `ID` | — | Optional; omitted/null ⇒ the owner's default category. A **blank string is rejected**. A supplied id must be a real, owned, non-deleting Category (see below) |
+| `categoryId` | `ID` | — | Optional; omitted/null ⇒ the **target owner's** default category. A **blank string is rejected**. A supplied id must be a real, owned (by the target owner), non-deleting Category (see below) |
 | `description` | `String` | — | Optional |
 | `steps` | `[CreateTaskStepNestedInput!]` | — | Ordered; each becomes a `STEP#<stepId>` item; max **97**, or max **96** when `coverImageS3Key` is supplied |
 | `coverImageS3Key` | `String` | — | Optional cover image (pending key from `createTaskCoverImageUploadUrl`) |
 
-> **No `ownerId`.** The owner is the caller's Cognito `sub`; a client-supplied `ownerId`
-> is ignored. The owner must already have a profile (and therefore a default category) —
-> call `createUserProfile` first, or `createTask` fails clearly.
+> **No arbitrary `ownerId`.** The owner is the caller's Cognito `sub`, or the `userId` target
+> when the caller is a delegated SupportPerson — never a free-form client-supplied owner. The
+> target owner must already have a profile (and therefore a default category) — call
+> `createUserProfile` first, or `createTask` fails clearly.
 
 `CreateTaskStepNestedInput`: `text: String!` plus optional `description: String` (trimmed;
 empty/whitespace dropped). Step media is attached afterward via the upload flow, since step
@@ -555,17 +571,17 @@ categories via the optional `userId` — see below)
 
 | Operation | Input | Returns |
 |---|---|---|
-| `getTask` | `taskId!` | `Task` · `null` if not found · `steps` is `null` here (use `listTaskSteps`) · readable by the **owner OR a user with an active assignment referencing the task** (read-only) |
-| `listTaskSteps` | `taskId!, limit, nextToken` | `TaskStepConnection!` — steps sorted by ascending `order`, order preserved across pages; readable by the **owner OR an assignee** (read-only); see below |
-| `listTasksByOwner` | `ownerId!, limit, nextToken` | `TaskConnection!` — tasks sorted by ascending per-owner `order` (un-ordered legacy rows last), order preserved across pages; `ownerId` must be the caller |
-| `listTasksByCategory` | `ownerId!, categoryId!, limit, nextToken` | `TaskConnection!` — tasks in one real category; **`categoryId` is required** and is validated (owned + exists + not deleting → `NOT_FOUND`/`VALIDATION`, never a silent empty result); `ownerId` must be the caller |
-| `updateTask` | `input: { taskId!, title, categoryId, description, coverImageS3Key }` | `Task` — **partial edit**; owner-only; see below |
-| `createTaskStep` | `input: { taskId!, order!, text!, description, media }` | `TaskStep` — **appends** one step at the end, optionally with initial type-specific media (owner-only); see below |
-| `updateTaskStep` | `input: { taskId!, stepId!, text, description, media }` | `TaskStep` — **partial edit** of one step and its type-specific media slots; see below |
-| `deleteTaskStep` | `input: { taskId!, stepId! }` | `TaskStep` — the deleted step; also deletes all its media assets; see below |
-| `reorderTaskSteps` | `input: { taskId!, steps: [{ stepId!, order! }] }` | `[TaskStep!]!` — atomically renumbers all steps; see below |
-| `updateTaskOrder` | `input: { tasks: [{ taskId!, order! }] }` | `[Task!]!` — atomically reorders **all of the caller's tasks** in one transaction; see below |
-| `deleteTask` | `taskId!` | `Task` — the deleted template (minus internal fields); cascades to all its steps + media; see below |
+| `getTask` | `taskId!` | `Task` · `null` if not found · `steps` is `null` here (use `listTaskSteps`) · readable by the **owner, a delegated SupportPerson, OR a user with an active assignment referencing the task** (read-only) |
+| `listTaskSteps` | `taskId!, limit, nextToken` | `TaskStepConnection!` — steps sorted by ascending `order`, order preserved across pages; readable by the **owner, a delegated SupportPerson, OR an assignee** (read-only); see below |
+| `listTasksByOwner` | `ownerId!, limit, nextToken` | `TaskConnection!` — tasks sorted by ascending per-owner `order` (un-ordered legacy rows last), order preserved across pages; `ownerId` is the caller **or a primary user the caller (a SupportPerson) has delegated access to** |
+| `listTasksByCategory` | `ownerId!, categoryId!, limit, nextToken` | `TaskConnection!` — tasks in one real category; **`categoryId` is required** and is validated (owned + exists + not deleting → `NOT_FOUND`/`VALIDATION`, never a silent empty result); same access as `listTasksByOwner` (self or delegated) |
+| `updateTask` | `input: { taskId!, title, categoryId, description, coverImageS3Key }` | `Task` — **partial edit**; owner **or delegated SupportPerson**; see below |
+| `createTaskStep` | `input: { taskId!, order!, text!, description, media }` | `TaskStep` — **appends** one step at the end, optionally with initial type-specific media (owner or delegated SupportPerson); see below |
+| `updateTaskStep` | `input: { taskId!, stepId!, text, description, media }` | `TaskStep` — **partial edit** of one step and its type-specific media slots (owner or delegated SupportPerson); see below |
+| `deleteTaskStep` | `input: { taskId!, stepId! }` | `TaskStep` — the deleted step; also deletes all its media assets (owner or delegated SupportPerson); see below |
+| `reorderTaskSteps` | `input: { taskId!, steps: [{ stepId!, order! }] }` | `[TaskStep!]!` — atomically renumbers all steps (owner or delegated SupportPerson); see below |
+| `updateTaskOrder` | `input: { userId, tasks: [{ taskId!, order! }] }` | `[Task!]!` — atomically reorders **all of a target owner's tasks** in one transaction; omitted/null `userId` ⇒ the caller, a non-self value requires delegated access; see below |
+| `deleteTask` | `taskId!` | `Task` — the deleted template (minus internal fields); cascades to all its steps + media (owner or delegated SupportPerson); see below |
 
 > **`updateTask` is a partial edit.** Only the fields you include change; omitted
 > fields keep their current value. `ownerId` is immutable and **steps are not edited
@@ -918,18 +934,21 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 |---|---|---|
 | `createMediaUploadUrl` | `input: { taskId!, contentType!, fileName }` | `MediaUploadTarget` — see flow below |
 | `createTaskCoverImageUploadUrl` | `input: { contentType!, fileName }` | `MediaUploadTarget!` — temporary cover-image upload; see [cover images](#task-cover-images) |
-| `createMediaAsset` | `input: { taskId!, s3Key!, type!, mimeType!, ownerId!, size }` | `MediaAsset` — initially unattached; see flow below |
+| `createMediaAsset` | `input: { taskId!, s3Key!, type!, mimeType!, ownerId (ignored), size }` | `MediaAsset` — initially unattached; asset owner is the task's owner; see flow below |
 | `deleteMediaAsset` | `input: { taskId!, assetId! }` | `MediaAsset` — deletes the binary + row + dangling refs; see below |
-| `getMediaDownloadUrl` | `taskId!, assetId!` | `MediaDownloadTarget` — see flow below; readable by the **owner OR an assignee** (read-only) |
-| `listMediaForTask` | `taskId!, limit, nextToken` | `MediaAssetConnection!` — readable by the **owner OR an assignee** |
+| `getMediaDownloadUrl` | `taskId!, assetId!` | `MediaDownloadTarget` — see flow below; readable by the **owner, delegated SupportPerson, OR an assignee** (read-only) |
+| `listMediaForTask` | `taskId!, limit, nextToken` | `MediaAssetConnection!` — readable by the **owner, delegated SupportPerson, OR an assignee** |
 
-> **Media authorization.** **Writes are owner-only** — `createMediaUploadUrl`, `createMediaAsset`,
-> and `deleteMediaAsset` require the caller to own the task (`NOT_AUTHORIZED` otherwise).
-> **Reads** (`getMediaDownloadUrl`, `listMediaForTask`) are allowed for the owner **or** a user
-> who holds an **active assignment referencing the task** — so an assigned primary user can view
-> a SupportPerson's task media, but never mutate it. `createTaskCoverImageUploadUrl` only
-> requires an authenticated caller (no task exists yet; the pending upload is promoted to a
-> task-owned asset by the owner-scoped `createTask`/`updateTask`).
+> **Media authorization.** **Writes** — `createMediaUploadUrl`, `createMediaAsset`, and
+> `deleteMediaAsset` — authorize against the task's owner: the **owner OR a SupportPerson with
+> delegated access** to that owner (`NOT_AUTHORIZED` otherwise). `createMediaAsset` **derives the
+> asset owner from the task's authoritative `ownerId`** and ignores any client-supplied
+> `ownerId`, so a delegated SupportPerson's registration stores the primary user as the owner.
+> **Reads** (`getMediaDownloadUrl`, `listMediaForTask`) are additionally allowed for a user who
+> holds an **active assignment referencing the task** — so an assigned primary user can view a
+> SupportPerson's task media, but never mutate it. `createTaskCoverImageUploadUrl` only requires
+> an authenticated caller (no task exists yet; the pending upload is promoted to a task-owned
+> asset by `createTask`/`updateTask`, which authorize the target owner).
 
 > **Media is upload-first.** Binaries live in the S3 media bucket; DynamoDB stores
 > only the `s3Key` and metadata (`type`, `mimeType`, `ownerId`, `size`). Newly created
@@ -1415,9 +1434,10 @@ ordering changed. **This is a breaking API change.**
 
 - `TaskStatus` enum and `Task.status` (output), plus `status` on `CreateTaskInput` /
   `UpdateTaskInput`. Tasks have no status.
-- `ownerId` on `CreateTaskInput` and `CreateCategoryInput`. `createTask` is owned by the
-  caller; category operations default to the caller but may target a selected primary user via
-  optional `userId` and SupportPerson delegation.
+- Free-form `ownerId` on `CreateTaskInput` and `CreateCategoryInput`. Task and category
+  operations default to the caller but may target a selected primary user via optional `userId`
+  and SupportPerson delegation. (`CreateMediaAssetInput.ownerId` is likewise ignored — the asset
+  owner is derived from the task.)
 - `listCategoriesByOwner(ownerId, …)` — replaced by `listMyCategories(…)`.
 
 **Changed**
@@ -1426,8 +1446,9 @@ ordering changed. **This is a breaking API change.**
   bucket).
 - `TaskStep` storage moved from order-based sort keys (`STEP#001`) to stable
   `STEP#<stepId>` keys; `order` is a plain attribute. List/read paths sort by `order`.
-- **Task & TaskStep operations are now owner-scoped** (caller `sub` must equal the task's
-  `ownerId`); `createTaskStep` is **append-only** (next position; max 99 steps).
+- **Task & TaskStep operations are owner-scoped with SupportPerson delegation** (the caller
+  must be the task's `ownerId`, or a SupportPerson with an ACTIVE link to that owner);
+  `createTaskStep` is **append-only** (next position; max 99 steps).
 
 **Added**
 

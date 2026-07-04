@@ -110,9 +110,9 @@ export const handler = async (
     case 'setTaskInstanceStepCompletion':
       return setTaskInstanceStepCompletion(args.input as SetTaskInstanceStepCompletionInput, identity);
     case 'startTaskInstanceStep':
-      return startTaskInstanceStep(args.input as StartTaskInstanceStepInput);
+      return startTaskInstanceStep(args.input as StartTaskInstanceStepInput, identity);
     case 'pauseTaskInstanceTimer':
-      return pauseTaskInstanceTimer(args.input as PauseTaskInstanceTimerInput);
+      return pauseTaskInstanceTimer(args.input as PauseTaskInstanceTimerInput, identity);
     case 'updateTaskInstanceStatus':
       return updateTaskInstanceStatus(args.input as UpdateTaskInstanceStatusInput, identity);
     case 'cancelTaskInstance':
@@ -464,6 +464,7 @@ async function setTaskInstanceStepCompletion(
  */
 async function startTaskInstanceStep(
   input: StartTaskInstanceStepInput,
+  identity: AppSyncIdentity | undefined,
 ): Promise<TaskInstanceTimingResult> {
   const userId = input?.userId?.trim();
   const instanceId = input?.instanceId?.trim();
@@ -471,6 +472,7 @@ async function startTaskInstanceStep(
   if (!userId) throw new ValidationError('userId is required and cannot be empty');
   if (!instanceId) throw new ValidationError('instanceId is required and cannot be empty');
   if (!stepId) throw new ValidationError('stepId is required and cannot be empty');
+  await assertCanActForUser(identity, userId);
 
   const parsed = parseInstanceId(instanceId);
   if (!parsed) throw new ValidationError(`invalid instanceId "${instanceId}"`);
@@ -591,11 +593,13 @@ async function startTaskInstanceStep(
  */
 async function pauseTaskInstanceTimer(
   input: PauseTaskInstanceTimerInput,
+  identity: AppSyncIdentity | undefined,
 ): Promise<TaskInstanceTimingResult> {
   const userId = input?.userId?.trim();
   const instanceId = input?.instanceId?.trim();
   if (!userId) throw new ValidationError('userId is required and cannot be empty');
   if (!instanceId) throw new ValidationError('instanceId is required and cannot be empty');
+  await assertCanActForUser(identity, userId);
 
   const parsed = parseInstanceId(instanceId);
   if (!parsed) throw new ValidationError(`invalid instanceId "${instanceId}"`);

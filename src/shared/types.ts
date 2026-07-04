@@ -445,10 +445,14 @@ export interface CreateTaskStepNestedInput {
   description?: string;
 }
 
-// ownerId is intentionally absent — the owner is derived from the authenticated
-// Cognito identity (event.identity.sub), never client-supplied. A Task is a reusable
-// template only: it carries no schedule (scheduling lives on TaskAssignment).
+// The target owner is resolved server-side: omitted/null `userId` ⇒ the authenticated
+// caller (event.identity.sub); a non-self `userId` targets that primary user and requires
+// SupportPerson delegated access (assertCanActForUser). No arbitrary client-supplied ownerId
+// is honored beyond this delegation path. A Task is a reusable template only: it carries no
+// schedule (scheduling lives on TaskAssignment).
 export interface CreateTaskInput {
+  /** Omitted/null ⇒ the caller. A non-self value requires SupportPerson delegated access. */
+  userId?: string;
   title: string;
   /**
    * Optional. Omitted/null ⇒ the owner's default category. A blank string is rejected.
@@ -562,12 +566,15 @@ export interface TaskOrderInput {
 }
 
 /**
- * Atomically reorder ALL of the caller's tasks. `tasks` must be the complete current set:
+ * Atomically reorder ALL of a target owner's tasks. `tasks` must be the complete current set:
  * every owned taskId exactly once, with positive, mutually-unique orders (gaps allowed).
  * Applied in a single DynamoDB transaction (all-or-nothing); only the `order` attribute
- * changes. The owner is derived from the Cognito identity, never the input.
+ * changes. Omitted/null `userId` ⇒ the caller; a non-self value requires SupportPerson
+ * delegated access.
  */
 export interface UpdateTaskOrderInput {
+  /** Omitted/null ⇒ the caller. A non-self value requires SupportPerson delegated access. */
+  userId?: string;
   tasks: TaskOrderInput[];
 }
 
@@ -677,7 +684,12 @@ export interface CreateMediaAssetInput {
   s3Key: string;
   type: MediaType;
   mimeType: string;
-  ownerId: string;
+  /**
+   * Deprecated/ignored. The asset owner is derived from the task's authoritative `ownerId`
+   * (never client-supplied), so a SupportPerson registering media under a delegated primary
+   * user's task stores that primary user as the owner. Retained only for input compatibility.
+   */
+  ownerId?: string;
   size?: number;
 }
 

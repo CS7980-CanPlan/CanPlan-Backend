@@ -1,17 +1,29 @@
 import { handler } from './handler';
 import { dynamo } from '../../shared/dynamodb';
+import { assertCanActForUser } from '../../shared/delegation';
 import {
   deleteS3ObjectBestEffort,
   prepareCoverImageAsset,
   purgeMediaAsset,
   retryTaskMediaCleanup,
 } from '../../shared/media';
+import { UnauthorizedError } from '../../shared/response';
 import type { Connection, Task, TaskStep } from '../../shared/types';
 
 jest.mock('../../shared/dynamodb', () => ({
   dynamo: { send: jest.fn() },
   TABLE_NAME: 'CanPlan-test',
 }));
+
+// Manage-access authorization (owner or delegated SupportPerson) is unit-tested in
+// shared/delegation.test.ts; here `assertCanActForUser` is mocked to resolve by default so tests
+// exercise the handler logic, and is overridden to reject for denial tests. The READ path
+// (`assertCanReadTask`) keeps its real implementation (owner / active-assignment) via
+// requireActual, driven by the mocked dynamo.send.
+jest.mock('../../shared/delegation', () => {
+  const actual = jest.requireActual('../../shared/delegation');
+  return { ...actual, assertCanActForUser: jest.fn() };
+});
 
 jest.mock('../../shared/media', () => ({
   prepareCoverImageAsset: jest.fn(),
@@ -21,6 +33,7 @@ jest.mock('../../shared/media', () => ({
 }));
 
 const mockSend = dynamo.send as jest.Mock;
+const mockAssertCanAct = assertCanActForUser as jest.Mock;
 const mockPrepare = prepareCoverImageAsset as jest.Mock;
 const mockDeleteS3 = deleteS3ObjectBestEffort as jest.Mock;
 const mockPurge = purgeMediaAsset as jest.Mock;
@@ -28,7 +41,11 @@ const mockRetryMediaCleanup = retryTaskMediaCleanup as jest.Mock;
 
 const OWNER = 'o1';
 
-beforeEach(() => mockSend.mockResolvedValue({}));
+beforeEach(() => {
+  mockSend.mockResolvedValue({});
+  // Default: the caller may manage the target owner's tasks (self or active delegation).
+  mockAssertCanAct.mockResolvedValue(OWNER);
+});
 afterEach(() => jest.clearAllMocks());
 
 /** Identity defaults to the task owner (OWNER); pass another sub to test cross-owner denial. */
@@ -71,7 +88,7 @@ describe('tasks handler — reads + authorization', () => {
     expect(result.taskId).toBe('t1');
     // An intruder with no active assignment referencing the task cannot read it.
     await expect(handler(event('getTask', { taskId: 't1' }, 'intruder'))).rejects.toThrow(
-      'does not own this task and has no assignment',
+      'does not own this task',
     );
   });
 
@@ -157,18 +174,23 @@ describe('tasks handler — reads + authorization', () => {
   it('listTaskSteps rejects a non-owner without an assignment, and a missing task', async () => {
     mockSend.mockResolvedValue({ Item: meta() });
     await expect(handler(event('listTaskSteps', { taskId: 't1' }, 'intruder'))).rejects.toThrow(
-      'does not own this task and has no assignment',
+      'does not own this task',
     );
     mockSend.mockResolvedValue({}); // task missing
     await expect(handler(event('listTaskSteps', { taskId: 'gone' }))).rejects.toThrow('task gone not found');
   });
 
-  it('listTasksByOwner requires the caller to be the owner', async () => {
+  it('listTasksByOwner authorizes delegated access to the owner, then queries the index', async () => {
     mockSend.mockResolvedValueOnce({ Items: [{ taskId: 't1', ownerId: OWNER }] });
     await handler(event('listTasksByOwner', { ownerId: OWNER }));
+    expect(mockAssertCanAct).toHaveBeenCalledWith(expect.objectContaining({ sub: OWNER }), OWNER);
     expect(lastInput().IndexName).toBe('taskOwnerIndex');
+  });
+
+  it('listTasksByOwner rejects a caller who may not act for the owner', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
     await expect(handler(event('listTasksByOwner', { ownerId: 'someone-else' }, OWNER))).rejects.toThrow(
-      'does not own this resource',
+      'no active support link',
     );
   });
 
@@ -194,10 +216,13 @@ describe('tasks handler — reads + authorization', () => {
     ).rejects.toThrow('category nope not found');
   });
 
-  it('listTasksByCategory rejects a non-owner before any read', async () => {
+  it('listTasksByCategory rejects a caller who may not act for the owner, before any read', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
     await expect(
       handler(event('listTasksByCategory', { ownerId: 'someone-else', categoryId: 'c' }, OWNER)),
-    ).rejects.toThrow('does not own this resource');
+    ).rejects.toThrow('no active support link');
+    // Authorization happens before validating the category or querying the index.
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
   it('listTasksByOwner returns tasks sorted by ascending order', async () => {
@@ -280,6 +305,31 @@ describe('tasks handler — updateTaskOrder', () => {
     }
   });
 
+  it('reorders a primary user’s tasks for a delegated SupportPerson (input.userId), guarding on that owner', async () => {
+    onlyQueryReturns();
+    await handler(
+      event(
+        'updateTaskOrder',
+        { input: { userId: 'pu-1', tasks: [{ taskId: 'a', order: 1 }, { taskId: 'b', order: 2 }, { taskId: 'c', order: 3 }] } },
+        'sup-1',
+      ),
+    );
+    // Delegation is checked for the target primary user, and every write is guarded on that owner.
+    expect(mockAssertCanAct).toHaveBeenCalledWith(expect.objectContaining({ sub: 'sup-1' }), 'pu-1');
+    const tx = calls().find((c) => c.input.TransactItems)!;
+    for (const item of tx.input.TransactItems as Array<{ Update: { ExpressionAttributeValues: Record<string, unknown> } }>) {
+      expect(item.Update.ExpressionAttributeValues[':owner']).toBe('pu-1');
+    }
+  });
+
+  it('rejects a delegated reorder when authorization fails, before any read', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
+    await expect(
+      handler(event('updateTaskOrder', { input: { userId: 'pu-1', tasks: [{ taskId: 'a', order: 1 }] } }, 'sup-1')),
+    ).rejects.toThrow('no active support link');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
   it('rejects an incomplete task set (must list every owned task)', async () => {
     onlyQueryReturns();
     await expect(
@@ -346,7 +396,7 @@ describe('tasks handler — updateTask', () => {
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
   });
-  /** GET #META (loadOwnedTask) then the write. */
+  /** GET #META (loadManageableTask) then the write. */
   const withExisting = () => mockSend.mockResolvedValueOnce({ Item: { ...existingTask } });
   const putInput = () => mockSend.mock.calls[1][0].input;
 
@@ -362,11 +412,27 @@ describe('tasks handler — updateTask', () => {
     expect(result.title).toBe('New title');
   });
 
-  it('rejects a non-owner caller', async () => {
+  it('lets a delegated SupportPerson edit a primary user’s task (authorized against the task owner)', async () => {
+    // Task is owned by primary user "pu-1"; the caller is their SupportPerson.
+    const puTask = meta({ ownerId: 'pu-1', title: 'Old', createdAt: 'c', updatedAt: 'c' });
+    mockSend.mockResolvedValueOnce({ Item: { ...puTask } });
+    const result = (await handler(
+      event('updateTask', { input: { taskId: 't1', title: 'New title' } }, 'sup-1'),
+    )) as Task;
+    // Manage authorization is checked against the task's OWNER, not the caller.
+    expect(mockAssertCanAct).toHaveBeenCalledWith(expect.objectContaining({ sub: 'sup-1' }), 'pu-1');
+    // The edit lands on the primary user's task; ownerId is never reassigned to the SupportPerson.
+    expect(putInput().Item.ownerId).toBe('pu-1');
+    expect(putInput().Item.title).toBe('New title');
+    expect(result.ownerId).toBe('pu-1');
+  });
+
+  it('rejects a caller who cannot manage the task (not owner, no delegation)', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
     mockSend.mockResolvedValueOnce({ Item: { ...existingTask } });
     await expect(
       handler(event('updateTask', { input: { taskId: 't1', title: 'x' } }, 'intruder')),
-    ).rejects.toThrow('does not own this resource');
+    ).rejects.toThrow('no active support link');
   });
 
   it('moves the task between categories, adjusting both counts in one transaction', async () => {
@@ -572,10 +638,11 @@ describe('tasks handler — createTaskStep', () => {
       handler(event('createTaskStep', { input: { taskId: 'gone', order: 1, text: 'x' } })),
     ).rejects.toThrow('task gone not found');
 
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
     stub({ ownerId: 'someone-else', stepCount: 0, nextStepOrder: 1 });
     await expect(
       handler(event('createTaskStep', { input: { taskId: 't1', order: 1, text: 'x' } }, OWNER)),
-    ).rejects.toThrow('does not own this resource');
+    ).rejects.toThrow('no active support link');
     expect(tx()).toBeUndefined();
   });
 
@@ -706,11 +773,12 @@ describe('tasks handler — updateTaskStep', () => {
     expect(mockSend).not.toHaveBeenCalled();
   });
 
-  it('rejects a non-owner', async () => {
+  it('rejects a caller who cannot manage the task', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
     stub([{ stepId: 's1', order: 1, taskId: 't1' }], { owner: 'someone-else' });
     await expect(
       handler(event('updateTaskStep', { input: { taskId: 't1', stepId: 's1', text: 'x' } }, OWNER)),
-    ).rejects.toThrow('does not own this resource');
+    ).rejects.toThrow('no active support link');
   });
 
   it('returns NotFound when the step does not exist', async () => {
@@ -916,7 +984,8 @@ describe('tasks handler — reorderTaskSteps', () => {
     ).rejects.toThrow('changed concurrently');
   });
 
-  it('rejects a non-owner', async () => {
+  it('rejects a caller who cannot manage the task', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
     stub(current, { ownerId: 'someone-else' });
     await expect(
       handler(
@@ -924,7 +993,7 @@ describe('tasks handler — reorderTaskSteps', () => {
           input: { taskId: 't1', steps: [{ stepId: 's1', order: 1 }, { stepId: 's2', order: 2 }, { stepId: 's3', order: 3 }] },
         }, OWNER),
       ),
-    ).rejects.toThrow('does not own this resource');
+    ).rejects.toThrow('no active support link');
   });
 
   it('rejects a partial set, an unknown stepId, duplicates, and non-contiguous orders', async () => {
@@ -1014,11 +1083,12 @@ describe('tasks handler — deleteTaskStep', () => {
     expect(finalTx()).toBeUndefined();
   });
 
-  it('rejects a non-owner', async () => {
+  it('rejects a caller who cannot manage the task', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
     stub({ steps: [{ stepId: 's1', order: 1 }], metaExtra: { ownerId: 'someone-else' } });
     await expect(
       handler(event('deleteTaskStep', { input: { taskId: 't1', stepId: 's1' } }, OWNER)),
-    ).rejects.toThrow('does not own this resource');
+    ).rejects.toThrow('no active support link');
   });
 
   it('returns NotFound when the step does not exist', async () => {
@@ -1072,7 +1142,7 @@ describe('tasks handler — deleteTask', () => {
 
   it('deletes #META + decrements its category, plus all steps, media, and S3 objects', async () => {
     mockSend
-      .mockResolvedValueOnce({ Item: { ...m } }) // loadOwnedTask GET #META
+      .mockResolvedValueOnce({ Item: { ...m } }) // loadManageableTask GET #META
       .mockResolvedValueOnce({ Count: 0 }) // active-assignment GSI guard (none)
       .mockResolvedValueOnce({ Items: [{ PK: 'TASK#t1', SK: 'STEP#s1' }, { PK: 'TASK#t1', SK: 'STEP#s2' }] }) // STEP# keys
       .mockResolvedValueOnce({
@@ -1113,16 +1183,17 @@ describe('tasks handler — deleteTask', () => {
     expect(mockDeleteS3).not.toHaveBeenCalled();
   });
 
-  it('rejects a non-owner', async () => {
+  it('rejects a caller who cannot manage the task', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
     mockSend.mockResolvedValueOnce({ Item: { ...m } });
     await expect(handler(event('deleteTask', { taskId: 't1' }, 'intruder'))).rejects.toThrow(
-      'does not own this resource',
+      'no active support link',
     );
   });
 
   it('rejects deletion while an active TaskAssignment references the task', async () => {
     mockSend
-      .mockResolvedValueOnce({ Item: { ...m } }) // loadOwnedTask GET #META
+      .mockResolvedValueOnce({ Item: { ...m } }) // loadManageableTask GET #META
       .mockResolvedValueOnce({ Count: 2 }); // active-assignment GSI guard finds 2
     await expect(handler(event('deleteTask', { taskId: 't1' }))).rejects.toThrow(
       'active task assignment',
