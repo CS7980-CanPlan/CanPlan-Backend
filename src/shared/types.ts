@@ -927,6 +927,8 @@ export interface GenerateReportInput {
   userId: string;
   from: string;
   to: string;
+  /** When false, return the report inline only (no S3/DynamoDB write). Defaults to true. */
+  persist?: boolean;
 }
 
 /**
@@ -938,9 +940,13 @@ export interface Report {
   reportId: string;
   scope: { userId: string };
   dateRange: { from: string; to: string };
-  s3Key: string;
+  /** Set only when persisted; absent when generateReport ran with persist:false. */
+  s3Key?: string;
   createdBy: string;
   createdAt: string;
+  /** Populated inline on generateReport responses; absent on listReports index rows. */
+  narrative?: string;
+  stats?: ReportStats;
 }
 
 /** Deterministic statistics computed over a user's task instances in a date range. */

@@ -300,9 +300,13 @@ type Report {
   reportId: ID!
   scope: AWSJSON
   dateRange: AWSJSON
+  # Set only when the report was persisted; null when generateReport ran with persist:false.
   s3Key: String
   createdBy: ID
   createdAt: String!
+  # Populated inline on generateReport responses (computed in memory); null on listReports rows.
+  narrative: String
+  stats: AWSJSON
 }
 
 # Presigned S3 upload target returned by createMediaUploadUrl. The client PUTs the
@@ -804,6 +808,9 @@ input GenerateReportInput {
   userId: ID!
   from: AWSDate!
   to: AWSDate!
+  # When false, the report is returned inline only (narrative + stats) and NOT saved to
+  # S3/DynamoDB. Defaults to true (persist), preserving the original behavior.
+  persist: Boolean
 }
 
 # ─── Pagination / connections ───────────────────────────────────────────────--
@@ -969,7 +976,9 @@ type Query {
   adminListOrganizationUsers(organizationId: ID!, limit: Int, nextToken: String): UserProfileConnection!
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 
-  # AI progress reports for a cared-for user (caller must have an active support link).
+  # AI progress reports for a cared-for user. NOTE: access checks are temporarily disabled
+  # (any authenticated caller may read any user's reports) pending the general permission
+  # model; see assertCanAccessUserReports.
   listReports(userId: ID!, limit: Int, nextToken: String): ReportConnection!
   getReportDownloadUrl(userId: ID!, reportId: ID!): MediaDownloadTarget!
 }
@@ -1089,8 +1098,14 @@ type Mutation {
   generateTaskSteps(input: GenerateTaskStepsInput!): TaskStepsResponse!
 
   # Generate an AI progress report for a cared-for user over a date range. Computes the
-  # stats in code, has the AI write the narrative, persists JSON to S3 + a DynamoDB row.
+  # stats in code, has the AI write the narrative, and (when input.persist is not false)
+  # saves JSON to S3 + a DynamoDB row. Always returns narrative + stats inline.
   generateReport(input: GenerateReportInput!): Report!
+
+  # Delete a persisted report (its DynamoDB index row + S3 JSON object). NOTE: access
+  # checks are temporarily disabled pending the general permission model. Returns true
+  # when a report was deleted; errors if no such report exists.
+  deleteReport(userId: ID!, reportId: ID!): Boolean!
 
   # ─── Admin mutations (SystemAdmin-only) ──────────────────────────────────────
   # All gated to the SystemAdmin Cognito group at the AppSync edge AND re-checked in the

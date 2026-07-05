@@ -2,7 +2,12 @@ import { handler } from './handler';
 import { assertCanAccessUserReports } from '../../shared/reportAuthz';
 import { buildReportStats } from '../../shared/reportMetrics';
 import { generateReportNarrative } from '../../shared/reportNarrative';
-import { writeReport, listReports, getReportDownloadUrl } from '../../shared/reportStorage';
+import {
+  writeReport,
+  listReports,
+  getReportDownloadUrl,
+  deleteReport,
+} from '../../shared/reportStorage';
 
 jest.mock('../../shared/reportAuthz', () => ({ assertCanAccessUserReports: jest.fn() }));
 jest.mock('../../shared/reportMetrics', () => ({ buildReportStats: jest.fn() }));
@@ -11,6 +16,7 @@ jest.mock('../../shared/reportStorage', () => ({
   writeReport: jest.fn(),
   listReports: jest.fn(),
   getReportDownloadUrl: jest.fn(),
+  deleteReport: jest.fn(),
 }));
 
 const mockAuthz = assertCanAccessUserReports as jest.Mock;
@@ -19,6 +25,7 @@ const mockNarrative = generateReportNarrative as jest.Mock;
 const mockWrite = writeReport as jest.Mock;
 const mockList = listReports as jest.Mock;
 const mockDownload = getReportDownloadUrl as jest.Mock;
+const mockDelete = deleteReport as jest.Mock;
 
 function event(fieldName: string, args: Record<string, unknown>, sub: string | null = 'sup-1') {
   return {
@@ -71,6 +78,40 @@ describe('generateReport', () => {
   it('still produces a report for an empty range (zero instances)', async () => {
     await handler(event('generateReport', { input }));
     expect(mockWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns the narrative and stats inline', async () => {
+    const result = (await handler(event('generateReport', { input }))) as {
+      narrative: string;
+      stats: unknown;
+    };
+    expect(result.narrative).toBe('A summary.');
+    expect(result.stats).toEqual({ meta: { totalInstances: 0 } });
+  });
+
+  it('skips persistence when persist is false, still returning the content', async () => {
+    const result = (await handler(
+      event('generateReport', { input: { ...input, persist: false } }),
+    )) as { narrative: string; s3Key?: string };
+    expect(mockWrite).not.toHaveBeenCalled();
+    expect(mockNarrative).toHaveBeenCalled();
+    expect(result.narrative).toBe('A summary.');
+    expect(result.s3Key).toBeUndefined();
+  });
+});
+
+describe('deleteReport', () => {
+  it('authorizes then deletes', async () => {
+    mockDelete.mockResolvedValue(true);
+    const result = await handler(event('deleteReport', { userId: 'u1', reportId: 'r-1' }));
+    expect(mockAuthz).toHaveBeenCalledWith('sup-1', 'u1');
+    expect(mockDelete).toHaveBeenCalledWith('u1', 'r-1');
+    expect(result).toBe(true);
+  });
+
+  it('rejects a missing reportId', async () => {
+    await expect(handler(event('deleteReport', { userId: 'u1' }))).rejects.toThrow('reportId');
+    expect(mockDelete).not.toHaveBeenCalled();
   });
 });
 

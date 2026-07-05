@@ -1,4 +1,10 @@
-import { writeReport, listReports, getReportDownloadUrl, reportS3Key } from './reportStorage';
+import {
+  writeReport,
+  listReports,
+  getReportDownloadUrl,
+  deleteReport,
+  reportS3Key,
+} from './reportStorage';
 import { dynamo } from './dynamodb';
 import { s3 } from './s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
@@ -84,5 +90,30 @@ describe('listReports', () => {
     const input = mockDynamo.mock.calls[0][0].input;
     expect(input.ExpressionAttributeValues[':pk']).toBe('USER#u1');
     expect(input.ExpressionAttributeValues[':prefix']).toBe('REPORT#');
+  });
+});
+
+describe('deleteReport', () => {
+  it('deletes the DynamoDB row (by chronological SK) then the S3 object', async () => {
+    // First send: queryAll lookup. Second: DeleteCommand. s3.send: DeleteObjectCommand.
+    mockDynamo
+      .mockResolvedValueOnce({
+        Items: [{ reportId: 'r-1', createdAt: '2026-06-30T12:00:00.000Z', s3Key: 'reports/u1/r-1.json' }],
+      })
+      .mockResolvedValueOnce({});
+    mockS3.mockResolvedValue({});
+
+    const out = await deleteReport('u1', 'r-1');
+    expect(out).toBe(true);
+    const delKey = mockDynamo.mock.calls[1][0].input.Key;
+    expect(delKey).toEqual({ PK: 'USER#u1', SK: 'REPORT#2026-06-30T12:00:00.000Z#r-1' });
+    expect(mockS3).toHaveBeenCalledTimes(1);
+    expect(mockS3.mock.calls[0][0].input.Key).toBe('reports/u1/r-1.json');
+  });
+
+  it('throws NotFound when the report does not exist', async () => {
+    mockDynamo.mockResolvedValue({ Items: [] });
+    await expect(deleteReport('u1', 'missing')).rejects.toThrow('not found');
+    expect(mockS3).not.toHaveBeenCalled();
   });
 });

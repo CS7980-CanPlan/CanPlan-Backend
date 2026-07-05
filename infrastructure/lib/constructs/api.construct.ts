@@ -92,6 +92,7 @@ export class Api extends Construct {
     // reports — generate/list/download AI progress reports (Bedrock + DynamoDB + S3).
     wire('ReportsDataSource', props.reportsFn, [
       { typeName: 'Mutation', fieldName: 'generateReport' },
+      { typeName: 'Mutation', fieldName: 'deleteReport' },
       { typeName: 'Query', fieldName: 'listReports' },
       { typeName: 'Query', fieldName: 'getReportDownloadUrl' },
     ]);

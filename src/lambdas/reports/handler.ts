@@ -4,7 +4,12 @@ import { pageArgs } from '../../shared/pagination';
 import { buildReportStats } from '../../shared/reportMetrics';
 import { assertCanAccessUserReports } from '../../shared/reportAuthz';
 import { generateReportNarrative } from '../../shared/reportNarrative';
-import { getReportDownloadUrl, listReports, writeReport } from '../../shared/reportStorage';
+import {
+  deleteReport,
+  getReportDownloadUrl,
+  listReports,
+  writeReport,
+} from '../../shared/reportStorage';
 import { ValidationError } from '../../shared/response';
 import type {
   AppSyncEvent,
@@ -22,12 +27,12 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 /**
  * Reports domain Lambda — generate an AI progress report for a cared-for user, list a
- * user's reports, and mint a presigned download URL for one. Routed by fieldName.
- * Authorization for all three is the single seam assertCanAccessUserReports.
+ * user's reports, mint a presigned download URL for one, and delete one. Routed by
+ * fieldName. Authorization for all four is the single seam assertCanAccessUserReports.
  */
 export const handler = async (
   event: AppSyncEvent<Record<string, unknown>>,
-): Promise<Report | Connection<Report> | MediaDownloadTarget> => {
+): Promise<Report | Connection<Report> | MediaDownloadTarget | boolean> => {
   const callerId = requireCaller(event.identity);
   const { arguments: args } = event;
 
@@ -47,6 +52,14 @@ export const handler = async (
       if (!reportId) throw new ValidationError('reportId is required');
       await assertCanAccessUserReports(callerId, userId);
       return getReportDownloadUrl(userId, reportId);
+    }
+    case 'deleteReport': {
+      const userId = (args.userId as string)?.trim();
+      const reportId = (args.reportId as string)?.trim();
+      if (!userId) throw new ValidationError('userId is required');
+      if (!reportId) throw new ValidationError('reportId is required');
+      await assertCanAccessUserReports(callerId, userId);
+      return deleteReport(userId, reportId);
     }
     default:
       throw new Error(`reports handler: unsupported field "${event.info?.fieldName}"`);
@@ -85,7 +98,12 @@ async function generateReport(callerId: string, input: GenerateReportInput): Pro
     narrative,
   };
 
-  const report = await writeReport(doc);
+  // persist defaults to true; only an explicit `false` skips the S3 + DynamoDB write.
+  const persist = input?.persist !== false;
+  const report: Report = persist
+    ? await writeReport(doc)
+    : { reportId, scope: doc.scope, dateRange: doc.dateRange, createdBy: callerId, createdAt };
+
   console.log(
     JSON.stringify({
       event: 'generateReport',
@@ -94,8 +112,12 @@ async function generateReport(callerId: string, input: GenerateReportInput): Pro
       from,
       to,
       reportId,
+      persist,
       totalInstances: stats.meta.totalInstances,
     }),
   );
-  return report;
+
+  // Return narrative + stats inline (computed in memory) so the caller can render the report
+  // without a follow-up download — and so persist:false, which writes no s3Key, is still usable.
+  return { ...report, narrative, stats };
 }

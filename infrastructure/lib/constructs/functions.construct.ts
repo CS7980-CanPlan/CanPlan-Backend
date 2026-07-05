@@ -300,9 +300,10 @@ export class Functions extends Construct {
     });
     // Reads instances/steps/tasks/categories/support-links; writes the Report row.
     table.grantReadWriteData(this.reportsFn);
-    // Writes the report JSON and signs a GET for it (no KB retrieval).
+    // Writes the report JSON, signs a GET for it, and deletes it on deleteReport (no KB retrieval).
     mediaBucket.grantPut(this.reportsFn);
     mediaBucket.grantRead(this.reportsFn);
+    mediaBucket.grantDelete(this.reportsFn);
     // Converse (Sonnet) — same cross-region inference-profile grant as createAiTask.
     this.reportsFn.addToRolePolicy(
       new iam.PolicyStatement({

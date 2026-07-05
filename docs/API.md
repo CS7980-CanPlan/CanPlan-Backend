@@ -49,10 +49,11 @@ human-readable companion.
 > client-supplied `ownerId` is ignored). Delegated writes always land under the target
 > **primary user's** account, never the SupportPerson's. Anyone else gets `NOT_AUTHORIZED`.
 >
-> The **report operations** (`generateReport`, `listReports`, `getReportDownloadUrl`) use a
-> separate delegated check: the caller must hold an **ACTIVE `SupportLink`** to the target
-> `userId` and is denied otherwise (an interim rule until the general permission model lands —
-> see [AI progress reports](#ai-progress-reports--generatereport--listreports--getreportdownloadurl)).
+> The **report operations** — `generateReport`, `listReports`, `getReportDownloadUrl`,
+> `deleteReport` — currently have their access check **disabled**: any authenticated caller
+> may read, generate, or delete any user's reports (an interim state until the general
+> permission model lands — see
+> [AI progress reports](#ai-progress-reports--generatereport--listreports--getreportdownloadurl--deletereport)).
 >
 > **Self-scoped TaskInstance reads.** `getTaskInstance`, `listTaskInstances`, and
 > `batchGetTaskInstances` take **no `userId`** — they derive the owner from the caller's `sub`
@@ -1367,38 +1368,39 @@ mutation CreateAiTask($input: CreateAiTaskInput!) {
 
 ---
 
-### AI progress reports — `generateReport` / `listReports` / `getReportDownloadUrl`
+### AI progress reports — `generateReport` / `listReports` / `getReportDownloadUrl` / `deleteReport`
 
-Lets a **support person** generate an AI progress report about a cared-for primary
-user over a date range, list that user's reports, and download one. Every number is
+Lets a caller generate an AI progress report about a primary user over a date range,
+list that user's saved reports, download one, and delete one. Every number is
 **computed in code** from the user's task data; the AI (Bedrock) writes only the
 **narrative** prose over those pre-computed stats — it is instructed not to invent
 numbers and not to give medical/clinical/behavioral advice.
 
 | Operation | Input | Returns |
 |---|---|---|
-| `generateReport` (mutation) | `input: { userId!, from!, to! }` | `Report!` · **synchronous**: gathers the user's instances in `[from, to]`, computes the stats, has the AI write the narrative, then persists the full JSON to S3 (`reports/<userId>/<reportId>.json` in the private media bucket) plus a DynamoDB index row. `from`/`to` are plain `YYYY-MM-DD` (inclusive); `from ≤ to` and the span is capped at **366 days** — violations are `VALIDATION` errors. If stats or narrative generation fails, **nothing is persisted** (no half-saved report). Expect a few seconds of latency (one Bedrock call). `createdBy` records the caller. |
-| `listReports` (query) | `userId!, limit, nextToken` | `ReportConnection!` · the user's report metadata rows, **newest-first**, paginated like every other list. |
-| `getReportDownloadUrl` (query) | `userId!, reportId!` | `MediaDownloadTarget!` · short-lived presigned **GET** for the report's JSON document (same `{ downloadUrl, s3Key, expiresIn }` shape and TTL as media downloads). Only signs reports that actually exist for that user — an unknown `reportId` is a not-found error, never an arbitrary-key signature. |
+| `generateReport` (mutation) | `input: { userId!, from!, to!, persist }` | `Report!` · **synchronous**: gathers the user's instances in `[from, to]`, computes the stats, and has the AI write the narrative. `persist` defaults to **true** — the full JSON is saved to S3 (`reports/<userId>/<reportId>.json` in the private media bucket) plus a DynamoDB index row, and `s3Key` is set on the result. Pass `persist: false` to **skip saving**: nothing is written, `s3Key` is null, and the report exists only in the response. Either way the result carries the `narrative` and `stats` **inline** (computed in memory), so no follow-up download is needed to render it. `from`/`to` are plain `YYYY-MM-DD` (inclusive); `from ≤ to` and the span is capped at **366 days** — violations are `VALIDATION` errors. If stats or narrative generation fails, **nothing is persisted** (no half-saved report). Expect a few seconds of latency (one Bedrock call). `createdBy` records the caller. |
+| `listReports` (query) | `userId!, limit, nextToken` | `ReportConnection!` · the user's saved report metadata rows, **newest-first**, paginated like every other list. (Index rows carry no `narrative`/`stats` — those are null here.) |
+| `getReportDownloadUrl` (query) | `userId!, reportId!` | `MediaDownloadTarget!` · short-lived presigned **GET** for a saved report's JSON document (same `{ downloadUrl, s3Key, expiresIn }` shape and TTL as media downloads). Only signs reports that actually exist for that user — an unknown `reportId` is a not-found error, never an arbitrary-key signature. |
+| `deleteReport` (mutation) | `userId!, reportId!` | `Boolean!` · deletes a saved report — the DynamoDB index row first, then the S3 JSON object (so the index never points at a missing object). Returns `true`; an unknown `reportId` is a not-found error. |
 
-> **Authorization — enforced, and different from everything else.** All three
-> operations require the caller to hold an **ACTIVE `SupportLink` to `userId`** — the
-> API's first *delegated* check (every other enforced rule is strict self-ownership).
-> No link, or a `PENDING`/`REVOKED` one, is denied (surfaced per the
-> [error-handling stability caveat](#errortype-codes)). Note the corollary: under this
-> interim rule a primary user **cannot** call these on themselves — reports are a
-> supporter-facing feature. The rule is a seam that will be swapped for the team's
-> general permission model without changing the API shape.
+> **Authorization — currently disabled (interim).** All four operations run with **no
+> access check**: any authenticated caller may generate, read, or delete any user's
+> reports. `assertCanAccessUserReports` is a no-op seam; the callers still funnel through
+> it, so the team's general permission model can be dropped into that one function body
+> without changing the API shape. (An unauthenticated caller is still rejected — a caller
+> identity is always required.)
 
-> **`Report` (GraphQL) is only the metadata row** — `{ reportId, scope, dateRange,
-> s3Key, createdBy, createdAt }`. The stats and narrative are **not** exposed through
-> GraphQL. `scope` and `dateRange` are `AWSJSON`, so they arrive as JSON **strings**
-> (see [the `AWSJSON` foot-gun](#awsjson-fields--encoding-foot-gun)):
-> `JSON.parse(scope)` → `{ userId }`, `JSON.parse(dateRange)` → `{ from, to }`.
+> **`Report` (GraphQL) — metadata plus inline content on `generateReport`.** The full
+> shape is `{ reportId, scope, dateRange, s3Key, createdBy, createdAt, narrative, stats }`.
+> `generateReport` populates `narrative` (String) and `stats` (`AWSJSON`) **inline** so the
+> client can render immediately; `listReports` rows leave both null (fetch the saved JSON
+> via `getReportDownloadUrl` for those). `s3Key` is null when the report wasn't persisted.
+> `scope`, `dateRange`, and `stats` are `AWSJSON`, so they arrive as JSON **strings** (see
+> [the `AWSJSON` foot-gun](#awsjson-fields--encoding-foot-gun)): `JSON.parse(scope)` →
+> `{ userId }`, `JSON.parse(dateRange)` → `{ from, to }`, `JSON.parse(stats)` → the object below.
 >
-> To read the actual report, call `getReportDownloadUrl` and `GET` the `downloadUrl`.
-> The body is one JSON document (here `scope`/`dateRange` are plain nested objects —
-> it's a raw S3 object, not a GraphQL response):
+> A saved report's downloadable S3 document has the same content (here `scope`/`dateRange`
+> are plain nested objects — it's a raw S3 object, not a GraphQL response):
 >
 > ```jsonc
 > {
@@ -1451,12 +1453,16 @@ numbers and not to give medical/clinical/behavioral advice.
 ```graphql
 mutation GenerateReport($input: GenerateReportInput!) {
   # input: { userId: "<primary user's sub>", from: "2026-06-01", to: "2026-06-30" }
+  # add persist: false to get the report inline WITHOUT saving it (s3Key will be null)
   generateReport(input: $input) {
     reportId
     scope       # AWSJSON string — JSON.parse → { userId }
     dateRange   # AWSJSON string — JSON.parse → { from, to }
+    s3Key       # null when persist: false
     createdBy
     createdAt
+    narrative   # inline AI summary
+    stats       # AWSJSON string — JSON.parse → the stats object
   }
 }
 
@@ -1469,6 +1475,10 @@ query ReadReports($userId: ID!, $reportId: ID!) {
     downloadUrl   # GET this URL → the full JSON document (stats + narrative)
     expiresIn
   }
+}
+
+mutation DeleteReport($userId: ID!, $reportId: ID!) {
+  deleteReport(userId: $userId, reportId: $reportId)   # → true
 }
 ```
 

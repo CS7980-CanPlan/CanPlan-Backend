@@ -1,5 +1,5 @@
-import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
-import { PutCommand } from '@aws-sdk/lib-dynamodb';
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
+import { DeleteCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { dynamo, TABLE_NAME } from './dynamodb';
 import { queryAll } from './batch';
@@ -81,7 +81,7 @@ export async function getReportDownloadUrl(
     ExpressionAttributeValues: { ':pk': userPk(userId), ':prefix': REPORT_PREFIX },
   });
   const report = reports.find((r) => r.reportId === reportId);
-  if (!report) throw new NotFoundError('report not found');
+  if (!report?.s3Key) throw new NotFoundError('report not found');
 
   const downloadUrl = await getSignedUrl(
     s3,
@@ -89,4 +89,31 @@ export async function getReportDownloadUrl(
     { expiresIn: DOWNLOAD_URL_TTL_SECONDS },
   );
   return { downloadUrl, s3Key: report.s3Key, expiresIn: DOWNLOAD_URL_TTL_SECONDS };
+}
+
+/**
+ * Delete a persisted report: remove the DynamoDB index row FIRST, then the S3 JSON object.
+ * This order mirrors writeReport in reverse — the index never points at a missing object, so
+ * a failed S3 delete leaves an orphaned object (harmless) rather than a dangling row. Looks
+ * the row up by reportId first (we need its chronological SK, and to 404 on an unknown id).
+ */
+export async function deleteReport(userId: string, reportId: string): Promise<boolean> {
+  const reports = await queryAll<Report>({
+    TableName: TABLE_NAME,
+    KeyConditionExpression: 'PK = :pk AND begins_with(SK, :prefix)',
+    ExpressionAttributeValues: { ':pk': userPk(userId), ':prefix': REPORT_PREFIX },
+  });
+  const report = reports.find((r) => r.reportId === reportId);
+  if (!report) throw new NotFoundError('report not found');
+
+  await dynamo.send(
+    new DeleteCommand({
+      TableName: TABLE_NAME,
+      Key: { PK: userPk(userId), SK: reportSk(report.createdAt, report.reportId) },
+    }),
+  );
+  if (report.s3Key) {
+    await s3.send(new DeleteObjectCommand({ Bucket: MEDIA_BUCKET, Key: report.s3Key }));
+  }
+  return true;
 }
