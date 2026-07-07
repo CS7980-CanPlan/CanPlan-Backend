@@ -919,3 +919,146 @@ export interface RetrievedPassage {
   title: string;
   url?: string;
 }
+
+// ── AI Progress Report ──────────────────────────────────────────────────────
+
+/** Input for generateReport: which user + inclusive date range (YYYY-MM-DD). */
+export interface GenerateReportInput {
+  userId: string;
+  from: string;
+  to: string;
+}
+
+/**
+ * A freshly generated, UNSAVED report (the GraphQL GeneratedReport type). generateReport
+ * computes the stats + narrative in memory and returns them inline alongside a server-signed
+ * `draftToken`; nothing is written until saveReport re-submits this content with the token.
+ * `scope`/`dateRange`/`stats` are plain objects — AppSync serializes them to AWSJSON on the
+ * way out (same convention as accessibilitySettings / permissions).
+ */
+export interface GeneratedReport {
+  draftToken: string;
+  scope: { userId: string };
+  dateRange: { from: string; to: string };
+  generatedAt: string;
+  narrative: string;
+  stats: ReportStats;
+}
+
+/**
+ * Input for saveReport: the exact content returned by a prior generateReport, plus its signed
+ * `draftToken`. The server recomputes a canonical hash of this content and verifies it against
+ * the token — a stale, expired, or tampered draft is rejected. `scope`/`dateRange`/`stats`
+ * arrive as AWSJSON, i.e. already-parsed objects when they reach the Lambda.
+ */
+export interface SaveReportInput {
+  draftToken: string;
+  scope: { userId: string };
+  dateRange: { from: string; to: string };
+  generatedAt: string;
+  narrative: string;
+  stats: ReportStats;
+}
+
+/**
+ * A persisted report's metadata row (the GraphQL Report type). Only saveReport produces one, so
+ * `s3Key` is always set. `scope` and `dateRange` are plain objects — AppSync serializes them to
+ * AWSJSON on the way out, the same convention used for accessibilitySettings (UserProfile) and
+ * permissions (SupportLink).
+ */
+export interface Report {
+  reportId: string;
+  scope: { userId: string };
+  dateRange: { from: string; to: string };
+  /** The S3 key of the saved JSON document (always set — a Report row only exists once saved). */
+  s3Key?: string;
+  createdBy: string;
+  createdAt: string;
+  /** Echoed inline on the saveReport response; absent on listReports index rows. */
+  narrative?: string;
+  stats?: ReportStats;
+}
+
+/** Deterministic statistics computed over a user's task instances in a date range. */
+export interface ReportStats {
+  meta: {
+    userId: string;
+    from: string;
+    to: string;
+    /** Rates cover attempted (acted-on) instances only — recurrence is not expanded. */
+    basis: 'attempted-instances-only';
+    totalInstances: number;
+  };
+  completion: {
+    completed: number;
+    skipped: number;
+    cancelled: number;
+    overdue: number;
+    inProgress: number;
+    toDo: number;
+    completionRate: number;
+  };
+  trend: Array<{ weekStart: string; completed: number; total: number; completionRate: number }>;
+  byCategory: Array<{
+    categoryId: string;
+    categoryName: string;
+    completed: number;
+    total: number;
+    completionRate: number;
+  }>;
+  byTask: Array<{
+    taskId: string;
+    title: string;
+    completed: number;
+    total: number;
+    completionRate: number;
+  }>;
+  /** Per-step average ACTIVE seconds (server-measured; pauses excluded). */
+  stepDwell: Array<{
+    taskId: string;
+    title: string;
+    stepOrder: number;
+    stepText: string;
+    samples: number;
+    avgSeconds: number;
+  }>;
+  /** Instance-level active time per task + overall active÷wall-clock ratio. */
+  focus: {
+    byTask: Array<{ taskId: string; title: string; samples: number; avgActiveSeconds: number }>;
+    focusRatio: number | null;
+  };
+  skipPatterns: {
+    byTask: Array<{ taskId: string; title: string; skipped: number }>;
+    byHour: number[];
+  };
+  abandonment: Array<{
+    instanceId: string;
+    taskId: string;
+    title: string;
+    stalledAtStepOrder: number | null;
+  }>;
+  timeOfDay: number[];
+}
+
+/** The full report JSON stored in S3: stats + the AI narrative. */
+export interface ReportDocument {
+  reportId: string;
+  scope: { userId: string };
+  dateRange: { from: string; to: string };
+  createdBy: string;
+  createdAt: string;
+  stats: ReportStats;
+  narrative: string;
+}
+
+/** Everything computeReportStats needs, gathered by the storage/metrics query layer. */
+export interface ReportComputeInput {
+  userId: string;
+  from: string;
+  to: string;
+  now: string;
+  instances: TaskInstance[];
+  steps: TaskInstanceStep[];
+  tasks: Task[];
+  categories: Category[];
+}

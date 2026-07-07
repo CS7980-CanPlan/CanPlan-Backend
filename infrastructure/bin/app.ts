@@ -69,6 +69,23 @@ const knowledgeBaseRegion =
   process.env.CANPLAN_KNOWLEDGE_BASE_REGION ??
   process.env.BEDROCK_REGION ??
   'us-east-1';
+// Backend-only HMAC secret that signs AI report draft tokens (generateReport → saveReport).
+// Shared envs (dev/prod) MUST supply a strong random value; personal/sandbox deploys fall back
+// to an env-scoped, clearly dev-only default so local deploys work without extra setup.
+// TODO: promote to AWS Secrets Manager if reports graduate past MVP (this bakes the value into
+// the Lambda's environment / CloudFormation template).
+const reportDraftSigningSecretInput =
+  contextString('reportDraftSigningSecret') ?? process.env.REPORT_DRAFT_SIGNING_SECRET;
+if (!reportDraftSigningSecretInput && !isDestroyable) {
+  throw new Error(
+    'REPORT_DRAFT_SIGNING_SECRET must be set for dev/prod deployments — a strong random value ' +
+      'that signs AI report draft tokens. Set the env var or pass ' +
+      '--context reportDraftSigningSecret=...',
+  );
+}
+const reportDraftSigningSecret =
+  reportDraftSigningSecretInput ?? `canplan-report-draft-dev-only-${envName}`;
+
 const tags = {
   Project: 'CanPlan',
   Environment: envName,
@@ -95,6 +112,7 @@ new CanPlanBackendStack(app, `CanPlanBackend-${envName}`, {
   isDestroyable,
   knowledgeBaseId: knowledgeBaseStack.knowledgeBaseId,
   bedrockRegion: knowledgeBaseRegion,
+  reportDraftSigningSecret,
   env: { account, region: backendRegion },
   crossRegionReferences: true,
   tags,

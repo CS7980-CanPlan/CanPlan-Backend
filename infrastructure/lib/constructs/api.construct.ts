@@ -19,6 +19,7 @@ export interface ApiProps {
   readonly mediaFn: lambda.IFunction;
   readonly adminFn: lambda.IFunction;
   readonly createAiTaskFn: lambda.IFunction;
+  readonly reportsFn: lambda.IFunction;
 }
 
 /** A (typeName, fieldName) pair wired to a Lambda data source. */
@@ -86,6 +87,15 @@ export class Api extends Construct {
     // createAiTask — Bedrock-powered task creation with AI-generated steps.
     wire('CreateAiTaskDataSource', props.createAiTaskFn, [
       { typeName: 'Mutation', fieldName: 'createAiTask' },
+    ]);
+
+    // reports — generate a preview, save it, list/download/delete saved ones (Bedrock + DynamoDB + S3).
+    wire('ReportsDataSource', props.reportsFn, [
+      { typeName: 'Mutation', fieldName: 'generateReport' },
+      { typeName: 'Mutation', fieldName: 'saveReport' },
+      { typeName: 'Mutation', fieldName: 'deleteReport' },
+      { typeName: 'Query', fieldName: 'listReports' },
+      { typeName: 'Query', fieldName: 'getReportDownloadUrl' },
     ]);
 
     // UserProfile + SupportLink (incl. SupportPerson selection of primary users).

@@ -1,6 +1,6 @@
 # CanPlan 2.0 — Frontend API Reference
 
-_Last updated: 2026-07-04. Version: SupportPerson delegation (schedules, categories, task templates) + organization management._
+_Last updated: 2026-07-06. Version: SupportPerson delegation (schedules, categories, task templates) + organization management + AI progress reports (two-step generate → save, SupportPerson-only)._
 
 > ## 🚨 Breaking change — categories, default category, Task status, TaskStep keys
 >
@@ -48,6 +48,13 @@ human-readable companion.
 > stored `ownerId`; and `createMediaAsset` stores the task's owner as the asset owner (a
 > client-supplied `ownerId` is ignored). Delegated writes always land under the target
 > **primary user's** account, never the SupportPerson's. Anyone else gets `NOT_AUTHORIZED`.
+>
+> The **report operations** — `generateReport`, `saveReport`, `listReports`,
+> `getReportDownloadUrl`, `deleteReport` — are a **SupportPerson-only** surface: the caller must
+> be a `SUPPORT_PERSON` with an **ACTIVE** `SupportLink` to the target `PRIMARY_USER` in the
+> **same organization** (the same delegation rule as everything else, below). A primary user may
+> **not** access their own reports. See
+> [AI progress reports](#ai-progress-reports--two-step-generate--save).
 >
 > **Self-scoped TaskInstance reads.** `getTaskInstance`, `listTaskInstances`, and
 > `batchGetTaskInstances` take **no `userId`** — they derive the owner from the caller's `sub`
@@ -204,6 +211,7 @@ GraphQL types below. The key layout (for reference):
 | TaskInstance | `USER#<userId>` | `TASK_INSTANCE#<scheduledDate>#<scheduledTime>#<assignmentId>` |
 | TaskInstanceStep | `USER#<userId>` | `TASK_INSTANCE_STEP#<instanceId>#STEP#<stepId>` |
 | MediaAsset | `TASK#<taskId>` | `MEDIA#<assetId>` |
+| Report | `USER#<primaryUserId>` | `REPORT#<createdAt>#<reportId>` (chronological, so `listReports` reads newest-first) |
 
 Seven GSIs serve the cross-cutting lists: `supporterIndex` (users managed by a
 supporter), `primaryUserSupportLinkIndex` (`SupportLink`s by primary user — keyed on
@@ -290,6 +298,14 @@ object instead is the most common mistake here and is rejected at the AppSync ed
 In practice: `accessibilitySettings: JSON.stringify(settings)` on the way in.
 **Responses are symmetric** — these fields come back as JSON strings, so
 `JSON.parse(profile.accessibilitySettings)` on the way out.
+
+`Report`/`GeneratedReport` `scope`, `dateRange`, and `stats` are `AWSJSON` too: on the way **out**
+they are JSON strings like the others (`JSON.parse(report.scope)` → `{ userId }`,
+`JSON.parse(report.dateRange)` → `{ from, to }`). They also appear as `AWSJSON` **inputs** on
+`SaveReportInput` — in GraphQL variables, send JSON-encoded strings just like other `AWSJSON`
+inputs. If you kept the strings returned by `generateReport`, you can pass them back unchanged;
+if you parsed them for rendering, `JSON.stringify` the parsed objects before calling
+`saveReport`. AppSync parses those strings before the Lambda sees them.
 
 ---
 
@@ -1357,6 +1373,177 @@ mutation CreateAiTask($input: CreateAiTaskInput!) {
 
 ---
 
+### AI progress reports — two-step generate → save
+
+Producing a report is a **two-step flow** so the frontend can show a preview and let the user
+decide before anything is stored:
+
+1. **`generateReport`** computes the stats + AI narrative and returns them inline with a signed
+   `draftToken`. It **persists nothing**.
+2. The frontend **displays the preview**.
+3. The user **saves or discards** it. Discarding is a no-op — just drop the response.
+4. **`saveReport`** persists a previously generated report to S3 + DynamoDB. It **recomputes no
+   stats and calls no model** — it only verifies the draft token and writes.
+
+Every number is **computed in code** from the user's task data; the AI (Bedrock) writes only the
+**narrative** prose over those pre-computed stats — it is instructed not to invent numbers and
+not to give medical/clinical/behavioral advice.
+
+| Operation | Input | Returns |
+|---|---|---|
+| `generateReport` (mutation) | `input: { userId!, from!, to! }` | `GeneratedReport!` · **synchronous, non-persisting preview**: gathers the user's instances in `[from, to]`, computes the stats, and has the AI write the narrative — all in memory. Writes **nothing** to S3 or DynamoDB. Returns `{ draftToken, scope, dateRange, generatedAt, narrative, stats }`: the content to render, plus a server-signed `draftToken` to hand to `saveReport`. `from`/`to` are plain `YYYY-MM-DD` (inclusive); `from ≤ to` and the span is capped at **366 days** — violations are `VALIDATION` errors. Expect a few seconds of latency (one Bedrock call). |
+| `saveReport` (mutation) | `input: { draftToken!, scope!, dateRange!, generatedAt!, narrative!, stats! }` | `Report!` · persists a report previously produced by `generateReport`. Re-submit the **exact** content plus its `draftToken`; the server verifies the token against the content (below), then writes the full JSON to S3 (`reports/<userId>/<reportId>.json` in the private media bucket) plus a DynamoDB index row, sets `s3Key`, and stamps `createdBy` (the caller) + `createdAt` + a fresh `reportId`. **Recomputes no stats and calls no model.** A stale, expired, or tampered draft is rejected before any write. The result echoes `narrative`/`stats` inline so no follow-up download is needed. |
+| `listReports` (query) | `userId!, limit, nextToken` | `ReportConnection!` · the user's saved report metadata rows, **newest-first**, paginated like every other list. (Index rows carry no `narrative`/`stats` — those are null here.) |
+| `getReportDownloadUrl` (query) | `userId!, reportId!` | `MediaDownloadTarget!` · short-lived presigned **GET** for a saved report's JSON document (same `{ downloadUrl, s3Key, expiresIn }` shape and TTL as media downloads). Only signs reports that actually exist for that user — an unknown `reportId` is a not-found error, never an arbitrary-key signature. |
+| `deleteReport` (mutation) | `userId!, reportId!` | `Boolean!` · deletes a saved report — the DynamoDB index row first, then the S3 JSON object (so the index never points at a missing object). Returns `true`; an unknown `reportId` is a not-found error. |
+
+> **`draftToken` — anti-tamper contract.** `generateReport` signs an HMAC-SHA256 token
+> (backend-only secret, `REPORT_DRAFT_SIGNING_SECRET`) that binds a **canonical hash** of the
+> generated content — `userId`, `from`, `to`, `generatedAt`, `narrative`, and `stats` — plus a
+> **15-minute expiry**. `saveReport` recomputes that hash from the content you submit and compares
+> it to the signed value: if **any** field was changed (a reworded narrative, an edited number, a
+> different user or date range), the hashes differ and the save is rejected as a `VALIDATION`
+> error. An expired or forged/altered token is an `NOT_AUTHORIZED` error. Net effect: you can only
+> save a report the server actually generated, unmodified, within 15 minutes. Send every field
+> back **verbatim** — do not round-trip `stats` through anything that reorders or reformats values
+> (key order is fine; the hash is canonical). There is **no** `persist` flag anywhere — persistence
+> is exactly and only what `saveReport` does.
+
+> **Authorization — SupportPerson only.** Every report operation (`generateReport`, `saveReport`,
+> `listReports`, `getReportDownloadUrl`, `deleteReport`) requires the caller to be a
+> `SUPPORT_PERSON` with an **ACTIVE** `SupportLink` to the target `PRIMARY_USER`, both currently in
+> the **same organization** — the identical delegation rule enforced everywhere else (see the
+> **Authorization model** section at the top). A **primary user may not access their own reports** (self-access
+> is denied): reports are produced *for* a supporter. Anyone else — unauthenticated, non-supporter,
+> revoked/absent link, non-primary target, or cross-org — gets `NOT_AUTHORIZED`. For `saveReport`
+> the target user is taken from the **signed** draft token, so the caller cannot redirect a save to
+> a different user.
+
+> **`GeneratedReport` (generateReport output).** `{ draftToken, scope, dateRange, generatedAt,
+> narrative, stats }`. `scope`, `dateRange`, and `stats` are `AWSJSON`, so they arrive as JSON
+> **strings** (see [the `AWSJSON` foot-gun](#awsjson-fields--encoding-foot-gun)):
+> `JSON.parse(scope)` → `{ userId }`, `JSON.parse(dateRange)` → `{ from, to }`,
+> `JSON.parse(stats)` → the object below. `generatedAt` and `narrative` are plain strings.
+
+> **`SaveReportInput` (saveReport input).** `{ draftToken, scope, dateRange, generatedAt,
+> narrative, stats }` — the same shape you received from `generateReport`. `scope`, `dateRange`,
+> and `stats` are `AWSJSON` **inputs**: in GraphQL variables, send JSON strings. You may pass back
+> the exact `scope`/`dateRange`/`stats` strings returned by `generateReport`; if you parsed them,
+> re-stringify the objects before calling `saveReport`.
+
+> **`Report` (GraphQL) — a saved report.** `{ reportId, scope, dateRange, s3Key, createdBy,
+> createdAt, narrative, stats }`. Only `saveReport` produces one, so `s3Key` is always set. The
+> `saveReport` response echoes `narrative`/`stats` inline (the content you just saved); `listReports`
+> rows leave both null (fetch the saved JSON via `getReportDownloadUrl`). `scope`, `dateRange`, and
+> `stats` are `AWSJSON` output strings, same as above.
+>
+> A saved report's downloadable S3 document has the same content (here `scope`/`dateRange`
+> are plain nested objects — it's a raw S3 object, not a GraphQL response):
+>
+> ```jsonc
+> {
+>   "reportId": "…",
+>   "scope": { "userId": "…" },
+>   "dateRange": { "from": "2026-06-01", "to": "2026-06-30" },
+>   "createdBy": "<caller's sub>",
+>   "createdAt": "2026-07-03T…Z",
+>   "stats": { /* see below */ },
+>   "narrative": "2–4 short paragraphs of plain-language AI summary"
+> }
+> ```
+
+> **What's in `stats`.** Deterministic aggregations over the user's **materialized**
+> `TaskInstance` rows (and their step snapshots) in the range:
+>
+> - `meta` — `userId`, `from`, `to`, `basis: "attempted-instances-only"` (see below),
+>   `totalInstances`.
+> - `completion` — instance counts by status (`completed` / `skipped` / `cancelled` /
+>   `overdue` / `inProgress` / `toDo`; `OVERDUE` derived at read time exactly like the
+>   instance queries) plus an overall `completionRate`.
+> - `trend` — weekly completion (`weekStart` = ISO Monday): `completed`, `total`,
+>   `completionRate` per week.
+> - `byCategory` / `byTask` — `completed` / `total` / `completionRate` per category and
+>   per task template (with names/titles resolved).
+> - `stepDwell` — per task step (grouped by task + step order): `samples` and
+>   `avgSeconds` of **server-measured active time**
+>   (`TaskInstanceStep.activeDurationSeconds` — see the **Active-step timing** note in
+>   the scheduling section; pauses/idle excluded). A step is a sample once it was ever
+>   started, completed or not — effort sunk into an abandoned step is exactly the
+>   sticking-point signal. Never-started and pre-timing (legacy) steps are not samples.
+> - `focus` — per-task average **instance-level** active seconds (`byTask`), plus one
+>   overall `focusRatio` = active ÷ wall-clock seconds summed over `COMPLETED`
+>   instances (`null` when none qualify). A low ratio means the task was often
+>   interrupted or left idle.
+> - `skipPatterns` — skips per task plus a 24-bucket `byHour` histogram (hour of
+>   `skippedAt` in the instance's own timezone).
+> - `abandonment` — instances that were started but never finished (status neither
+>   `COMPLETED` nor `CANCELLED` at report time — includes skipped-after-starting), each
+>   with `stalledAtStepOrder` (the first incomplete step, or `null`).
+> - `timeOfDay` — 24-bucket histogram of the hour each completed instance finished.
+>
+> **Basis foot-gun — engagement, not adherence.** Rates cover only instances the user
+> actually **acted on** (real rows). Scheduled occurrences that were never started or
+> cancelled don't exist as rows and are **not counted as misses** — recurrence is not
+> expanded. So `completionRate` means "of what was attempted, how much got done", not
+> "how much of the schedule was followed". The narrative is instructed to say so
+> whenever it mentions rates; surface the same framing in the UI.
+
+```graphql
+# Step 1 — generate a preview. Nothing is saved. Keep the WHOLE response around; you must
+# send its fields back verbatim to saveReport.
+mutation GenerateReport($input: GenerateReportInput!) {
+  # input: { userId: "<primary user's sub>", from: "2026-06-01", to: "2026-06-30" }
+  generateReport(input: $input) {
+    draftToken   # opaque signed token — pass back to saveReport unchanged
+    scope        # AWSJSON string — JSON.parse → { userId }
+    dateRange    # AWSJSON string — JSON.parse → { from, to }
+    generatedAt  # echo back to saveReport unchanged
+    narrative    # inline AI summary to render in the preview
+    stats        # AWSJSON string — JSON.parse → the stats object
+  }
+}
+
+# Step 2 — after the user chooses to keep the preview, persist it. Re-submit the content from
+# step 1 exactly. scope/dateRange/stats are AWSJSON inputs, so in GraphQL variables they are
+# JSON-encoded strings; pass back the strings from step 1 or JSON.stringify the parsed objects.
+# A stale/expired/tampered draft is rejected here.
+mutation SaveReport($input: SaveReportInput!) {
+  # input: {
+  #   draftToken:  "<from step 1>",
+  #   scope:       "{\"userId\":\"<primary user's sub>\"}",
+  #   dateRange:   "{\"from\":\"2026-06-01\",\"to\":\"2026-06-30\"}",
+  #   generatedAt: "<from step 1>",
+  #   narrative:   "<from step 1>",
+  #   stats:       "<stats string from step 1>"
+  # }
+  saveReport(input: $input) {
+    reportId
+    s3Key        # always set — the report is now saved
+    createdBy
+    createdAt
+    narrative    # echoed back (the content you saved)
+    stats        # AWSJSON string
+  }
+}
+
+query ReadReports($userId: ID!, $reportId: ID!) {
+  listReports(userId: $userId) {
+    items { reportId dateRange createdAt }
+    nextToken
+  }
+  getReportDownloadUrl(userId: $userId, reportId: $reportId) {
+    downloadUrl   # GET this URL → the full JSON document (stats + narrative)
+    expiresIn
+  }
+}
+
+mutation DeleteReport($userId: ID!, $reportId: ID!) {
+  deleteReport(userId: $userId, reportId: $reportId)   # → true
+}
+```
+
+---
+
 ## Error handling
 
 GraphQL does **not** use HTTP status codes for field-level problems. A request that
@@ -1425,8 +1612,6 @@ Planned but not implemented — don't build against them:
   (`updateCategory`), tasks (`updateTask`), task steps (`updateTaskStep`), task-step ordering
   (`reorderTaskSteps`), whole-owner task ordering (`updateTaskOrder`), and task-instance
   status (`updateTaskInstanceStatus`); other entities have no update yet.
-- **Report generation** — the `Report` type exists in the schema, but no query or
-  mutation is exposed for it yet.
 - **Streaming AI responses** — `generateTaskSteps` is request/response only.
 
 ---

@@ -23,6 +23,8 @@ export interface FunctionsProps {
   readonly bedrockRegion: string;
   /** Knowledge Base id the generateTaskSteps Lambda retrieves from. */
   readonly knowledgeBaseId: string;
+  /** Backend-only HMAC secret the reports Lambda uses to sign/verify report draft tokens. */
+  readonly reportDraftSigningSecret: string;
 }
 
 /** Lambda functions backing the GraphQL resolvers. */
@@ -30,6 +32,7 @@ export class Functions extends Construct {
   public readonly createTaskFn: NodejsFunction;
   public readonly generateTaskStepsFn: NodejsFunction;
   public readonly createAiTaskFn: NodejsFunction;
+  public readonly reportsFn: NodejsFunction;
   /** Domain Lambdas — each backs several fields of one domain (routed by fieldName). */
   public readonly usersFn: NodejsFunction;
   public readonly categoriesFn: NodejsFunction;
@@ -42,8 +45,16 @@ export class Functions extends Construct {
   constructor(scope: Construct, id: string, props: FunctionsProps) {
     super(scope, id);
 
-    const { envName, table, mediaBucket, userPool, bedrockModelId, bedrockRegion, knowledgeBaseId } =
-      props;
+    const {
+      envName,
+      table,
+      mediaBucket,
+      userPool,
+      bedrockModelId,
+      bedrockRegion,
+      knowledgeBaseId,
+      reportDraftSigningSecret,
+    } = props;
 
     // Shared factory for a DynamoDB-backed resolver Lambda. Each gets the table
     // name in its env and connection reuse enabled.
@@ -268,6 +279,49 @@ export class Functions extends Construct {
         actions: ['bedrock:InvokeModel'],
         resources: [
           `arn:aws:bedrock:${bedrockRegion}::foundation-model/cohere.rerank-v3-5:0`,
+        ],
+      }),
+    );
+
+    // ── reports (generate preview via Bedrock; save/list/download/delete persisted reports) ─
+    this.reportsFn = new NodejsFunction(this, 'ReportsFunction', {
+      functionName: `canplan-reports-${envName}`,
+      entry: path.join(__dirname, '../../../src/lambdas/reports/handler.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      environment: {
+        DYNAMODB_TABLE_NAME: table.tableName,
+        MEDIA_BUCKET_NAME: mediaBucket.bucketName,
+        BEDROCK_REGION: bedrockRegion,
+        BEDROCK_MODEL_ID: bedrockModelId,
+        BEDROCK_MAX_TOKENS: '1024',
+        // Backend-only HMAC key that signs generateReport draft tokens and verifies them in
+        // saveReport. Never exposed to clients; see infrastructure/bin/app.ts for how it is set.
+        REPORT_DRAFT_SIGNING_SECRET: reportDraftSigningSecret,
+        AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
+      },
+      logRetention: logs.RetentionDays.ONE_WEEK,
+      timeout: cdk.Duration.seconds(29),
+      memorySize: 256,
+    });
+    // Reads instances/steps/tasks/categories/support-links; writes the Report row.
+    table.grantReadWriteData(this.reportsFn);
+    // Writes the report JSON, signs a GET for it, and deletes it on deleteReport (no KB retrieval).
+    mediaBucket.grantPut(this.reportsFn);
+    mediaBucket.grantRead(this.reportsFn);
+    mediaBucket.grantDelete(this.reportsFn);
+    // Converse (Sonnet) — same cross-region inference-profile grant as createAiTask.
+    this.reportsFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          'bedrock:InvokeModel',
+          'bedrock:InvokeModelWithResponseStream',
+          'bedrock:Converse',
+          'bedrock:ConverseStream',
+        ],
+        resources: [
+          `arn:aws:bedrock:*:${cdk.Stack.of(this).account}:inference-profile/*`,
+          'arn:aws:bedrock:*::foundation-model/anthropic.*',
         ],
       }),
     );
