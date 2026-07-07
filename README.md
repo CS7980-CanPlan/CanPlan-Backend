@@ -451,6 +451,24 @@ Retrieval is a two-stage pipeline — coarse KB vector recall (`RERANK_COARSE_K`
 Cohere rerank pass (`src/shared/kb.ts` / `src/shared/rerank.ts`); see
 [scripts/floor-eval/README.md](scripts/floor-eval/README.md) for calibrating the floor.
 
+The **reports** Lambda also needs one secret — the HMAC key that signs the draft tokens the
+two-step report flow (`generateReport` → `saveReport`) uses to prove a saved report is exactly
+what the server generated:
+
+| Env var | Default | Meaning |
+| ------- | ------- | ------- |
+| `REPORT_DRAFT_SIGNING_SECRET` | none (required for `dev`/`prod`) | Backend-only HMAC-SHA256 key signing report draft tokens. Never exposed to clients. |
+
+Set it before deploying a shared env (the synth **fails** if it is missing for `dev`/`prod`):
+
+```bash
+export REPORT_DRAFT_SIGNING_SECRET="$(openssl rand -base64 32)"   # or --context reportDraftSigningSecret=...
+```
+
+Personal/sandbox deploys fall back to a clearly dev-only default when it is unset, so local
+testing needs no extra setup. (It is baked into the Lambda's environment at synth — promote it
+to AWS Secrets Manager if reports graduate past MVP.)
+
 ## Project Map
 
 ```text

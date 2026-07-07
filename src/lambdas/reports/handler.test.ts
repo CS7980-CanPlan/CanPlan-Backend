@@ -1,3 +1,7 @@
+// The reports handler exercises the REAL draft-token module (generate → save round-trip),
+// so a signing secret must be present. Everything else (authz, stats, narrative, storage) is mocked.
+process.env.REPORT_DRAFT_SIGNING_SECRET = 'handler-test-secret';
+
 import { handler } from './handler';
 import { assertCanAccessUserReports } from '../../shared/reportAuthz';
 import { buildReportStats } from '../../shared/reportMetrics';
@@ -8,6 +12,7 @@ import {
   getReportDownloadUrl,
   deleteReport,
 } from '../../shared/reportStorage';
+import type { GeneratedReport, Report, SaveReportInput } from '../../shared/types';
 
 jest.mock('../../shared/reportAuthz', () => ({ assertCanAccessUserReports: jest.fn() }));
 jest.mock('../../shared/reportMetrics', () => ({ buildReportStats: jest.fn() }));
@@ -27,6 +32,8 @@ const mockList = listReports as jest.Mock;
 const mockDownload = getReportDownloadUrl as jest.Mock;
 const mockDelete = deleteReport as jest.Mock;
 
+const STATS = { meta: { totalInstances: 2 }, completion: { completionRate: 0.5 } };
+
 function event(fieldName: string, args: Record<string, unknown>, sub: string | null = 'sup-1') {
   return {
     arguments: args,
@@ -35,26 +42,56 @@ function event(fieldName: string, args: Record<string, unknown>, sub: string | n
   } as unknown as Parameters<typeof handler>[0];
 }
 
+/** Map a GeneratedReport into the SaveReportInput a client would return, JSON-round-tripping
+ * the AWSJSON fields (as they would be after serialization to/from the client). */
+function toSaveInput(gen: GeneratedReport): SaveReportInput {
+  return {
+    draftToken: gen.draftToken,
+    scope: JSON.parse(JSON.stringify(gen.scope)),
+    dateRange: JSON.parse(JSON.stringify(gen.dateRange)),
+    generatedAt: gen.generatedAt,
+    narrative: gen.narrative,
+    stats: JSON.parse(JSON.stringify(gen.stats)),
+  };
+}
+
+const input = { userId: 'u1', from: '2026-06-01', to: '2026-06-30' };
+
+/** Run generateReport and return its GeneratedReport payload. */
+async function generate(): Promise<GeneratedReport> {
+  return (await handler(event('generateReport', { input }))) as GeneratedReport;
+}
+
 beforeEach(() => {
-  mockAuthz.mockResolvedValue(undefined);
-  mockStats.mockResolvedValue({ meta: { totalInstances: 0 } });
+  mockAuthz.mockResolvedValue('sup-1');
+  mockStats.mockResolvedValue(STATS);
   mockNarrative.mockResolvedValue('A summary.');
-  mockWrite.mockImplementation(async (doc) => ({ reportId: doc.reportId, s3Key: 'k' }));
+  mockWrite.mockImplementation(async (doc) => ({
+    reportId: doc.reportId,
+    scope: doc.scope,
+    dateRange: doc.dateRange,
+    s3Key: `reports/${doc.scope.userId}/${doc.reportId}.json`,
+    createdBy: doc.createdBy,
+    createdAt: doc.createdAt,
+  }));
 });
 afterEach(() => jest.clearAllMocks());
 
 describe('generateReport', () => {
-  const input = { userId: 'u1', from: '2026-06-01', to: '2026-06-30' };
-
-  it('authorizes, builds stats, generates narrative, persists, and returns the report', async () => {
-    const result = await handler(event('generateReport', { input }));
-    expect(mockAuthz).toHaveBeenCalledWith('sup-1', 'u1');
+  it('authorizes, builds stats, generates a narrative, and returns a signed draft WITHOUT persisting', async () => {
+    const result = await generate();
+    expect(mockAuthz).toHaveBeenCalledWith({ sub: 'sup-1' }, 'u1');
     expect(mockStats).toHaveBeenCalledWith('u1', '2026-06-01', '2026-06-30');
     expect(mockNarrative).toHaveBeenCalled();
-    const doc = mockWrite.mock.calls[0][0];
-    expect(doc.createdBy).toBe('sup-1');
-    expect(doc.narrative).toBe('A summary.');
-    expect((result as { reportId: string }).reportId).toBe(doc.reportId);
+    // The core split: generateReport never writes.
+    expect(mockWrite).not.toHaveBeenCalled();
+    expect(typeof result.draftToken).toBe('string');
+    expect(result.draftToken.length).toBeGreaterThan(0);
+    expect(result.narrative).toBe('A summary.');
+    expect(result.stats).toEqual(STATS);
+    expect(result.scope).toEqual({ userId: 'u1' });
+    expect(result.dateRange).toEqual({ from: '2026-06-01', to: '2026-06-30' });
+    expect(result.generatedAt).toEqual(expect.any(String));
   });
 
   it('rejects an unauthenticated caller before doing any work', async () => {
@@ -74,29 +111,87 @@ describe('generateReport', () => {
     await expect(handler(event('generateReport', { input }))).rejects.toThrow('bedrock down');
     expect(mockWrite).not.toHaveBeenCalled();
   });
+});
 
-  it('still produces a report for an empty range (zero instances)', async () => {
-    await handler(event('generateReport', { input }));
+describe('saveReport', () => {
+  it('verifies the draft token and persists via writeReport, echoing content inline', async () => {
+    const gen = await generate();
+    mockWrite.mockClear(); // ignore the (zero) generate-phase writes
+    const result = (await handler(event('saveReport', { input: toSaveInput(gen) }))) as Report;
+
     expect(mockWrite).toHaveBeenCalledTimes(1);
-  });
-
-  it('returns the narrative and stats inline', async () => {
-    const result = (await handler(event('generateReport', { input }))) as {
-      narrative: string;
-      stats: unknown;
-    };
+    const doc = mockWrite.mock.calls[0][0];
+    expect(doc.createdBy).toBe('sup-1');
+    expect(doc.scope).toEqual({ userId: 'u1' });
+    expect(doc.dateRange).toEqual({ from: '2026-06-01', to: '2026-06-30' });
+    expect(doc.narrative).toBe('A summary.');
+    expect(doc.stats).toEqual(STATS);
     expect(result.narrative).toBe('A summary.');
-    expect(result.stats).toEqual({ meta: { totalInstances: 0 } });
+    expect(result.stats).toEqual(STATS);
+    expect(result.s3Key).toBe(`reports/u1/${doc.reportId}.json`);
   });
 
-  it('skips persistence when persist is false, still returning the content', async () => {
-    const result = (await handler(
-      event('generateReport', { input: { ...input, persist: false } }),
-    )) as { narrative: string; s3Key?: string };
+  it('does NOT recompute stats or call the narrative model', async () => {
+    const gen = await generate();
+    mockStats.mockClear();
+    mockNarrative.mockClear();
+    await handler(event('saveReport', { input: toSaveInput(gen) }));
+    expect(mockStats).not.toHaveBeenCalled();
+    expect(mockNarrative).not.toHaveBeenCalled();
+  });
+
+  it('authorizes against the userId bound in the draft token', async () => {
+    const gen = await generate();
+    mockAuthz.mockClear();
+    await handler(event('saveReport', { input: toSaveInput(gen) }));
+    expect(mockAuthz).toHaveBeenCalledWith({ sub: 'sup-1' }, 'u1');
+  });
+
+  it.each([
+    ['narrative', (s: SaveReportInput) => ({ ...s, narrative: 'tampered summary' })],
+    ['stats', (s: SaveReportInput) => ({ ...s, stats: { meta: { totalInstances: 999 } } })],
+    ['dateRange', (s: SaveReportInput) => ({ ...s, dateRange: { from: '2020-01-01', to: '2020-12-31' } })],
+    ['userId', (s: SaveReportInput) => ({ ...s, scope: { userId: 'attacker' } })],
+  ])('rejects a tampered %s and writes nothing', async (_field, tamper) => {
+    const gen = await generate();
+    mockWrite.mockClear();
+    const tampered = tamper(toSaveInput(gen)) as SaveReportInput;
+    await expect(handler(event('saveReport', { input: tampered }))).rejects.toThrow();
     expect(mockWrite).not.toHaveBeenCalled();
-    expect(mockNarrative).toHaveBeenCalled();
-    expect(result.narrative).toBe('A summary.');
-    expect(result.s3Key).toBeUndefined();
+  });
+
+  it('rejects an expired draft token', async () => {
+    jest.useFakeTimers();
+    try {
+      jest.setSystemTime(new Date('2026-07-06T00:00:00.000Z'));
+      const gen = await generate();
+      const saveInput = toSaveInput(gen);
+      // Advance past the 15-minute TTL.
+      jest.setSystemTime(new Date('2026-07-06T00:16:00.000Z'));
+      mockWrite.mockClear();
+      await expect(handler(event('saveReport', { input: saveInput }))).rejects.toThrow(/expired/);
+      expect(mockWrite).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('rejects a missing draft token before authorizing or writing', async () => {
+    const gen = await generate();
+    const noToken = toSaveInput(gen) as Partial<SaveReportInput>;
+    delete noToken.draftToken;
+    mockAuthz.mockClear();
+    mockWrite.mockClear();
+    await expect(handler(event('saveReport', { input: noToken as SaveReportInput }))).rejects.toThrow('draftToken');
+    expect(mockWrite).not.toHaveBeenCalled();
+    expect(mockAuthz).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unauthenticated caller', async () => {
+    const gen = await generate();
+    await expect(handler(event('saveReport', { input: toSaveInput(gen) }, null))).rejects.toThrow(
+      'Unauthorized',
+    );
   });
 });
 
@@ -104,7 +199,7 @@ describe('deleteReport', () => {
   it('authorizes then deletes', async () => {
     mockDelete.mockResolvedValue(true);
     const result = await handler(event('deleteReport', { userId: 'u1', reportId: 'r-1' }));
-    expect(mockAuthz).toHaveBeenCalledWith('sup-1', 'u1');
+    expect(mockAuthz).toHaveBeenCalledWith({ sub: 'sup-1' }, 'u1');
     expect(mockDelete).toHaveBeenCalledWith('u1', 'r-1');
     expect(result).toBe(true);
   });
@@ -119,7 +214,7 @@ describe('listReports', () => {
   it('authorizes then lists', async () => {
     mockList.mockResolvedValue({ items: [], nextToken: null });
     await handler(event('listReports', { userId: 'u1' }));
-    expect(mockAuthz).toHaveBeenCalledWith('sup-1', 'u1');
+    expect(mockAuthz).toHaveBeenCalledWith({ sub: 'sup-1' }, 'u1');
     expect(mockList).toHaveBeenCalledWith('u1', { limit: undefined, nextToken: undefined });
   });
 });
@@ -128,7 +223,7 @@ describe('getReportDownloadUrl', () => {
   it('authorizes then signs', async () => {
     mockDownload.mockResolvedValue({ downloadUrl: 'x', s3Key: 'k', expiresIn: 900 });
     await handler(event('getReportDownloadUrl', { userId: 'u1', reportId: 'r-1' }));
-    expect(mockAuthz).toHaveBeenCalledWith('sup-1', 'u1');
+    expect(mockAuthz).toHaveBeenCalledWith({ sub: 'sup-1' }, 'u1');
     expect(mockDownload).toHaveBeenCalledWith('u1', 'r-1');
   });
 });

@@ -19,6 +19,8 @@ export interface CanPlanBackendStackProps extends cdk.StackProps {
   readonly knowledgeBaseId: string;
   /** Region for KB Retrieve + Converse. Must match the KnowledgeBase stack region. */
   readonly bedrockRegion: string;
+  /** Backend-only HMAC secret the reports Lambda uses to sign/verify report draft tokens. */
+  readonly reportDraftSigningSecret: string;
 }
 
 /**
@@ -29,7 +31,8 @@ export class CanPlanBackendStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: CanPlanBackendStackProps) {
     super(scope, id, props);
 
-    const { envName, isDestroyable, knowledgeBaseId, bedrockRegion } = props;
+    const { envName, isDestroyable, knowledgeBaseId, bedrockRegion, reportDraftSigningSecret } =
+      props;
 
     // Data + storage
     const database = new Database(this, 'Database', { envName, isDestroyable });
@@ -50,6 +53,7 @@ export class CanPlanBackendStack extends cdk.Stack {
       bedrockModelId: ai.bedrockModelId,
       bedrockRegion: ai.bedrockRegion,
       knowledgeBaseId,
+      reportDraftSigningSecret,
     });
 
     // GraphQL API — resolvers depend on the Lambdas; Cognito is the primary authorizer

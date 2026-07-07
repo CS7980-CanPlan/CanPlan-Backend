@@ -89,9 +89,10 @@ export class Api extends Construct {
       { typeName: 'Mutation', fieldName: 'createAiTask' },
     ]);
 
-    // reports — generate/list/download AI progress reports (Bedrock + DynamoDB + S3).
+    // reports — generate a preview, save it, list/download/delete saved ones (Bedrock + DynamoDB + S3).
     wire('ReportsDataSource', props.reportsFn, [
       { typeName: 'Mutation', fieldName: 'generateReport' },
+      { typeName: 'Mutation', fieldName: 'saveReport' },
       { typeName: 'Mutation', fieldName: 'deleteReport' },
       { typeName: 'Query', fieldName: 'listReports' },
       { typeName: 'Query', fieldName: 'getReportDownloadUrl' },

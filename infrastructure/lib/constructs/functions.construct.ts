@@ -23,6 +23,8 @@ export interface FunctionsProps {
   readonly bedrockRegion: string;
   /** Knowledge Base id the generateTaskSteps Lambda retrieves from. */
   readonly knowledgeBaseId: string;
+  /** Backend-only HMAC secret the reports Lambda uses to sign/verify report draft tokens. */
+  readonly reportDraftSigningSecret: string;
 }
 
 /** Lambda functions backing the GraphQL resolvers. */
@@ -51,6 +53,7 @@ export class Functions extends Construct {
       bedrockModelId,
       bedrockRegion,
       knowledgeBaseId,
+      reportDraftSigningSecret,
     } = props;
 
     // Shared factory for a DynamoDB-backed resolver Lambda. Each gets the table
@@ -280,7 +283,7 @@ export class Functions extends Construct {
       }),
     );
 
-    // ── reports (Bedrock Converse over pre-computed stats; persists to DynamoDB + S3) ─
+    // ── reports (generate preview via Bedrock; save/list/download/delete persisted reports) ─
     this.reportsFn = new NodejsFunction(this, 'ReportsFunction', {
       functionName: `canplan-reports-${envName}`,
       entry: path.join(__dirname, '../../../src/lambdas/reports/handler.ts'),
@@ -292,6 +295,9 @@ export class Functions extends Construct {
         BEDROCK_REGION: bedrockRegion,
         BEDROCK_MODEL_ID: bedrockModelId,
         BEDROCK_MAX_TOKENS: '1024',
+        // Backend-only HMAC key that signs generateReport draft tokens and verifies them in
+        // saveReport. Never exposed to clients; see infrastructure/bin/app.ts for how it is set.
+        REPORT_DRAFT_SIGNING_SECRET: reportDraftSigningSecret,
         AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
       },
       logRetention: logs.RetentionDays.ONE_WEEK,

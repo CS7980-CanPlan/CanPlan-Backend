@@ -300,12 +300,29 @@ type Report {
   reportId: ID!
   scope: AWSJSON
   dateRange: AWSJSON
-  # Set only when the report was persisted; null when generateReport ran with persist:false.
+  # The S3 key of the saved JSON document. A Report only exists once saveReport persisted it.
   s3Key: String
   createdBy: ID
   createdAt: String!
-  # Populated inline on generateReport responses (computed in memory); null on listReports rows.
+  # Echoed inline on the saveReport response (the content just saved); null on listReports rows.
   narrative: String
+  stats: AWSJSON
+}
+
+# A freshly generated, UNSAVED report — the output of generateReport. Nothing is persisted:
+# the stats + AI narrative are computed in memory and returned inline alongside a server-signed
+# `draftToken`. The frontend shows this as a preview; to keep it, the client re-submits the same
+# content (plus the token) to saveReport. scope/dateRange/stats are AWSJSON (output-only JSON
+# strings — JSON.parse them client-side, same as Report).
+type GeneratedReport {
+  # Opaque, server-signed token binding this exact content + a 15-minute expiry. Pass it back
+  # verbatim to saveReport; it is not human-readable and carries no separately useful data.
+  draftToken: String!
+  scope: AWSJSON
+  dateRange: AWSJSON
+  # Server timestamp (ISO-8601) the report was generated. Must be echoed back to saveReport unchanged.
+  generatedAt: String!
+  narrative: String!
   stats: AWSJSON
 }
 
@@ -808,9 +825,20 @@ input GenerateReportInput {
   userId: ID!
   from: AWSDate!
   to: AWSDate!
-  # When false, the report is returned inline only (narrative + stats) and NOT saved to
-  # S3/DynamoDB. Defaults to true (persist), preserving the original behavior.
-  persist: Boolean
+}
+
+# Save a previously generated report. Re-submit the EXACT content returned by generateReport
+# (scope, dateRange, generatedAt, narrative, stats) plus its `draftToken`. The server recomputes
+# a canonical hash of this content and verifies it against the signed token — a stale, expired,
+# or tampered draft is rejected. scope/dateRange/stats are AWSJSON; clients send JSON-encoded
+# strings in GraphQL variables, and AppSync parses them before the Lambda sees them.
+input SaveReportInput {
+  draftToken: String!
+  scope: AWSJSON!
+  dateRange: AWSJSON!
+  generatedAt: String!
+  narrative: String!
+  stats: AWSJSON!
 }
 
 # ─── Pagination / connections ───────────────────────────────────────────────--
@@ -976,9 +1004,9 @@ type Query {
   adminListOrganizationUsers(organizationId: ID!, limit: Int, nextToken: String): UserProfileConnection!
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 
-  # AI progress reports for a cared-for user. NOTE: access checks are temporarily disabled
-  # (any authenticated caller may read any user's reports) pending the general permission
-  # model; see assertCanAccessUserReports.
+  # AI progress reports for a cared-for user. Restricted to a SupportPerson with an ACTIVE
+  # SupportLink to the target PRIMARY_USER in the same organization (a user cannot read their
+  # own reports); see assertCanAccessUserReports.
   listReports(userId: ID!, limit: Int, nextToken: String): ReportConnection!
   getReportDownloadUrl(userId: ID!, reportId: ID!): MediaDownloadTarget!
 }
@@ -1097,14 +1125,19 @@ type Mutation {
   # Break a daily-living task into ordered, source-cited steps via Bedrock KB + RAG.
   generateTaskSteps(input: GenerateTaskStepsInput!): TaskStepsResponse!
 
-  # Generate an AI progress report for a cared-for user over a date range. Computes the
-  # stats in code, has the AI write the narrative, and (when input.persist is not false)
-  # saves JSON to S3 + a DynamoDB row. Always returns narrative + stats inline.
-  generateReport(input: GenerateReportInput!): Report!
+  # Generate an AI progress report PREVIEW for a cared-for user over a date range. Computes the
+  # stats in code and has the AI write the narrative, both in memory — it persists NOTHING. Returns
+  # the content inline plus a server-signed `draftToken`; call saveReport to keep it.
+  generateReport(input: GenerateReportInput!): GeneratedReport!
 
-  # Delete a persisted report (its DynamoDB index row + S3 JSON object). NOTE: access
-  # checks are temporarily disabled pending the general permission model. Returns true
-  # when a report was deleted; errors if no such report exists.
+  # Persist a report previously produced by generateReport. Re-submit the exact content plus its
+  # `draftToken`; the server verifies the token against the content (rejecting stale/expired/tampered
+  # drafts) and writes the JSON to S3 + a DynamoDB index row. Recomputes no stats and calls no model.
+  saveReport(input: SaveReportInput!): Report!
+
+  # Delete a persisted report (its DynamoDB index row + S3 JSON object). Restricted to a
+  # SupportPerson with delegated access to the target user (see assertCanAccessUserReports).
+  # Returns true when a report was deleted; errors if no such report exists.
   deleteReport(userId: ID!, reportId: ID!): Boolean!
 
   # ─── Admin mutations (SystemAdmin-only) ──────────────────────────────────────

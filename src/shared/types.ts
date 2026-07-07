@@ -927,24 +927,54 @@ export interface GenerateReportInput {
   userId: string;
   from: string;
   to: string;
-  /** When false, return the report inline only (no S3/DynamoDB write). Defaults to true. */
-  persist?: boolean;
 }
 
 /**
- * A persisted report's metadata row (the GraphQL Report type). `scope` and `dateRange`
- * are plain objects — AppSync serializes them to AWSJSON on the way out, the same
- * convention used for accessibilitySettings (UserProfile) and permissions (SupportLink).
+ * A freshly generated, UNSAVED report (the GraphQL GeneratedReport type). generateReport
+ * computes the stats + narrative in memory and returns them inline alongside a server-signed
+ * `draftToken`; nothing is written until saveReport re-submits this content with the token.
+ * `scope`/`dateRange`/`stats` are plain objects — AppSync serializes them to AWSJSON on the
+ * way out (same convention as accessibilitySettings / permissions).
+ */
+export interface GeneratedReport {
+  draftToken: string;
+  scope: { userId: string };
+  dateRange: { from: string; to: string };
+  generatedAt: string;
+  narrative: string;
+  stats: ReportStats;
+}
+
+/**
+ * Input for saveReport: the exact content returned by a prior generateReport, plus its signed
+ * `draftToken`. The server recomputes a canonical hash of this content and verifies it against
+ * the token — a stale, expired, or tampered draft is rejected. `scope`/`dateRange`/`stats`
+ * arrive as AWSJSON, i.e. already-parsed objects when they reach the Lambda.
+ */
+export interface SaveReportInput {
+  draftToken: string;
+  scope: { userId: string };
+  dateRange: { from: string; to: string };
+  generatedAt: string;
+  narrative: string;
+  stats: ReportStats;
+}
+
+/**
+ * A persisted report's metadata row (the GraphQL Report type). Only saveReport produces one, so
+ * `s3Key` is always set. `scope` and `dateRange` are plain objects — AppSync serializes them to
+ * AWSJSON on the way out, the same convention used for accessibilitySettings (UserProfile) and
+ * permissions (SupportLink).
  */
 export interface Report {
   reportId: string;
   scope: { userId: string };
   dateRange: { from: string; to: string };
-  /** Set only when persisted; absent when generateReport ran with persist:false. */
+  /** The S3 key of the saved JSON document (always set — a Report row only exists once saved). */
   s3Key?: string;
   createdBy: string;
   createdAt: string;
-  /** Populated inline on generateReport responses; absent on listReports index rows. */
+  /** Echoed inline on the saveReport response; absent on listReports index rows. */
   narrative?: string;
   stats?: ReportStats;
 }
