@@ -1,8 +1,17 @@
 import { randomUUID } from 'crypto';
 import { GetCommand, PutCommand, TransactWriteCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { requireGroup } from '../../shared/auth';
 import { requireCaller } from '../../shared/authz';
 import { getOwnedCategory } from '../../shared/category';
+import { loadProfile } from '../../shared/delegation';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
+import {
+  assertUsableOrganization,
+  isTransactConditionCheckFailure,
+  organizationConditionCheck,
+  organizationMemberDelete,
+  organizationMemberPut,
+} from '../../shared/organization';
 import {
   categorySk,
   DEFAULT_CATEGORY_COLOR,
@@ -17,16 +26,17 @@ import {
   userPk,
 } from '../../shared/keys';
 import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
-import { NotFoundError, ValidationError } from '../../shared/response';
-import { roleFromIdentity } from '../../shared/roles';
+import { NotFoundError, UnauthorizedError, ValidationError } from '../../shared/response';
+import { roleFromIdentity, SUPPORT_PERSON_GROUP } from '../../shared/roles';
 import type {
   AppSyncEvent,
   AppSyncIdentity,
   Category,
   Connection,
   CreateMyUserProfileInput,
-  CreateSupportLinkInput,
+  SelectPrimaryUserInput,
   SupportLink,
+  UnselectPrimaryUserInput,
   UpdateMyUserProfileInput,
   UserProfile,
 } from '../../shared/types';
@@ -41,20 +51,22 @@ export const handler = async (
 ): Promise<
   UserProfile | SupportLink | Connection<UserProfile> | Connection<SupportLink> | null
 > => {
-  const { arguments: args } = event;
+  const { arguments: args, identity } = event;
   switch (event.info?.fieldName) {
     case 'createUserProfile':
-      return createMyUserProfile(event.identity, args.input as CreateMyUserProfileInput);
+      return createMyUserProfile(identity, args.input as CreateMyUserProfileInput);
     case 'updateMyUserProfile':
-      return updateMyUserProfile(event.identity, args.input as UpdateMyUserProfileInput);
+      return updateMyUserProfile(identity, args.input as UpdateMyUserProfileInput);
     case 'getUserProfile':
       return getUserProfile(args.userId as string);
-    case 'listUsersByOrganization':
-      return listUsersByOrganization(args.organizationId as string, pageArgs(args));
-    case 'createSupportLink':
-      return createSupportLink(args.input as CreateSupportLinkInput);
-    case 'listPrimaryUsersBySupporter':
-      return listPrimaryUsersBySupporter(args.supporterId as string, pageArgs(args));
+    case 'listMyOrganizationUsers':
+      return listMyOrganizationUsers(identity, pageArgs(args));
+    case 'selectPrimaryUser':
+      return selectPrimaryUser(identity, args.input as SelectPrimaryUserInput);
+    case 'unselectPrimaryUser':
+      return unselectPrimaryUser(identity, args.input as UnselectPrimaryUserInput);
+    case 'listMySupportList':
+      return listMySupportList(identity, pageArgs(args));
     default:
       throw new Error(`users handler: unsupported field "${event.info?.fieldName}"`);
   }
@@ -90,11 +102,15 @@ async function createMyUserProfile(
   const displayName = input?.displayName?.trim();
   if (!displayName) throw new ValidationError('displayName is required and cannot be empty');
 
+  // organizationId references a real Organization now: omitted ⇒ none; a non-empty value must
+  // name an existing, non-deleting org (validated before any profile work); blank ⇒ rejected.
+  const organizationId = await resolveCreateOrganization(input?.organizationId);
+
   const editable = {
     role,
     displayName,
     email,
-    organizationId: input?.organizationId?.trim(),
+    organizationId,
     accessibilitySettings: input?.accessibilitySettings,
   };
 
@@ -104,10 +120,14 @@ async function createMyUserProfile(
   // (carrying the existing task counters forward so a re-create never resets them).
   if (existing?.defaultCategoryId) {
     await assertValidDefaultCategory(userId, existing.defaultCategoryId);
-    return putProfile(userId, editable, existing.defaultCategoryId, existing.createdAt, {
-      taskCount: existing.taskCount,
-      nextTaskOrder: existing.nextTaskOrder,
-    });
+    return putProfile(
+      userId,
+      editable,
+      existing.defaultCategoryId,
+      existing.createdAt,
+      { taskCount: existing.taskCount, nextTaskOrder: existing.nextTaskOrder },
+      existing.organizationId,
+    );
   }
 
   // No valid default yet → create the default category alongside the profile, atomically.
@@ -162,39 +182,72 @@ async function createMyUserProfile(
     updatedAt: now,
   };
 
+  const transactItems: Array<Record<string, unknown>> = [
+    profileWrite,
+    {
+      Put: {
+        TableName: TABLE_NAME,
+        Item: {
+          PK: userPk(userId),
+          SK: categorySk(defaultCategoryId),
+          entityType: ENTITY.CATEGORY,
+          ...defaultCategory,
+        },
+        ConditionExpression: 'attribute_not_exists(PK)',
+      },
+    },
+  ];
+  // When joining an org, atomically re-verify it still exists and isn't deleting — closing the
+  // race where adminDeleteOrganization removes it between the pre-read and this write — and write
+  // the strongly-consistent OrganizationMember row in the SAME transaction so the org partition
+  // always reflects this new member.
+  const orgCheckIndex = organizationId ? transactItems.length : -1;
+  if (organizationId) {
+    transactItems.push(organizationConditionCheck(organizationId));
+    transactItems.push(organizationMemberPut(organizationId, userId));
+  }
+  // A legacy profile that was in a DIFFERENT org (or is being cleared here) must drop its stale
+  // membership row in the same transaction. Unconditional delete → harmless no-op if none exists.
+  const previousOrg = existing?.organizationId?.trim() || undefined;
+  if (previousOrg && previousOrg !== organizationId) {
+    transactItems.push(organizationMemberDelete(previousOrg, userId));
+  }
+
   try {
-    await dynamo.send(
-      new TransactWriteCommand({
-        TransactItems: [
-          profileWrite,
-          {
-            Put: {
-              TableName: TABLE_NAME,
-              Item: {
-                PK: userPk(userId),
-                SK: categorySk(defaultCategoryId),
-                entityType: ENTITY.CATEGORY,
-                ...defaultCategory,
-              },
-              ConditionExpression: 'attribute_not_exists(PK)',
-            },
-          },
-        ],
-      }),
-    );
+    await dynamo.send(new TransactWriteCommand({ TransactItems: transactItems }));
     return profile;
   } catch (err) {
+    // The org was deleted/began deleting between the pre-read and the write.
+    if (organizationId && isTransactConditionCheckFailure(err, orgCheckIndex)) {
+      throw organizationUnavailableError(organizationId);
+    }
     // A concurrent first call already created the profile + default (or set the default on
     // a legacy row). Reread and reuse it rather than minting a second default category.
     if ((err as { name?: string }).name !== 'TransactionCanceledException') throw err;
     const reread = await getProfile(userId);
     if (!reread?.defaultCategoryId) throw err;
     await assertValidDefaultCategory(userId, reread.defaultCategoryId);
-    return putProfile(userId, editable, reread.defaultCategoryId, reread.createdAt, {
-      taskCount: reread.taskCount,
-      nextTaskOrder: reread.nextTaskOrder,
-    });
+    return putProfile(
+      userId,
+      editable,
+      reread.defaultCategoryId,
+      reread.createdAt,
+      { taskCount: reread.taskCount, nextTaskOrder: reread.nextTaskOrder },
+      reread.organizationId,
+    );
   }
+}
+
+/**
+ * The organization named by a membership write vanished or began deleting between the pre-read
+ * (assertUsableOrganization) and the atomic ConditionCheck — a clear, client-handleable error
+ * rather than a raw TransactionCanceledException surfacing as an internal failure.
+ */
+function organizationUnavailableError(organizationId: string): ValidationError {
+  return new ValidationError(
+    `organization ${organizationId} is no longer available (it was deleted or is being deleted) ` +
+      'and cannot be joined',
+  );
 }
 
 /** Read the caller's profile row (undefined if it doesn't exist). */
@@ -203,6 +256,19 @@ async function getProfile(userId: string): Promise<UserProfile | undefined> {
     new GetCommand({ TableName: TABLE_NAME, Key: { PK: userPk(userId), SK: PROFILE_SK } }),
   );
   return result.Item as UserProfile | undefined;
+}
+
+/**
+ * Validate a create-time organizationId reference. Omitted (undefined) ⇒ the profile joins no
+ * org; a blank string ⇒ ValidationError; otherwise the id must name an existing, non-deleting
+ * Organization (else NotFound/Validation from assertUsableOrganization). Returns the trimmed id.
+ */
+async function resolveCreateOrganization(raw: string | undefined): Promise<string | undefined> {
+  if (raw === undefined) return undefined;
+  const organizationId = raw.trim();
+  if (!organizationId) throw new ValidationError('organizationId cannot be empty');
+  await assertUsableOrganization(organizationId);
+  return organizationId;
 }
 
 /** The profile's editable, server-derived fields (everything except id/keys/default/timestamps). */
@@ -228,6 +294,12 @@ function buildProfile(
 /**
  * Overwrite the editable profile fields, preserving the existing default + createdAt + task
  * counters (a full Put replaces the item, so the counters must be re-supplied or they'd drop).
+ *
+ * `previousOrg` is the org the profile belonged to BEFORE this write (undefined if none). Because a
+ * full Put also rewrites organizationId, membership rows must be kept in step: setting an org writes
+ * its OrganizationMember row (guarded by an org existence/not-deleting ConditionCheck), and any
+ * change that MOVES to a different org or CLEARS it deletes the previous org's membership row — all
+ * atomically with the profile Put.
  */
 async function putProfile(
   userId: string,
@@ -235,6 +307,7 @@ async function putProfile(
   defaultCategoryId: string,
   createdAt: string,
   counters: TaskCounters,
+  previousOrg?: string,
 ): Promise<UserProfile> {
   const profile = buildProfile(
     userId,
@@ -244,12 +317,46 @@ async function putProfile(
     new Date().toISOString(),
     counters,
   );
-  await dynamo.send(
-    new PutCommand({
-      TableName: TABLE_NAME,
-      Item: { PK: userPk(userId), SK: PROFILE_SK, entityType: ENTITY.USER_PROFILE, ...profile },
-    }),
-  );
+  const item = { PK: userPk(userId), SK: PROFILE_SK, entityType: ENTITY.USER_PROFILE, ...profile };
+  const newOrg = editable.organizationId;
+  const prevOrg = previousOrg?.trim() || undefined;
+
+  // Setting organizationId? The Put must be atomic with an org existence/not-deleting check so a
+  // profile rewrite can't join an org that adminDeleteOrganization is concurrently removing, and it
+  // must write the OrganizationMember row (and drop the old org's row when moving) in one transaction.
+  if (newOrg) {
+    const transactItems: Array<Record<string, unknown>> = [
+      { Put: { TableName: TABLE_NAME, Item: item } },
+      organizationConditionCheck(newOrg),
+      organizationMemberPut(newOrg, userId),
+    ];
+    if (prevOrg && prevOrg !== newOrg) {
+      transactItems.push(organizationMemberDelete(prevOrg, userId));
+    }
+    try {
+      await dynamo.send(new TransactWriteCommand({ TransactItems: transactItems }));
+    } catch (err) {
+      if (isTransactConditionCheckFailure(err, 1)) throw organizationUnavailableError(newOrg);
+      throw err;
+    }
+    return profile;
+  }
+
+  // Not setting an org, but the profile previously had one: the full Put clears organizationId, so
+  // delete the now-stale membership row in the same transaction (no org check needed to clear).
+  if (prevOrg) {
+    await dynamo.send(
+      new TransactWriteCommand({
+        TransactItems: [
+          { Put: { TableName: TABLE_NAME, Item: item } },
+          organizationMemberDelete(prevOrg, userId),
+        ],
+      }),
+    );
+    return profile;
+  }
+
+  await dynamo.send(new PutCommand({ TableName: TABLE_NAME, Item: item }));
   return profile;
 }
 
@@ -284,14 +391,15 @@ function stripProfile(item: Record<string, unknown>): UserProfile {
  * Cognito `sub` (never a client-supplied userId), so a caller can only edit their own row.
  *
  * Distinct from createUserProfile: this NEVER creates a profile or a default category, NEVER
- * touches role/email/organizationId/defaultCategoryId/createdAt/keys/entityType, and is a
- * targeted UpdateCommand (not a full-item Put) so every untouched field is preserved. Only
- * `displayName` and `accessibilitySettings` are editable:
+ * touches role/email/defaultCategoryId/createdAt/keys/entityType, and is a targeted
+ * UpdateCommand (not a full-item Put) so every untouched field is preserved. Editable fields:
  *  - `displayName`: omitted ⇒ unchanged; otherwise trimmed (null/empty/whitespace rejected).
  *  - `accessibilitySettings`: omitted ⇒ unchanged; explicit `null` ⇒ cleared (REMOVE); a
  *    non-null value ⇒ FULL replacement of the stored value (never deep-merged). It arrives
  *    already parsed from the AWSJSON argument and is stored as-is; AppSync re-serializes it
  *    to an AWSJSON string on the way out.
+ *  - `organizationId` (MVP self-service): omitted ⇒ unchanged; non-empty string ⇒ set; explicit
+ *    `null` ⇒ cleared (REMOVE); a blank string is rejected. Any signed-in user may set their own.
  *
  * At least one editable field must be supplied. The write is conditioned on the profile
  * existing (`attribute_exists(PK)`), so it can never create a new row; a missing profile
@@ -305,9 +413,10 @@ async function updateMyUserProfile(
 
   const displayNameKeyPresent = input?.displayName !== undefined;
   const settingsKeyPresent = input?.accessibilitySettings !== undefined;
-  if (!displayNameKeyPresent && !settingsKeyPresent) {
+  const orgKeyPresent = input?.organizationId !== undefined;
+  if (!displayNameKeyPresent && !settingsKeyPresent && !orgKeyPresent) {
     throw new ValidationError(
-      'at least one of displayName or accessibilitySettings must be supplied',
+      'at least one of displayName, accessibilitySettings, or organizationId must be supplied',
     );
   }
 
@@ -333,21 +442,68 @@ async function updateMyUserProfile(
     }
   }
 
+  // The org id being SET (a non-null string), if any — drives the atomic org ConditionCheck.
+  let orgToSet: string | undefined;
+  if (orgKeyPresent) {
+    // Self-service org membership: explicit null clears it; a non-empty string sets it but must
+    // name an existing, non-deleting Organization (validated here — no longer free-form). A
+    // blank/whitespace string is rejected (use null to clear). role/email/etc. stay locked.
+    if (input.organizationId === null) {
+      removeParts.push('organizationId');
+    } else {
+      const organizationId = input.organizationId?.trim();
+      if (!organizationId) {
+        throw new ValidationError('organizationId cannot be empty; use null to clear it');
+      }
+      await assertUsableOrganization(organizationId);
+      orgToSet = organizationId;
+      setParts.push('organizationId = :organizationId');
+      values[':organizationId'] = organizationId;
+    }
+  }
+
   let updateExpression = `SET ${setParts.join(', ')}`;
   if (removeParts.length) updateExpression += ` REMOVE ${removeParts.join(', ')}`;
 
+  const profileUpdate: ProfileUpdate = {
+    TableName: TABLE_NAME,
+    Key: { PK: userPk(userId), SK: PROFILE_SK },
+    UpdateExpression: updateExpression,
+    // Never create a profile row — the update only applies to an existing one.
+    ConditionExpression: 'attribute_exists(PK)',
+    ExpressionAttributeValues: values,
+  };
+
+  // Any change to organizationId must keep the strongly-consistent OrganizationMember rows (under
+  // the org partition) in lockstep with UserProfile.organizationId. To drop the row for the org
+  // the caller is LEAVING we need their PREVIOUS org id, so read the profile first. (A missing
+  // profile is NotFound — the same result the update's attribute_exists(PK) guard would give.)
+  if (orgKeyPresent) {
+    const current = await getProfile(userId);
+    if (!current) throw new NotFoundError(`profile for user ${userId} not found`);
+    const previousOrg = current.organizationId?.trim() || undefined;
+    return orgToSet
+      ? setProfileOrganization(userId, profileUpdate, orgToSet, previousOrg)
+      : clearProfileOrganization(userId, profileUpdate, previousOrg);
+  }
+
+  // No organizationId change (only displayName/accessibilitySettings): one conditional update.
+  return runProfileUpdate(userId, profileUpdate);
+}
+
+/** The conditional profile UpdateCommand shape shared by the update paths below. */
+interface ProfileUpdate {
+  TableName: string;
+  Key: Record<string, string>;
+  UpdateExpression: string;
+  ConditionExpression: string;
+  ExpressionAttributeValues: Record<string, unknown>;
+}
+
+/** Run the profile update as a single conditional UpdateCommand, returning the stored row (ALL_NEW). */
+async function runProfileUpdate(userId: string, profileUpdate: ProfileUpdate): Promise<UserProfile> {
   try {
-    const result = await dynamo.send(
-      new UpdateCommand({
-        TableName: TABLE_NAME,
-        Key: { PK: userPk(userId), SK: PROFILE_SK },
-        UpdateExpression: updateExpression,
-        // Never create a profile row — the update only applies to an existing one.
-        ConditionExpression: 'attribute_exists(PK)',
-        ExpressionAttributeValues: values,
-        ReturnValues: 'ALL_NEW',
-      }),
-    );
+    const result = await dynamo.send(new UpdateCommand({ ...profileUpdate, ReturnValues: 'ALL_NEW' }));
     return stripProfile(result.Attributes as Record<string, unknown>);
   } catch (err) {
     if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
@@ -355,6 +511,75 @@ async function updateMyUserProfile(
     }
     throw err;
   }
+}
+
+/** Read the profile back after a TransactWrite (which returns no attributes) and strip it. */
+async function readBackProfile(userId: string): Promise<UserProfile> {
+  const updated = await getProfile(userId);
+  if (!updated) throw new NotFoundError(`profile for user ${userId} not found`);
+  return stripProfile(updated as unknown as Record<string, unknown>);
+}
+
+/**
+ * SET the caller's organizationId in ONE transaction: the profile update + an org
+ * existence/not-deleting ConditionCheck (so a concurrent adminDeleteOrganization can't slip a
+ * membership onto a deleting/deleted org) + a Put of the new OrganizationMember row, and — when
+ * MOVING from a different org — a Delete of the old membership row. TransactWrite returns no
+ * attributes, so read the updated profile back.
+ */
+async function setProfileOrganization(
+  userId: string,
+  profileUpdate: ProfileUpdate,
+  orgToSet: string,
+  previousOrg: string | undefined,
+): Promise<UserProfile> {
+  const transactItems: Array<Record<string, unknown>> = [
+    { Update: profileUpdate },
+    organizationConditionCheck(orgToSet),
+    organizationMemberPut(orgToSet, userId),
+  ];
+  if (previousOrg && previousOrg !== orgToSet) {
+    transactItems.push(organizationMemberDelete(previousOrg, userId));
+  }
+  try {
+    await dynamo.send(new TransactWriteCommand({ TransactItems: transactItems }));
+  } catch (err) {
+    // The org ConditionCheck is transact-item index 1.
+    if (isTransactConditionCheckFailure(err, 1)) throw organizationUnavailableError(orgToSet);
+    // The only other conditional item is the profile Update's attribute_exists(PK).
+    if ((err as { name?: string }).name === 'TransactionCanceledException') {
+      throw new NotFoundError(`profile for user ${userId} not found`);
+    }
+    throw err;
+  }
+  return readBackProfile(userId);
+}
+
+/**
+ * CLEAR the caller's organizationId. When they currently belong to an org, REMOVE the attribute
+ * AND delete that OrganizationMember row in ONE transaction (then read back). With no current org
+ * there is no membership row to drop, so a single conditional update suffices. Idempotent.
+ */
+async function clearProfileOrganization(
+  userId: string,
+  profileUpdate: ProfileUpdate,
+  previousOrg: string | undefined,
+): Promise<UserProfile> {
+  if (!previousOrg) return runProfileUpdate(userId, profileUpdate);
+  try {
+    await dynamo.send(
+      new TransactWriteCommand({
+        TransactItems: [{ Update: profileUpdate }, organizationMemberDelete(previousOrg, userId)],
+      }),
+    );
+  } catch (err) {
+    // The only conditional item is the profile Update's attribute_exists(PK).
+    if ((err as { name?: string }).name === 'TransactionCanceledException') {
+      throw new NotFoundError(`profile for user ${userId} not found`);
+    }
+    throw err;
+  }
+  return readBackProfile(userId);
 }
 
 async function getUserProfile(userId: string): Promise<UserProfile | null> {
@@ -365,61 +590,181 @@ async function getUserProfile(userId: string): Promise<UserProfile | null> {
   return (result.Item as UserProfile) ?? null;
 }
 
-async function listUsersByOrganization(
-  organizationId: string,
+/**
+ * listMyOrganizationUsers — the roster of users in the AUTHENTICATED caller's OWN current
+ * organization. The org is read from the caller's profile (never a client argument), so a
+ * caller can only ever see their own org — a SupportPerson cannot enumerate another
+ * organization. Errors if the caller has no current organization. Returns the lightweight
+ * orgIndex projection (userId, displayName, role).
+ */
+async function listMyOrganizationUsers(
+  identity: AppSyncIdentity | undefined,
   page: PageArgs,
 ): Promise<Connection<UserProfile>> {
-  if (!organizationId?.trim()) throw new ValidationError('organizationId is required');
-  // orgIndex projects displayName + role — a lightweight roster, not the full profile.
+  const callerOrg = await requireCallerOrganization(identity);
+  return queryOrgRoster(callerOrg, page);
+}
+
+/** The authenticated caller's current organizationId, or a ValidationError if they have none. */
+async function requireCallerOrganization(identity: AppSyncIdentity | undefined): Promise<string> {
+  const caller = requireCaller(identity);
+  const profile = await loadProfile(caller);
+  const organizationId = profile?.organizationId?.trim();
+  if (!organizationId) {
+    throw new ValidationError(
+      'caller has no current organization; set one via updateMyUserProfile first',
+    );
+  }
+  return organizationId;
+}
+
+/** Query the orgIndex roster for one organization (projects userId, displayName, role). */
+function queryOrgRoster(organizationId: string, page: PageArgs): Promise<Connection<UserProfile>> {
   return queryPage<UserProfile>(
     {
       TableName: TABLE_NAME,
       IndexName: ORG_INDEX,
       KeyConditionExpression: 'organizationId = :org',
-      ExpressionAttributeValues: { ':org': organizationId },
+      // OrganizationMember rows also carry organizationId + userId, so they co-tenant this GSI.
+      // Their SK is MEMBER#<userId>, not #PROFILE — restrict the roster to real UserProfile rows.
+      // (PK/SK are the base-table key, always present in a GSI result regardless of projection.)
+      FilterExpression: 'SK = :profileSk',
+      ExpressionAttributeValues: { ':org': organizationId, ':profileSk': PROFILE_SK },
     },
     page,
   );
 }
 
-async function createSupportLink(input: CreateSupportLinkInput): Promise<SupportLink> {
-  const supporterId = input?.supporterId?.trim();
+// ── SupportLink selection (SupportPerson delegated access) ──────────────────────
+
+/**
+ * selectPrimaryUser — a SupportPerson selects a PRIMARY_USER in their OWN organization to
+ * support, writing (or restoring) the SupportLink as ACTIVE. The supporter is ALWAYS the
+ * authenticated caller (never client-supplied). Guard rails:
+ *  - only a SupportPerson may select (a primary user cannot select a supporter);
+ *  - the caller must currently belong to an organization;
+ *  - the target must exist, be a PRIMARY_USER, and currently share the caller's organization.
+ * The write is an idempotent upsert: a brand-new link is created ACTIVE, and a previously
+ * REVOKED link is restored to ACTIVE while preserving its original createdAt.
+ */
+async function selectPrimaryUser(
+  identity: AppSyncIdentity | undefined,
+  input: SelectPrimaryUserInput,
+): Promise<SupportLink> {
+  const supporterId = requireCaller(identity);
+  // Only a SupportPerson may select/unselect — a primary user cannot select a supporter.
+  requireGroup(identity, SUPPORT_PERSON_GROUP);
+
   const primaryUserId = input?.primaryUserId?.trim();
-  if (!supporterId) throw new ValidationError('supporterId is required and cannot be empty');
+  if (!primaryUserId) throw new ValidationError('primaryUserId is required and cannot be empty');
+  if (primaryUserId === supporterId) {
+    throw new ValidationError('cannot select yourself as a primary user');
+  }
+
+  const supporter = await loadProfile(supporterId);
+  const supporterOrg = supporter?.organizationId?.trim();
+  if (!supporterOrg) {
+    throw new ValidationError(
+      'you must belong to an organization to select primary users; set one via updateMyUserProfile',
+    );
+  }
+
+  const target = await loadProfile(primaryUserId);
+  if (!target) throw new NotFoundError(`user ${primaryUserId} not found`);
+  if (target.role !== 'PRIMARY_USER') {
+    throw new ValidationError(`user ${primaryUserId} is not a primary user and cannot be selected`);
+  }
+  if ((target.organizationId?.trim() ?? '') !== supporterOrg) {
+    throw new UnauthorizedError(`Unauthorized: user ${primaryUserId} is not in your organization`);
+  }
+
+  const now = new Date().toISOString();
+  // Upsert: create ACTIVE if absent, or restore a REVOKED link to ACTIVE — preserving its
+  // original createdAt. supporterId/userId are (re)written so the GSIs stay populated.
+  const setParts = [
+    'entityType = :entityType',
+    'supporterId = :supporterId',
+    'primaryUserId = :primaryUserId',
+    // `userId` mirrors primaryUserId — the supporterIndex / primaryUserSupportLinkIndex key.
+    'userId = :primaryUserId',
+    '#status = :active',
+    'createdAt = if_not_exists(createdAt, :now)',
+    'updatedAt = :now',
+  ];
+  const values: Record<string, unknown> = {
+    ':entityType': ENTITY.SUPPORT_LINK,
+    ':supporterId': supporterId,
+    ':primaryUserId': primaryUserId,
+    ':active': 'ACTIVE',
+    ':now': now,
+  };
+
+  const result = await dynamo.send(
+    new UpdateCommand({
+      TableName: TABLE_NAME,
+      Key: { PK: supporterPk(supporterId), SK: userLinkSk(primaryUserId) },
+      UpdateExpression: `SET ${setParts.join(', ')}`,
+      ExpressionAttributeNames: { '#status': 'status' },
+      ExpressionAttributeValues: values,
+      ReturnValues: 'ALL_NEW',
+    }),
+  );
+  return stripSupportLink(result.Attributes as Record<string, unknown>);
+}
+
+/**
+ * unselectPrimaryUser — a SupportPerson un-selects a primary user, SOFT-revoking the SupportLink
+ * (status REVOKED) rather than deleting it, so the original row (and createdAt) survives and a
+ * later selectPrimaryUser restores it. The supporter is the authenticated caller; only a
+ * SupportPerson may unselect. NotFound if no link exists for the (caller, primaryUser) pair.
+ */
+async function unselectPrimaryUser(
+  identity: AppSyncIdentity | undefined,
+  input: UnselectPrimaryUserInput,
+): Promise<SupportLink> {
+  const supporterId = requireCaller(identity);
+  requireGroup(identity, SUPPORT_PERSON_GROUP);
+
+  const primaryUserId = input?.primaryUserId?.trim();
   if (!primaryUserId) throw new ValidationError('primaryUserId is required and cannot be empty');
 
   const now = new Date().toISOString();
-  const link: SupportLink = {
-    supporterId,
-    primaryUserId,
-    // `userId` mirrors primaryUserId so it can serve as the supporterIndex sort key.
-    userId: primaryUserId,
-    status: input.status ?? 'PENDING',
-    permissions: input.permissions,
-    createdAt: now,
-    updatedAt: now,
-  };
-
-  await dynamo.send(
-    new PutCommand({
-      TableName: TABLE_NAME,
-      Item: {
-        PK: supporterPk(supporterId),
-        SK: userLinkSk(primaryUserId),
-        entityType: ENTITY.SUPPORT_LINK,
-        ...link,
-      },
-    }),
-  );
-
-  return link;
+  try {
+    const result = await dynamo.send(
+      new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: { PK: supporterPk(supporterId), SK: userLinkSk(primaryUserId) },
+        UpdateExpression: 'SET #status = :revoked, updatedAt = :now',
+        // Never create a link here — only revoke one that exists.
+        ConditionExpression: 'attribute_exists(PK)',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':revoked': 'REVOKED', ':now': now },
+        ReturnValues: 'ALL_NEW',
+      }),
+    );
+    return stripSupportLink(result.Attributes as Record<string, unknown>);
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
+      throw new NotFoundError(`no support link from ${supporterId} to ${primaryUserId} to unselect`);
+    }
+    throw err;
+  }
 }
 
-async function listPrimaryUsersBySupporter(
-  supporterId: string,
+/**
+ * listMySupportList — the AUTHENTICATED caller's own support list (every primary user they have
+ * selected, ACTIVE and REVOKED), via supporterIndex keyed on the caller's sub.
+ */
+async function listMySupportList(
+  identity: AppSyncIdentity | undefined,
   page: PageArgs,
 ): Promise<Connection<SupportLink>> {
-  if (!supporterId?.trim()) throw new ValidationError('supporterId is required');
+  const supporterId = requireCaller(identity);
+  return querySupportList(supporterId, page);
+}
+
+/** Query a supporter's SupportLinks (supporterIndex). */
+function querySupportList(supporterId: string, page: PageArgs): Promise<Connection<SupportLink>> {
   return queryPage<SupportLink>(
     {
       TableName: TABLE_NAME,
@@ -429,4 +774,13 @@ async function listPrimaryUsersBySupporter(
     },
     page,
   );
+}
+
+/** Strip internal storage attributes (PK/SK/entityType) before returning a SupportLink. */
+function stripSupportLink(item: Record<string, unknown>): SupportLink {
+  const out = { ...item };
+  delete out.PK;
+  delete out.SK;
+  delete out.entityType;
+  return out as unknown as SupportLink;
 }

@@ -68,9 +68,40 @@ export interface SupportLink {
   /** Mirror of primaryUserId — the supporterIndex sort key. */
   userId: string;
   status: SupportLinkStatus;
-  permissions?: Record<string, unknown>;
   createdAt: string;
   updatedAt?: string;
+}
+
+/**
+ * An organization a UserProfile.organizationId references. PK = ORG#<organizationId>,
+ * SK = #META. Managed by SystemAdmin-only admin APIs.
+ */
+export interface Organization {
+  organizationId: string;
+  name: string;
+  /**
+   * Internal, transient marker set while the organization is being deleted and its members'
+   * organizationId references are being removed. While present, new memberships may not point
+   * at it. Never exposed in the GraphQL Organization type.
+   */
+  deleting?: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * A strongly-consistent membership row: one per (organization, user), written in the SAME
+ * transaction as any UserProfile.organizationId set/clear so it always mirrors the profile's
+ * current org. PK = ORG#<organizationId>, SK = MEMBER#<userId>. It is the source of truth
+ * adminDeleteOrganization reads (a consistent Query of the org partition) to detach every member
+ * safely — the orgIndex GSI is eventually consistent and could miss a just-joined member. Purely
+ * internal: never exposed in GraphQL.
+ */
+export interface OrganizationMember {
+  organizationId: string;
+  userId: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 /** A user-owned grouping for tasks (folder-like). PK = USER#<ownerId>, SK = CATEGORY#<categoryId>. */
@@ -346,48 +377,63 @@ export interface CreateMyUserProfileInput {
 /**
  * Partial update of the caller's OWN profile. The owner is derived from the Cognito
  * identity (never client-supplied), so there is no userId — and userId, email, role,
- * organizationId, defaultCategoryId, and timestamps are intentionally absent: they cannot
- * be changed here. At least one of `displayName`/`accessibilitySettings` must be supplied.
+ * defaultCategoryId, and timestamps are intentionally absent: they cannot be changed here.
+ * At least one editable field must be supplied.
  * `displayName`: omitted ⇒ unchanged; otherwise trimmed and may not be empty/whitespace.
  * `accessibilitySettings`: omitted ⇒ unchanged; explicit `null` ⇒ cleared; a non-null value
  * ⇒ FULL replacement of the stored settings (never deep-merged).
+ * `organizationId` (MVP self-service org membership): omitted (the key absent) ⇒ unchanged; a
+ * non-empty string ⇒ set; explicit `null` ⇒ cleared. Any signed-in user may change their own.
  */
 export interface UpdateMyUserProfileInput {
   displayName?: string | null;
   accessibilitySettings?: Record<string, unknown> | null;
+  organizationId?: string | null;
 }
 
-export interface CreateSupportLinkInput {
-  supporterId: string;
+/** A SupportPerson selects a primary user (supporter derived from identity). Writes ACTIVE. */
+export interface SelectPrimaryUserInput {
   primaryUserId: string;
-  status?: SupportLinkStatus;
-  permissions?: Record<string, unknown>;
 }
 
-// ownerId is intentionally absent — the owner is derived from the authenticated
-// Cognito identity (event.identity.sub), never client-supplied. Categories are private
-// to their owner.
+/** A SupportPerson un-selects a primary user (supporter derived from identity). Soft-revokes. */
+export interface UnselectPrimaryUserInput {
+  primaryUserId: string;
+}
+
+// `userId` is optional and selects whose categories to operate on: omitted/null ⇒ the
+// authenticated caller (event.identity.sub); a non-self value targets that primary user and
+// requires SupportPerson delegated access. The created category is always owned by the target
+// user. There is no client-supplied ownerId.
 export interface CreateCategoryInput {
+  userId?: string | null;
   name: string;
   color?: string;
   sortOrder?: number;
 }
 
 /**
- * Partial edit of one of the caller's own categories. At least one updatable field
- * (name, color, sortOrder) must be supplied. The default category's `name` may not be
- * changed (color/sortOrder are allowed); a normal category may not be renamed to the
- * reserved default name.
+ * Partial edit of a category. At least one updatable field (name, color, sortOrder) must be
+ * supplied. `userId` is optional: omitted/null ⇒ the caller's own category; a non-self value
+ * targets that primary user's category (SupportPerson delegated access). The default category's
+ * `name` may not be changed (color/sortOrder are allowed); a normal category may not be renamed
+ * to the reserved default name.
  */
 export interface UpdateCategoryInput {
+  userId?: string | null;
   categoryId: string;
   name?: string;
   color?: string;
   sortOrder?: number;
 }
 
-/** Identifies one of the caller's own categories to delete. The default cannot be deleted. */
+/**
+ * Identifies a category to delete. The default cannot be deleted. `userId` is optional:
+ * omitted/null ⇒ the caller's own category; a non-self value targets that primary user's
+ * category (SupportPerson delegated access).
+ */
 export interface DeleteCategoryInput {
+  userId?: string | null;
   categoryId: string;
 }
 
@@ -397,10 +443,14 @@ export interface CreateTaskStepNestedInput {
   description?: string;
 }
 
-// ownerId is intentionally absent — the owner is derived from the authenticated
-// Cognito identity (event.identity.sub), never client-supplied. A Task is a reusable
-// template only: it carries no schedule (scheduling lives on TaskAssignment).
+// The target owner is resolved server-side: omitted/null `userId` ⇒ the authenticated
+// caller (event.identity.sub); a non-self `userId` targets that primary user and requires
+// SupportPerson delegated access (assertCanActForUser). No arbitrary client-supplied ownerId
+// is honored beyond this delegation path. A Task is a reusable template only: it carries no
+// schedule (scheduling lives on TaskAssignment).
 export interface CreateTaskInput {
+  /** Omitted/null ⇒ the caller. A non-self value requires SupportPerson delegated access. */
+  userId?: string;
   title: string;
   /**
    * Optional. Omitted/null ⇒ the owner's default category. A blank string is rejected.
@@ -514,12 +564,15 @@ export interface TaskOrderInput {
 }
 
 /**
- * Atomically reorder ALL of the caller's tasks. `tasks` must be the complete current set:
+ * Atomically reorder ALL of a target owner's tasks. `tasks` must be the complete current set:
  * every owned taskId exactly once, with positive, mutually-unique orders (gaps allowed).
  * Applied in a single DynamoDB transaction (all-or-nothing); only the `order` attribute
- * changes. The owner is derived from the Cognito identity, never the input.
+ * changes. Omitted/null `userId` ⇒ the caller; a non-self value requires SupportPerson
+ * delegated access.
  */
 export interface UpdateTaskOrderInput {
+  /** Omitted/null ⇒ the caller. A non-self value requires SupportPerson delegated access. */
+  userId?: string;
   tasks: TaskOrderInput[];
 }
 
@@ -629,7 +682,12 @@ export interface CreateMediaAssetInput {
   s3Key: string;
   type: MediaType;
   mimeType: string;
-  ownerId: string;
+  /**
+   * Deprecated/ignored. The asset owner is derived from the task's authoritative `ownerId`
+   * (never client-supplied), so a SupportPerson registering media under a delegated primary
+   * user's task stores that primary user as the owner. Retained only for input compatibility.
+   */
+  ownerId?: string;
   size?: number;
 }
 
@@ -750,6 +808,37 @@ export interface AdminDeleteUserResult {
   deletedUserItems: number;
   deletedSupportLinks: number;
   deletedCognitoUser: boolean;
+}
+
+// ── Admin organization management (SystemAdmin-only) ──────────────────────────
+export interface CreateOrganizationInput {
+  name: string;
+}
+
+export interface UpdateOrganizationInput {
+  organizationId: string;
+  name: string;
+}
+
+export interface DeleteOrganizationInput {
+  organizationId: string;
+}
+
+/**
+ * Admin sets/clears ANOTHER user's organization membership (SystemAdmin-only — distinct from the
+ * self-only updateMyUserProfile). `organizationId`: a non-null id joins that org (must exist and not
+ * be deleting); explicit `null` clears membership. The field is required at runtime so omitted values
+ * cannot accidentally clear a user's org. Membership rows are kept in step atomically.
+ */
+export interface AdminSetUserOrganizationInput {
+  userId: string;
+  organizationId: string | null;
+}
+
+/** Result of adminDeleteOrganization: the removed org plus how many members were detached. */
+export interface AdminDeleteOrganizationResult {
+  organization: Organization;
+  removedUsers: number;
 }
 
 /**

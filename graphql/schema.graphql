@@ -76,26 +76,40 @@ type UserProfile {
   role: UserRole!
   displayName: String
   email: String
+  # The id of an existing Organization this user belongs to (or null if none). No longer
+  # free-form: setting it via createUserProfile/updateMyUserProfile validates the org exists
+  # and is not being deleted. SystemAdmin manages organizations (see listAllOrganizations).
   organizationId: ID
   accessibilitySettings: AWSJSON
   # Id of this user's mandatory default Category (a real Category row with isDefault:true),
   # created atomically with the profile. Tasks created without an explicit category fall
   # into it. Server-managed; never client-supplied.
   defaultCategoryId: ID
-  # Nullable: the orgIndex roster projection (listUsersByOrganization) omits it.
+  # Nullable: the orgIndex roster projection (listMyOrganizationUsers) omits it.
   createdAt: String
   updatedAt: String
 }
 
+# A supporter↔primary-user delegation link. An ACTIVE link (plus a shared organization and a
+# PRIMARY_USER target) grants a SupportPerson delegated access.
 type SupportLink {
   supporterId: ID!
   primaryUserId: ID!
   # Mirror of primaryUserId — the supporterIndex sort key.
   userId: ID!
   status: SupportLinkStatus!
-  permissions: AWSJSON
   createdAt: String!
   updatedAt: String
+}
+
+# An organization a UserProfile.organizationId references. Created/managed only by SystemAdmin
+# admin APIs; a user joins one by setting organizationId to an existing org's id (validated
+# server-side). The internal `deleting` marker is never exposed here.
+type Organization {
+  organizationId: ID!
+  name: String!
+  createdAt: String!
+  updatedAt: String!
 }
 
 # A user-owned grouping for tasks (folder-like). PRIVATE to its owner: every category
@@ -395,49 +409,77 @@ input CreateMyUserProfileInput {
 }
 
 # Partial update of the signed-in caller's OWN profile. The owner is derived from the
-# Cognito identity — there is no userId. Only displayName and accessibilitySettings may be
-# changed here; userId, email, role, organizationId, defaultCategoryId, and timestamps are
-# not editable. Supply at least one field. displayName: omitted ⇒ unchanged; otherwise
-# trimmed and may not be empty/whitespace. accessibilitySettings: omitted ⇒ unchanged;
-# explicit null ⇒ cleared; a value ⇒ FULL replacement of the stored settings (never merged).
+# Cognito identity — there is no userId. userId, email, role, defaultCategoryId, and
+# timestamps are not editable. Supply at least one field. displayName: omitted ⇒ unchanged;
+# otherwise trimmed and may not be empty/whitespace. accessibilitySettings: omitted ⇒
+# unchanged; explicit null ⇒ cleared; a value ⇒ FULL replacement of the stored settings
+# (never merged). organizationId (MVP self-service org membership): omitted ⇒ unchanged; a
+# non-empty string sets it; explicit null clears it. Any signed-in user may change their own
+# organizationId for this MVP (no org-admin gating yet).
 input UpdateMyUserProfileInput {
   displayName: String
   accessibilitySettings: AWSJSON
+  organizationId: ID
 }
 
-input CreateSupportLinkInput {
-  supporterId: ID!
+# A SupportPerson selects a PRIMARY_USER in their OWN current organization to support. The
+# supporter is the authenticated caller (never client-supplied). Writes or restores the
+# SupportLink as ACTIVE. Only a SupportPerson may select; the target must be a PRIMARY_USER
+# currently in the caller's organization.
+input SelectPrimaryUserInput {
   primaryUserId: ID!
-  status: SupportLinkStatus
-  permissions: AWSJSON
 }
 
-# Create one of the caller's own categories. The owner is derived from the Cognito
-# identity — there is no ownerId. `name` may not be the reserved "No Category".
+# A SupportPerson un-selects a previously selected PRIMARY_USER. The supporter is the
+# authenticated caller. Soft-revokes the SupportLink (status REVOKED) — it is never hard
+# deleted, so re-selecting restores the original row.
+input UnselectPrimaryUserInput {
+  primaryUserId: ID!
+}
+
+# Create a category. `userId` is optional: omitted/null ⇒ the caller's own categories;
+# a non-self `userId` targets that primary user's categories and requires SupportPerson
+# delegated access (an ACTIVE SupportLink to that primary user in the same organization).
+# The created category is always owned by the target user. `name` may not be the reserved
+# "No Category".
 input CreateCategoryInput {
+  # Omitted/null ⇒ the caller. A non-self value requires SupportPerson delegated access.
+  userId: ID
   name: String!
   color: String
   sortOrder: Int
 }
 
-# Partial edit of one of the caller's own categories — at least one of name/color/
-# sortOrder is required. The default category's name cannot be changed (color/sortOrder
-# are allowed); a normal category cannot be renamed to the reserved "No Category".
+# Partial edit of a category — at least one of name/color/sortOrder is required. The default
+# category's name cannot be changed (color/sortOrder are allowed); a normal category cannot be
+# renamed to the reserved "No Category". `userId` is optional: omitted/null ⇒ the caller's own
+# category; a non-self `userId` targets that primary user's category and requires SupportPerson
+# delegated access.
 input UpdateCategoryInput {
+  # Omitted/null ⇒ the caller. A non-self value requires SupportPerson delegated access.
+  userId: ID
   categoryId: ID!
   name: String
   color: String
   sortOrder: Int
 }
 
-# Identifies one of the caller's own categories to delete. The default cannot be deleted.
+# Identifies a category to delete. The default cannot be deleted. `userId` is optional:
+# omitted/null ⇒ the caller's own category; a non-self `userId` targets that primary user's
+# category and requires SupportPerson delegated access.
 input DeleteCategoryInput {
+  # Omitted/null ⇒ the caller. A non-self value requires SupportPerson delegated access.
+  userId: ID
   categoryId: ID!
 }
 
-# The owner is derived from the Cognito identity — there is no ownerId. A Task is a reusable
-# template only: it carries no schedule (scheduling lives on TaskAssignment).
+# The target owner is resolved server-side: omitted/null `userId` ⇒ the caller; a non-self
+# `userId` targets that primary user and requires SupportPerson delegated access (an ACTIVE
+# SupportLink to a PRIMARY_USER in the same organization). No arbitrary ownerId is honored. A
+# Task is a reusable template only: it carries no schedule (scheduling lives on TaskAssignment).
 input CreateTaskInput {
+  # Omitted/null ⇒ the caller. A non-self value requires SupportPerson delegated access.
+  userId: ID
   title: String!
   # Optional. Omitted/null ⇒ the owner's default category. A blank string is rejected; a
   # supplied id must be a real, owned, non-deleting Category.
@@ -540,11 +582,14 @@ input TaskOrderInput {
   order: Int!
 }
 
-# Atomically reorder ALL of the caller's tasks. `tasks` must be the complete current set:
+# Atomically reorder ALL of a target owner's tasks. `tasks` must be the complete current set:
 # every owned taskId exactly once, with positive, mutually-unique `order` values (gaps
 # allowed — not required to be contiguous 1..N). Applied in one DynamoDB transaction
-# (all-or-nothing); only the `order` attribute changes. The owner is the Cognito identity.
+# (all-or-nothing); only the `order` attribute changes. Omitted/null `userId` ⇒ the caller; a
+# non-self value requires SupportPerson delegated access.
 input UpdateTaskOrderInput {
+  # Omitted/null ⇒ the caller. A non-self value requires SupportPerson delegated access.
+  userId: ID
   tasks: [TaskOrderInput!]!
 }
 
@@ -560,9 +605,13 @@ input DeleteTaskStepInput {
 # TaskInstance rows. ONE_TIME requires scheduledFor + timezone; RECURRING requires
 # scheduleRule + startDate + startTime + timezone (endDate optional). The RRULE's FREQ must be
 # DAILY/WEEKLY/MONTHLY/YEARLY — a missing FREQ or HOURLY/MINUTELY/SECONDLY is rejected.
+# Authorization: the caller must own the referenced Task template, and may only target a userId
+# that is themselves OR a primary user they have actively selected (SupportPerson delegation).
 input CreateTaskAssignmentInput {
   taskId: ID!
   userId: ID!
+  # DEPRECATED/IGNORED — assignedBy is always derived from the caller's identity (event sub),
+  # never trusted from input. Retained only so older clients don't break.
   assignedBy: ID
   scheduleType: TaskAssignmentScheduleType!
   scheduledFor: String
@@ -642,13 +691,16 @@ input DeleteTaskAssignmentInput {
 }
 
 # Register an uploaded object's metadata. The asset is created UNATTACHED — it is bound
-# to a step only via updateTaskStep(media), or used as a cover via the cover flow.
+# to a step only via updateTaskStep(media), or used as a cover via the cover flow. The asset
+# owner is derived from the task's authoritative ownerId (a delegated SupportPerson stores the
+# primary user as owner), so a client-supplied ownerId is ignored.
 input CreateMediaAssetInput {
   taskId: ID!
   s3Key: String!
   type: MediaType!
   mimeType: String!
-  ownerId: ID!
+  # Deprecated/ignored — the owner is derived from the task, never trusted from the client.
+  ownerId: ID
   size: Int
 }
 
@@ -704,6 +756,38 @@ input AdminDeleteUserInput {
   disableFirst: Boolean = true
 }
 
+# ─── Admin organization inputs (SystemAdmin-only) ─────────────────────────────--
+
+input CreateOrganizationInput {
+  name: String!
+}
+
+input UpdateOrganizationInput {
+  organizationId: ID!
+  name: String!
+}
+
+input DeleteOrganizationInput {
+  organizationId: ID!
+}
+
+# Admin sets/clears ANOTHER user's org membership (SystemAdmin-only; distinct from the self-only
+# updateMyUserProfile). organizationId: a non-null id joins that org (must exist and not be
+# deleting); explicit null clears membership. The resolver rejects omitted organizationId because
+# GraphQL input objects cannot express "nullable but required". OrganizationMember rows are kept in
+# step atomically.
+input AdminSetUserOrganizationInput {
+  userId: ID!
+  organizationId: ID
+}
+
+# Result of adminDeleteOrganization: the removed organization plus how many member
+# UserProfiles had their organizationId reference cleared.
+type AdminDeleteOrganizationResult {
+  organization: Organization!
+  removedUsers: Int!
+}
+
 # AI step generation
 input QueryContext {
   role: String
@@ -723,6 +807,11 @@ input GenerateTaskStepsInput {
 
 type UserProfileConnection {
   items: [UserProfile!]!
+  nextToken: String
+}
+
+type OrganizationConnection {
+  items: [Organization!]!
   nextToken: String
 }
 
@@ -792,17 +881,33 @@ type Query {
   healthCheck: String! @aws_api_key @aws_cognito_user_pools
 
   getUserProfile(userId: ID!): UserProfile
-  listUsersByOrganization(organizationId: ID!, limit: Int, nextToken: String): UserProfileConnection!
-  listPrimaryUsersBySupporter(supporterId: ID!, limit: Int, nextToken: String): SupportLinkConnection!
 
-  # The authenticated caller's own categories (owner derived from the Cognito identity).
-  listMyCategories(limit: Int, nextToken: String): CategoryConnection!
+  # The roster of users in the AUTHENTICATED caller's OWN current organization (orgIndex
+  # projection: userId, displayName, role). The organization is taken from the caller's
+  # profile — there is no organizationId argument, so a caller can only ever see their own
+  # org. A SupportPerson uses this to find PRIMARY_USERs they may select. Errors with
+  # VALIDATION if the caller has no current organization.
+  listMyOrganizationUsers(limit: Int, nextToken: String): UserProfileConnection!
+  # The AUTHENTICATED caller's OWN support list — every primary user they have selected
+  # (supporterIndex, keyed on the caller's sub). Includes ACTIVE and REVOKED links.
+  listMySupportList(limit: Int, nextToken: String): SupportLinkConnection!
 
+  # Categories for a user. `userId` is optional: omitted/null ⇒ the authenticated caller's own
+  # categories; a non-self `userId` lists that primary user's categories and requires SupportPerson
+  # delegated access (an ACTIVE SupportLink to that primary user in the same organization).
+  listMyCategories(userId: ID, limit: Int, nextToken: String): CategoryConnection!
+
+  # Read a task template. The owner may read; a SupportPerson with delegated access to the
+  # owner may read; and a user holding an ACTIVE assignment referencing the task may read it
+  # (read-only). Non-readers get NOT_AUTHORIZED.
   getTask(taskId: ID!): Task
-  # A task's steps, sorted by ascending numeric `order`.
+  # A task's steps, sorted by ascending numeric `order`. Same read access as getTask.
   listTaskSteps(taskId: ID!, limit: Int, nextToken: String): TaskStepConnection!
+  # An owner's tasks. `ownerId` is the caller's own id, or a primary user's id when the caller
+  # is a SupportPerson with delegated access to that primary user.
   listTasksByOwner(ownerId: ID!, limit: Int, nextToken: String): TaskConnection!
-  # Tasks in one of an owner's real categories. categoryId is required.
+  # Tasks in one of an owner's real categories (categoryId required). Same access as
+  # listTasksByOwner: self, or delegated SupportPerson access to the owner.
   listTasksByCategory(ownerId: ID!, categoryId: ID!, limit: Int, nextToken: String): TaskConnection!
 
   # A user's schedule rules (active + ended).
@@ -844,6 +949,14 @@ type Query {
   # support links) for the admin user-detail view. PK queries + GSIs only (no Scan).
   adminGetUserData(userId: ID!): AdminUserData!
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Every Organization, newest-first (entityTypeIndex; no Scan), paginated.
+  listAllOrganizations(limit: Int, nextToken: String): OrganizationConnection!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # The members of ONE organization: pages the strongly-consistent OrganizationMember rows under
+  # the org partition (PK = ORG#<id>, SK begins_with MEMBER#; no Scan) and returns their
+  # UserProfiles. A membership row whose profile is missing is skipped. Paginated by nextToken.
+  adminListOrganizationUsers(organizationId: ID!, limit: Int, nextToken: String): UserProfileConnection!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 }
 
 type Mutation {
@@ -851,49 +964,66 @@ type Mutation {
   # from the Cognito session (role derived from group membership), not the input.
   createUserProfile(input: CreateMyUserProfileInput!): UserProfile
   # Partial update of the caller's OWN profile (owner derived from the Cognito identity).
-  # Only displayName and accessibilitySettings are editable; accessibilitySettings is a full
-  # replacement, not a merge. Errors (NotFound) if the profile doesn't exist — it never
-  # creates one. organizationId, role, email, etc. cannot be changed here.
+  # displayName, accessibilitySettings, and organizationId are editable (accessibilitySettings
+  # is a full replacement, not a merge; organizationId: omitted ⇒ unchanged, value ⇒ set, null
+  # ⇒ clear). Errors (NotFound) if the profile doesn't exist — it never creates one. role,
+  # email, defaultCategoryId, and timestamps cannot be changed here.
   updateMyUserProfile(input: UpdateMyUserProfileInput!): UserProfile!
-  createSupportLink(input: CreateSupportLinkInput!): SupportLink
+  # A SupportPerson selects a PRIMARY_USER in their own organization (writes/restores the
+  # SupportLink as ACTIVE). Supporter = the authenticated caller. Only a SupportPerson may
+  # call this; the target must be a PRIMARY_USER currently in the caller's organization.
+  selectPrimaryUser(input: SelectPrimaryUserInput!): SupportLink!
+  # A SupportPerson un-selects a previously selected primary user — soft-revokes the
+  # SupportLink (status REVOKED), never a hard delete. Supporter = the authenticated caller.
+  unselectPrimaryUser(input: UnselectPrimaryUserInput!): SupportLink!
 
-  # Create one of the caller's own task categories (owner derived from identity).
+  # Create a task category. By default the caller's own; a non-self `input.userId` creates it
+  # for that primary user and requires SupportPerson delegated access.
   createCategory(input: CreateCategoryInput!): Category
-  # Edit one of the caller's own categories (partial update). The default category's name
-  # is immutable; normal categories cannot take the reserved "No Category" name.
+  # Edit a category (partial update). By default the caller's own; a non-self `input.userId`
+  # targets that primary user's category (SupportPerson delegated access). The default
+  # category's name is immutable; normal categories cannot take the reserved "No Category" name.
   updateCategory(input: UpdateCategoryInput!): Category!
-  # Delete one of the caller's own NON-default categories. Every task in it is first moved
-  # to the owner's default category, then the category row is removed. Internally this may
-  # run across multiple batches for large categories; it is safe to retry. Returns the
-  # deleted category. The default category cannot be deleted.
+  # Delete a NON-default category. By default the caller's own; a non-self `input.userId`
+  # targets that primary user's category (SupportPerson delegated access). Every task in it is
+  # first moved to the target user's default category, then the category row is removed.
+  # Internally this may run across multiple batches for large categories; it is safe to retry.
+  # Returns the deleted category. The default category cannot be deleted.
   deleteCategory(input: DeleteCategoryInput!): Category!
 
-  # Create a reusable task template (and optionally its ordered steps).
+  # Create a reusable task template (and optionally its ordered steps). By default owned by the
+  # caller; a non-self `input.userId` creates it under that primary user and requires
+  # SupportPerson delegated access.
   createTask(input: CreateTaskInput!): Task
   # Generate a titled, stepped task PREVIEW from one request. Citations are available on
   # each returned step when requested. Nothing is persisted — the caller saves it later via
   # createTask if they keep it.
   createAiTask(input: CreateAiTaskInput!): GeneratedAiTask!
-  # Edit an existing task template's fields (partial update). Errors if not found.
+  # Edit an existing task template's fields (partial update). Errors if not found. Authorized
+  # against the task's owner: the owner, or a SupportPerson with delegated access to the owner.
   updateTask(input: UpdateTaskInput!): Task
+  # Append a step to a task. Authorized against the task's owner (owner or delegated SupportPerson).
   createTaskStep(input: CreateTaskStepInput!): TaskStep
   # Partial edit of one TaskStep: text, description, and/or type-specific media slots.
-  # A step may have one IMAGE, one AUDIO, and one VIDEO asset. Errors if not found.
+  # A step may have one IMAGE, one AUDIO, and one VIDEO asset. Errors if not found. Authorized
+  # against the task's owner (owner or delegated SupportPerson).
   updateTaskStep(input: UpdateTaskStepInput!): TaskStep
   # Delete one TaskStep and every attached media asset (metadata rows + S3 objects), if any.
-  # Existing TaskInstanceStep snapshots are unaffected. Returns the deleted TaskStep.
+  # Existing TaskInstanceStep snapshots are unaffected. Returns the deleted TaskStep. Authorized
+  # against the task's owner (owner or delegated SupportPerson).
   deleteTaskStep(input: DeleteTaskStepInput!): TaskStep
   # Atomically reorder ALL of a task's steps (must supply the complete current set).
   # Returns the steps sorted by ascending order. Step ids, media, and assignments are
-  # untouched.
+  # untouched. Authorized against the task's owner (owner or delegated SupportPerson).
   reorderTaskSteps(input: ReorderTaskStepsInput!): [TaskStep!]!
-  # Atomically reorder ALL of the caller's tasks (must supply the complete current set with
-  # positive, unique orders). Returns the tasks sorted by ascending order. The owner is taken
-  # from the Cognito identity, never the input.
+  # Atomically reorder ALL of a target owner's tasks (must supply the complete current set with
+  # positive, unique orders). Returns the tasks sorted by ascending order. Omitted/null
+  # `input.userId` ⇒ the caller; a non-self value requires SupportPerson delegated access.
   updateTaskOrder(input: UpdateTaskOrderInput!): [Task!]!
   # Delete a task template and all of its TaskSteps. REJECTED while any active TaskAssignment
   # still references it (end/delete those first). TaskInstance/TaskInstanceStep snapshots under
-  # USER# partitions are not touched. Returns the deleted Task.
+  # USER# partitions are not touched. Returns the deleted Task. Authorized against the task's
+  # owner (owner or delegated SupportPerson).
   deleteTask(taskId: ID!): Task
 
   # Create a schedule rule binding a task to a user. Validates the task exists; creates no
@@ -924,16 +1054,20 @@ type Mutation {
   deleteTaskAssignment(input: DeleteTaskAssignmentInput!): TaskAssignment!
 
   # Mint a presigned S3 upload URL; the client uploads the file, then calls
-  # createMediaAsset with the returned s3Key to register the metadata.
+  # createMediaAsset with the returned s3Key to register the metadata. Authorized against the
+  # task's owner (owner or delegated SupportPerson).
   createMediaUploadUrl(input: CreateMediaUploadUrlInput!): MediaUploadTarget
+  # Register uploaded media under a task. Authorized against the task's owner (owner or delegated
+  # SupportPerson); the stored asset owner is the task's owner, never a client-supplied ownerId.
   createMediaAsset(input: CreateMediaAssetInput!): MediaAsset
   # Mint a presigned PUT URL + temporary pending s3Key for a task cover image. Reject
-  # non-image content types. Pass the returned s3Key as coverImageS3Key to createTask/
-  # updateTask, which verifies and promotes the upload to a task-owned MediaAsset.
+  # non-image content types. Authenticated-only (no task exists yet); the upload is promoted to a
+  # task-owned MediaAsset by createTask/updateTask, which authorize the target owner.
   createTaskCoverImageUploadUrl(input: CreateTaskCoverImageUploadUrlInput!): MediaUploadTarget!
   # Delete one MediaAsset: its S3 binary and metadata row, plus a Task cover back-reference
   # when applicable. Step media is resolved through MediaAsset.stepId. Returns
   # the deleted asset; NotFound if it doesn't exist. Does not delete the Task or its steps.
+  # Authorized against the task's owner (owner or delegated SupportPerson).
   deleteMediaAsset(input: DeleteMediaAssetInput!): MediaAsset
 
   # Break a daily-living task into ordered, source-cited steps via Bedrock KB + RAG.
@@ -965,6 +1099,27 @@ type Mutation {
   # Fully delete a user: owned tasks, their USER# partition rows, SupportLinks (both sides),
   # and the Cognito login (last). Deleting yourself is rejected.
   adminDeleteUser(input: AdminDeleteUserInput!): AdminDeleteUserResult!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+
+  # ─── Admin organization management (SystemAdmin-only) ────────────────────────
+  # Create an Organization. name is required (trimmed, non-empty); organizationId is generated.
+  adminCreateOrganization(input: CreateOrganizationInput!): Organization!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Rename an Organization. NotFound if it doesn't exist; rejected while it is being deleted.
+  adminUpdateOrganization(input: UpdateOrganizationInput!): Organization!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Delete an Organization: mark it deleting, then detach every member found via the
+  # strongly-consistent OrganizationMember rows under the org partition (ConsistentRead query,
+  # paginated — no Scan; NOT the eventually-consistent orgIndex), clearing each member's
+  # organizationId and deleting the membership row together, then delete the org row last.
+  # Idempotent/retryable.
+  adminDeleteOrganization(input: DeleteOrganizationInput!): AdminDeleteOrganizationResult!
+    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  # Set or clear ANOTHER user's organization membership (SystemAdmin-only; updateMyUserProfile is
+  # self-only). A non-null organizationId joins that org (verified to exist and not be deleting) and
+  # writes the new OrganizationMember row (deleting the old one on a move); null clears membership
+  # and deletes the old row. Both happen in one transaction. Returns the updated UserProfile.
+  adminSetUserOrganization(input: AdminSetUserOrganizationInput!): UserProfile!
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 }
 

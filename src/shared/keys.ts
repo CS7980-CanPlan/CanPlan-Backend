@@ -9,6 +9,11 @@ export const ENTITY = {
   USER_PROFILE: 'UserProfile',
   SUPPORT_LINK: 'SupportLink',
   ORGANIZATION: 'Organization',
+  // A strongly-consistent membership row under an org's partition (PK = ORG#<id>,
+  // SK = MEMBER#<userId>). It is the source of truth for org membership that
+  // adminDeleteOrganization reads with a consistent Query — the orgIndex GSI is only
+  // eventually consistent, so it cannot safely prove a just-joined member has been detached.
+  ORGANIZATION_MEMBER: 'OrganizationMember',
   CATEGORY: 'Category',
   TASK: 'Task',
   TASK_STEP: 'TaskStep',
@@ -53,6 +58,10 @@ export const META_SK = '#META';
 
 // ── Sort-key prefixes (for begins_with queries) ──────────────────────────────
 export const CATEGORY_PREFIX = 'CATEGORY#';
+// OrganizationMember rows under an org partition (PK = ORG#<organizationId>). A
+// begins_with(SK, 'MEMBER#') query lists exactly one org's members (the #META row starts
+// with '#', so it never collides with this prefix).
+export const ORG_MEMBER_PREFIX = 'MEMBER#';
 export const STEP_PREFIX = 'STEP#';
 // TaskAssignment rows (the schedule rule for a (user, task)), under USER#<userId>.
 export const TASK_ASSIGNMENT_PREFIX = 'TASK_ASSIGNMENT#';
@@ -92,6 +101,10 @@ export const userPk = (userId: string): string => `USER#${userId}`;
 export const supporterPk = (supporterId: string): string => `SUPPORTER#${supporterId}`;
 export const taskPk = (taskId: string): string => `TASK#${taskId}`;
 export const reportPk = (reportId: string): string => `REPORT#${reportId}`;
+/** Organization #META row — PK = ORG#<organizationId>, SK = #META (entityType = Organization). */
+export const organizationPk = (organizationId: string): string => `ORG#${organizationId}`;
+/** OrganizationMember SK — one row per member under the org partition (PK = ORG#<organizationId>). */
+export const organizationMemberSk = (userId: string): string => `${ORG_MEMBER_PREFIX}${userId}`;
 
 // ── GSI partition keys (denormalized onto items at write time) ────────────────
 /**

@@ -3,8 +3,9 @@
 // A Task owns child rows (its #META anchor, every TaskStep, and every MediaAsset — cover
 // image, step media, and task-level media) plus each MediaAsset's S3 binary. Removing all
 // of that consistently is non-trivial, so the cascade lives here as the single source of
-// truth used by BOTH the owner-scoped `deleteTask` (after an ownership check) and the
-// SystemAdmin `adminDeleteTask` / full-user-deletion paths (no ownership check).
+// truth used by BOTH the user-facing `deleteTask` (after a manage-access check — owner or
+// delegated SupportPerson) and the SystemAdmin `adminDeleteTask` / full-user-deletion paths
+// (no access check).
 //
 // Deletion strategy & consistency (unchanged from the original owner deleteTask): a
 // DynamoDB transaction is capped at 100 items, so a task with >99 children cannot be

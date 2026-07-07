@@ -1,6 +1,5 @@
 import { handler } from './handler';
 import { dynamo } from '../../shared/dynamodb';
-import { encodeNextToken } from '../../shared/pagination';
 import type { Connection } from '../../shared/types';
 
 jest.mock('../../shared/dynamodb', () => ({
@@ -9,6 +8,8 @@ jest.mock('../../shared/dynamodb', () => ({
 }));
 
 const mockSend = dynamo.send as jest.Mock;
+
+type Rec = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any -- loose transact-item mock helpers
 
 beforeEach(() => mockSend.mockResolvedValue({}));
 afterEach(() => jest.clearAllMocks());
@@ -31,18 +32,30 @@ const caller = (groups: string[], sub = 'cognito-sub-1', email = 'me@example.com
 const lastInput = () => mockSend.mock.calls[0][0].input;
 
 // createUserProfile reads the existing profile first, then (first-time) writes the profile
-// + its default category atomically. Pull items out of the TransactWrite the handler made.
+// + its default category atomically. Pull the Put items out of the TransactWrite the handler
+// made (non-Put items, e.g. an org ConditionCheck, carry no `Put.Item` and are skipped).
+const txRaw = (callIndex: number) => mockSend.mock.calls[callIndex][0].input.TransactItems;
 const txItemsAt = (callIndex: number) =>
-  mockSend.mock.calls[callIndex][0].input.TransactItems.map(
-    (t: { Put: { Item: Record<string, unknown> } }) => t.Put.Item,
-  );
+  txRaw(callIndex)
+    .map((t: { Put?: { Item?: Record<string, unknown> } }) => t.Put?.Item)
+    .filter(Boolean);
 const profileItemAt = (callIndex = 1) =>
   txItemsAt(callIndex).find((i: Record<string, unknown>) => i.SK === '#PROFILE');
 const categoryItemAt = (callIndex = 1) =>
   txItemsAt(callIndex).find((i: Record<string, unknown>) => String(i.SK).startsWith('CATEGORY#'));
+// The OrganizationMember Put item written alongside a profile that sets organizationId.
+const memberItemAt = (callIndex: number) =>
+  txItemsAt(callIndex).find((i: Record<string, unknown>) => String(i.SK).startsWith('MEMBER#'));
 
 describe('users handler — UserProfile', () => {
+  /** An existing, non-deleting Organization row (the assertUsableOrganization GET). */
+  const orgItem = (organizationId = 'org-1') => ({
+    Item: { organizationId, name: 'Acme', createdAt: 'c', updatedAt: 'u' },
+  });
+
   it('createUserProfile derives userId from the Cognito sub, role from group, email from the claim', async () => {
+    // organizationId references a real org now: the first call is the org existence check.
+    mockSend.mockResolvedValueOnce(orgItem('org-1'));
     await handler(
       event(
         'createUserProfile',
@@ -50,7 +63,8 @@ describe('users handler — UserProfile', () => {
         caller(['PrimaryUser'], 'sub-123', 'sam@example.com'),
       ),
     );
-    const profile = profileItemAt();
+    // calls: [0] org GET, [1] getProfile, [2] TransactWrite.
+    const profile = profileItemAt(2);
     expect(profile.PK).toBe('USER#sub-123');
     expect(profile.SK).toBe('#PROFILE');
     expect(profile.entityType).toBe('UserProfile');
@@ -61,6 +75,139 @@ describe('users handler — UserProfile', () => {
     expect(profile.displayName).toBe('Sam');
     expect(profile.organizationId).toBe('org-1');
     expect(typeof profile.defaultCategoryId).toBe('string');
+    // The transaction ATOMICALLY re-checks the org still exists + isn't deleting.
+    const orgCheck = txRaw(2).find((t: Rec) => t.ConditionCheck);
+    expect(orgCheck.ConditionCheck.Key).toEqual({ PK: 'ORG#org-1', SK: '#META' });
+    expect(orgCheck.ConditionCheck.ConditionExpression).toBe(
+      'attribute_exists(PK) AND attribute_not_exists(deleting)',
+    );
+    // …and writes the strongly-consistent OrganizationMember row in the SAME transaction.
+    const member = memberItemAt(2);
+    expect(member.PK).toBe('ORG#org-1');
+    expect(member.SK).toBe('MEMBER#sub-123');
+    expect(member.entityType).toBe('OrganizationMember');
+    expect(member.organizationId).toBe('org-1');
+    expect(member.userId).toBe('sub-123');
+  });
+
+  it('createUserProfile without an organizationId includes NO org ConditionCheck', async () => {
+    await handler(
+      event('createUserProfile', { input: { displayName: 'Sam' } }, caller(['PrimaryUser'], 'sub-1')),
+    );
+    // calls: [0] getProfile, [1] TransactWrite (profile + category only — no org check, no member).
+    expect(txRaw(1).some((t: Rec) => t.ConditionCheck)).toBe(false);
+    expect(memberItemAt(1)).toBeUndefined();
+    expect(txRaw(1)).toHaveLength(2);
+  });
+
+  it('createUserProfile surfaces a clear error when the org is deleted mid-transaction (race)', async () => {
+    // Pre-read passes, but the transaction's org ConditionCheck (index 2) is canceled.
+    mockSend
+      .mockResolvedValueOnce(orgItem('org-1')) // pre-read: org exists
+      .mockResolvedValueOnce({}) // getProfile: none yet
+      .mockRejectedValueOnce(
+        Object.assign(new Error('canceled'), {
+          name: 'TransactionCanceledException',
+          CancellationReasons: [{ Code: 'None' }, { Code: 'None' }, { Code: 'ConditionalCheckFailed' }],
+        }),
+      );
+    await expect(
+      handler(
+        event('createUserProfile', { input: { displayName: 'Sam', organizationId: 'org-1' } }, caller(['PrimaryUser'], 'sub-1')),
+      ),
+    ).rejects.toThrow('organization org-1 is no longer available');
+  });
+
+  it('createUserProfile re-call setting an org uses a transaction with an org ConditionCheck (putProfile path)', async () => {
+    mockSend
+      .mockResolvedValueOnce(orgItem('org-1')) // resolveCreateOrganization pre-read
+      .mockResolvedValueOnce({ Item: { userId: 'sub-1', defaultCategoryId: 'def-1', createdAt: 'orig' } }) // getProfile (existing)
+      .mockResolvedValueOnce({ Item: { categoryId: 'def-1', ownerId: 'sub-1', isDefault: true, name: 'No Category' } }); // default category validation
+    await handler(
+      event('createUserProfile', { input: { displayName: 'Sam', organizationId: 'org-1' } }, caller(['PrimaryUser'], 'sub-1')),
+    );
+    // calls: [0] org pre-read, [1] getProfile, [2] default-category validation, [3] the putProfile write.
+    const tx = mockSend.mock.calls[3][0];
+    expect(tx.constructor.name).toBe('TransactWriteCommand');
+    const items = tx.input.TransactItems;
+    expect(items.find((t: Rec) => t.Put?.Item?.SK === '#PROFILE')).toBeTruthy();
+    const orgCheck = items.find((t: Rec) => t.ConditionCheck).ConditionCheck;
+    expect(orgCheck.Key).toEqual({ PK: 'ORG#org-1', SK: '#META' });
+    expect(orgCheck.ConditionExpression).toBe('attribute_exists(PK) AND attribute_not_exists(deleting)');
+    // The membership row is written in the same putProfile transaction.
+    const member = items.find((t: Rec) => String(t.Put?.Item?.SK).startsWith('MEMBER#')).Put.Item;
+    expect(member.PK).toBe('ORG#org-1');
+    expect(member.SK).toBe('MEMBER#sub-1');
+    expect(member.entityType).toBe('OrganizationMember');
+  });
+
+  it('createUserProfile re-call MOVING orgs deletes the previous OrganizationMember row (putProfile path)', async () => {
+    mockSend
+      .mockResolvedValueOnce(orgItem('org-2')) // resolveCreateOrganization pre-read (new org)
+      .mockResolvedValueOnce({ Item: { userId: 'sub-1', defaultCategoryId: 'def-1', createdAt: 'orig', organizationId: 'org-1' } }) // existing profile in org-1
+      .mockResolvedValueOnce({ Item: { categoryId: 'def-1', ownerId: 'sub-1', isDefault: true, name: 'No Category' } }); // default category validation
+    await handler(
+      event('createUserProfile', { input: { displayName: 'Sam', organizationId: 'org-2' } }, caller(['PrimaryUser'], 'sub-1')),
+    );
+    // call[3] = putProfile TransactWrite.
+    const items = mockSend.mock.calls[3][0].input.TransactItems;
+    // New membership row for org-2 …
+    const put = items.find((t: Rec) => String(t.Put?.Item?.SK).startsWith('MEMBER#')).Put.Item;
+    expect(put.PK).toBe('ORG#org-2');
+    expect(put.SK).toBe('MEMBER#sub-1');
+    // … and the stale org-1 membership row is deleted.
+    const del = items.find((t: Rec) => t.Delete).Delete;
+    expect(del.Key).toEqual({ PK: 'ORG#org-1', SK: 'MEMBER#sub-1' });
+  });
+
+  it('createUserProfile re-call WITHOUT an org clears the profile org and deletes the old membership row (putProfile path)', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { userId: 'sub-1', defaultCategoryId: 'def-1', createdAt: 'orig', organizationId: 'org-1' } }) // existing profile in org-1
+      .mockResolvedValueOnce({ Item: { categoryId: 'def-1', ownerId: 'sub-1', isDefault: true, name: 'No Category' } }); // default category validation
+    await handler(
+      event('createUserProfile', { input: { displayName: 'Sam' } }, caller(['PrimaryUser'], 'sub-1')),
+    );
+    // No org input ⇒ no org pre-read. calls: [0] getProfile, [1] category validation, [2] putProfile write.
+    const write = mockSend.mock.calls[2][0];
+    expect(write.constructor.name).toBe('TransactWriteCommand');
+    const items = write.input.TransactItems;
+    // The profile is Put (org cleared) and the old membership row deleted — no org check, no member Put.
+    expect(items.find((t: Rec) => t.Put?.Item?.SK === '#PROFILE')).toBeTruthy();
+    const del = items.find((t: Rec) => t.Delete).Delete;
+    expect(del.Key).toEqual({ PK: 'ORG#org-1', SK: 'MEMBER#sub-1' });
+    expect(items.some((t: Rec) => t.ConditionCheck)).toBe(false);
+    expect(items.some((t: Rec) => String(t.Put?.Item?.SK).startsWith('MEMBER#'))).toBe(false);
+  });
+
+  it('createUserProfile rejects a non-existent organizationId (NotFound), writing nothing', async () => {
+    mockSend.mockResolvedValueOnce({}); // org GET → no Item
+    await expect(
+      handler(
+        event('createUserProfile', { input: { displayName: 'Sam', organizationId: 'gone' } }, caller(['PrimaryUser'], 'sub-1')),
+      ),
+    ).rejects.toThrow('organization gone not found');
+    // Only the org existence check ran — no profile/category write.
+    expect(mockSend.mock.calls.some((c) => c[0].input.TransactItems)).toBe(false);
+  });
+
+  it('createUserProfile rejects a deleting organizationId (VALIDATION)', async () => {
+    mockSend.mockResolvedValueOnce({
+      Item: { organizationId: 'org-x', name: 'X', deleting: true, createdAt: 'c', updatedAt: 'u' },
+    });
+    await expect(
+      handler(
+        event('createUserProfile', { input: { displayName: 'Sam', organizationId: 'org-x' } }, caller(['PrimaryUser'], 'sub-1')),
+      ),
+    ).rejects.toThrow('being deleted');
+  });
+
+  it('createUserProfile rejects a blank organizationId before any read', async () => {
+    await expect(
+      handler(
+        event('createUserProfile', { input: { displayName: 'Sam', organizationId: '   ' } }, caller(['PrimaryUser'], 'sub-1')),
+      ),
+    ).rejects.toThrow('organizationId cannot be empty');
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
   it('createUserProfile creates exactly one real default "No Category" atomically with the profile', async () => {
@@ -230,31 +377,6 @@ describe('users handler — UserProfile', () => {
     expect(result).toBeNull();
   });
 
-  it('listUsersByOrganization queries the orgIndex by organizationId and returns a connection', async () => {
-    mockSend.mockResolvedValueOnce({ Items: [{ userId: 'u1', role: 'PRIMARY_USER' }] });
-    const result = (await handler(
-      event('listUsersByOrganization', { organizationId: 'org-1' }),
-    )) as Connection<unknown>;
-    expect(lastInput().IndexName).toBe('orgIndex');
-    expect(lastInput().ExpressionAttributeValues).toEqual({ ':org': 'org-1' });
-    expect(result.items).toHaveLength(1);
-    expect(result.nextToken).toBeNull();
-  });
-
-  it('listUsersByOrganization forwards limit and decodes nextToken into ExclusiveStartKey', async () => {
-    const startKey = { organizationId: 'org-1', userId: 'u0', PK: 'USER#u0', SK: '#PROFILE' };
-    mockSend.mockResolvedValueOnce({ Items: [], LastEvaluatedKey: startKey });
-    const result = (await handler(
-      event('listUsersByOrganization', {
-        organizationId: 'org-1',
-        limit: 10,
-        nextToken: encodeNextToken(startKey)!,
-      }),
-    )) as Connection<unknown>;
-    expect(lastInput().Limit).toBe(10);
-    expect(lastInput().ExclusiveStartKey).toEqual(startKey);
-    expect(result.nextToken).not.toBeNull(); // LastEvaluatedKey present → another page
-  });
 });
 
 describe('users handler — updateMyUserProfile', () => {
@@ -336,7 +458,7 @@ describe('users handler — updateMyUserProfile', () => {
   it('rejects an empty input (no editable field supplied)', async () => {
     await expect(
       handler(event('updateMyUserProfile', { input: {} }, caller(['PrimaryUser'], 'sub-1'))),
-    ).rejects.toThrow('at least one of displayName or accessibilitySettings');
+    ).rejects.toThrow('at least one of displayName, accessibilitySettings, or organizationId');
     expect(mockSend).not.toHaveBeenCalled();
   });
 
@@ -395,17 +517,17 @@ describe('users handler — updateMyUserProfile', () => {
     expect(lastInput().Key).toEqual({ PK: 'USER#sub-me', SK: '#PROFILE' });
   });
 
-  it('never changes organizationId, role, email, defaultCategoryId, or createdAt', async () => {
+  it('never changes role, email, defaultCategoryId, or createdAt', async () => {
     mockSend.mockResolvedValueOnce({ Attributes: storedProfile({ displayName: 'New name' }) });
     await handler(
       event(
         'updateMyUserProfile',
         {
           // An attacker tries to slip protected fields into the input — they are not part
-          // of the input type and must never appear in the write expression.
+          // of the input type and must never appear in the write expression. (organizationId
+          // IS editable now and is covered separately below.)
           input: {
             displayName: 'New name',
-            organizationId: 'evil-org',
             role: 'ORG_ADMIN',
             email: 'evil@example.com',
             defaultCategoryId: 'evil-cat',
@@ -419,48 +541,351 @@ describe('users handler — updateMyUserProfile', () => {
     const cmd = lastInput();
     // Only updatedAt + displayName are written; no protected field appears.
     expect(cmd.UpdateExpression).toBe('SET updatedAt = :now, displayName = :displayName');
-    for (const field of ['organizationId', 'role', 'email', 'defaultCategoryId', 'createdAt']) {
+    for (const field of ['role', 'email', 'defaultCategoryId', 'createdAt']) {
       expect(cmd.UpdateExpression).not.toContain(field);
       expect(cmd.ExpressionAttributeValues[`:${field}`]).toBeUndefined();
     }
   });
+
+  it('sets organizationId via a transaction (profile update + org check + member put), reading first + back', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { organizationId: 'org-2', name: 'Acme', createdAt: 'c', updatedAt: 'u' } }) // assertUsableOrganization
+      .mockResolvedValueOnce({ Item: storedProfile({ organizationId: undefined }) }) // profile pre-read (no current org)
+      .mockResolvedValueOnce({}) // TransactWrite (returns no attributes)
+      .mockResolvedValueOnce({ Item: storedProfile({ organizationId: 'org-2' }) }); // getProfile read-back
+    const result = (await handler(
+      event('updateMyUserProfile', { input: { organizationId: '  org-2  ' } }, caller(['PrimaryUser'], 'sub-1')),
+    )) as unknown as Record<string, unknown>;
+
+    // calls: [0] org GET, [1] profile pre-read, [2] TransactWrite, [3] read-back GET.
+    const tx = mockSend.mock.calls[2][0];
+    expect(tx.constructor.name).toBe('TransactWriteCommand');
+    const items = tx.input.TransactItems;
+    const update = items.find((t: Rec) => t.Update).Update;
+    expect(update.Key).toEqual({ PK: 'USER#sub-1', SK: '#PROFILE' });
+    expect(update.UpdateExpression).toBe('SET updatedAt = :now, organizationId = :organizationId');
+    expect(update.ExpressionAttributeValues[':organizationId']).toBe('org-2'); // trimmed
+    expect(update.ConditionExpression).toBe('attribute_exists(PK)');
+    // The org existence/not-deleting check rides in the SAME transaction (item index 1).
+    const orgCheck = items.find((t: Rec) => t.ConditionCheck).ConditionCheck;
+    expect(orgCheck.Key).toEqual({ PK: 'ORG#org-2', SK: '#META' });
+    expect(orgCheck.ConditionExpression).toBe('attribute_exists(PK) AND attribute_not_exists(deleting)');
+    // …as does the new OrganizationMember row.
+    const member = items.find((t: Rec) => t.Put).Put.Item;
+    expect(member.PK).toBe('ORG#org-2');
+    expect(member.SK).toBe('MEMBER#sub-1');
+    expect(member.entityType).toBe('OrganizationMember');
+    // No previous org → no membership Delete.
+    expect(items.some((t: Rec) => t.Delete)).toBe(false);
+    // The returned profile is the read-back, stripped of storage attributes.
+    expect(result.organizationId).toBe('org-2');
+    expect(result.PK).toBeUndefined();
+  });
+
+  it('moving organizations deletes the previous OrganizationMember row in the same transaction', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { organizationId: 'org-2', name: 'Acme', createdAt: 'c', updatedAt: 'u' } }) // assertUsableOrganization
+      .mockResolvedValueOnce({ Item: storedProfile({ organizationId: 'org-1' }) }) // pre-read: currently in org-1
+      .mockResolvedValueOnce({}) // TransactWrite
+      .mockResolvedValueOnce({ Item: storedProfile({ organizationId: 'org-2' }) }); // read-back
+    await handler(
+      event('updateMyUserProfile', { input: { organizationId: 'org-2' } }, caller(['PrimaryUser'], 'sub-1')),
+    );
+    const items = mockSend.mock.calls[2][0].input.TransactItems;
+    // New membership row for org-2 is put …
+    const put = items.find((t: Rec) => t.Put).Put.Item;
+    expect(put.PK).toBe('ORG#org-2');
+    expect(put.SK).toBe('MEMBER#sub-1');
+    // … and the stale org-1 membership row is deleted.
+    const del = items.find((t: Rec) => t.Delete).Delete;
+    expect(del.Key).toEqual({ PK: 'ORG#org-1', SK: 'MEMBER#sub-1' });
+  });
+
+  it('rejects setting organizationId to a non-existent org (NotFound), writing nothing', async () => {
+    mockSend.mockResolvedValueOnce({}); // assertUsableOrganization GET → no Item
+    await expect(
+      handler(event('updateMyUserProfile', { input: { organizationId: 'gone' } }, caller(['PrimaryUser'], 'sub-1'))),
+    ).rejects.toThrow('organization gone not found');
+    // Fails at the org existence check — no profile read, no write of any kind.
+    expect(
+      mockSend.mock.calls.some((c) =>
+        ['UpdateCommand', 'TransactWriteCommand'].includes(c[0].constructor.name),
+      ),
+    ).toBe(false);
+  });
+
+  it('rejects setting organizationId to a deleting org (VALIDATION)', async () => {
+    mockSend.mockResolvedValueOnce({
+      Item: { organizationId: 'org-x', name: 'X', deleting: true, createdAt: 'c', updatedAt: 'u' },
+    });
+    await expect(
+      handler(event('updateMyUserProfile', { input: { organizationId: 'org-x' } }, caller(['PrimaryUser'], 'sub-1'))),
+    ).rejects.toThrow('being deleted');
+    expect(
+      mockSend.mock.calls.some((c) =>
+        ['UpdateCommand', 'TransactWriteCommand'].includes(c[0].constructor.name),
+      ),
+    ).toBe(false);
+  });
+
+  it('surfaces a clear error when the org is deleted mid-transaction (race)', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { organizationId: 'org-2', name: 'Acme', createdAt: 'c', updatedAt: 'u' } }) // org GET
+      .mockResolvedValueOnce({ Item: storedProfile({ organizationId: undefined }) }) // profile pre-read
+      .mockRejectedValueOnce(
+        Object.assign(new Error('canceled'), {
+          name: 'TransactionCanceledException',
+          // index 0 = profile update (ok), index 1 = org ConditionCheck (failed), index 2 = member put.
+          CancellationReasons: [{ Code: 'None' }, { Code: 'ConditionalCheckFailed' }, { Code: 'None' }],
+        }),
+      );
+    await expect(
+      handler(event('updateMyUserProfile', { input: { organizationId: 'org-2' } }, caller(['PrimaryUser'], 'sub-1'))),
+    ).rejects.toThrow('organization org-2 is no longer available');
+  });
+
+  it('maps a canceled profile update (missing profile) to NotFound when setting an org', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { organizationId: 'org-2', name: 'Acme', createdAt: 'c', updatedAt: 'u' } }) // org GET
+      .mockResolvedValueOnce({ Item: storedProfile({ organizationId: undefined }) }) // profile pre-read (exists)
+      .mockRejectedValueOnce(
+        Object.assign(new Error('canceled'), {
+          name: 'TransactionCanceledException',
+          // Profile Update's attribute_exists(PK) failed (index 0); the org check held.
+          CancellationReasons: [{ Code: 'ConditionalCheckFailed' }, { Code: 'None' }, { Code: 'None' }],
+        }),
+      );
+    await expect(
+      handler(event('updateMyUserProfile', { input: { organizationId: 'org-2' } }, caller(['PrimaryUser'], 'sub-1'))),
+    ).rejects.toThrow('profile for user sub-1 not found');
+  });
+
+  it('returns NotFound when the profile is missing at the pre-read (setting an org), writing nothing', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { organizationId: 'org-2', name: 'Acme', createdAt: 'c', updatedAt: 'u' } }) // org GET
+      .mockResolvedValueOnce({}); // profile pre-read → no Item
+    await expect(
+      handler(event('updateMyUserProfile', { input: { organizationId: 'org-2' } }, caller(['PrimaryUser'], 'sub-1'))),
+    ).rejects.toThrow('profile for user sub-1 not found');
+    expect(mockSend.mock.calls.some((c) => c[0].constructor.name === 'TransactWriteCommand')).toBe(false);
+  });
+
+  it('clears organizationId when the caller had none → a plain UpdateCommand (no transaction)', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: storedProfile({ organizationId: undefined }) }) // pre-read: no current org
+      .mockResolvedValueOnce({ Attributes: storedProfile({ organizationId: undefined }) }); // UpdateCommand ALL_NEW
+    await handler(
+      event(
+        'updateMyUserProfile',
+        { input: { organizationId: null } as Record<string, unknown> },
+        caller(['PrimaryUser'], 'sub-1'),
+      ),
+    );
+    // calls: [0] pre-read GET, [1] the plain conditional UpdateCommand (nothing to detach).
+    const cmd = mockSend.mock.calls[1][0];
+    expect(cmd.constructor.name).toBe('UpdateCommand');
+    expect(cmd.input.UpdateExpression).toContain('REMOVE organizationId');
+    expect(cmd.input.ExpressionAttributeValues[':organizationId']).toBeUndefined();
+    expect(mockSend.mock.calls.some((c) => c[0].constructor.name === 'TransactWriteCommand')).toBe(false);
+  });
+
+  it('clears organizationId (caller was a member) via a transaction that deletes the OrganizationMember row', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: storedProfile({ organizationId: 'org-1' }) }) // pre-read: currently in org-1
+      .mockResolvedValueOnce({}) // TransactWrite
+      .mockResolvedValueOnce({ Item: storedProfile({ organizationId: undefined }) }); // read-back
+    const result = (await handler(
+      event(
+        'updateMyUserProfile',
+        { input: { organizationId: null } as Record<string, unknown> },
+        caller(['PrimaryUser'], 'sub-1'),
+      ),
+    )) as unknown as Record<string, unknown>;
+    // calls: [0] pre-read GET, [1] TransactWrite, [2] read-back GET.
+    const tx = mockSend.mock.calls[1][0];
+    expect(tx.constructor.name).toBe('TransactWriteCommand');
+    const items = tx.input.TransactItems;
+    const update = items.find((t: Rec) => t.Update).Update;
+    expect(update.UpdateExpression).toContain('REMOVE organizationId');
+    expect(update.ConditionExpression).toBe('attribute_exists(PK)');
+    // The old membership row is deleted; clearing needs neither an org check nor a member Put.
+    const del = items.find((t: Rec) => t.Delete).Delete;
+    expect(del.Key).toEqual({ PK: 'ORG#org-1', SK: 'MEMBER#sub-1' });
+    expect(items.some((t: Rec) => t.ConditionCheck)).toBe(false);
+    expect(items.some((t: Rec) => t.Put)).toBe(false);
+    expect(result.PK).toBeUndefined();
+  });
+
+  it('leaves organizationId unchanged when the key is omitted', async () => {
+    mockSend.mockResolvedValueOnce({ Attributes: storedProfile({ displayName: 'X' }) });
+    await handler(
+      event('updateMyUserProfile', { input: { displayName: 'X' } }, caller(['PrimaryUser'], 'sub-1')),
+    );
+    expect(lastInput().UpdateExpression).not.toContain('organizationId');
+  });
+
+  it('rejects a whitespace-only organizationId (use null to clear)', async () => {
+    await expect(
+      handler(
+        event('updateMyUserProfile', { input: { organizationId: '   ' } }, caller(['PrimaryUser'], 'sub-1')),
+      ),
+    ).rejects.toThrow('organizationId cannot be empty');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
 });
 
-describe('users handler — SupportLink', () => {
-  it('createSupportLink writes SUPPORTER#<id>/USER#<id> carrying the supporterIndex fields (supporterId, userId)', async () => {
-    await handler(
-      event('createSupportLink', {
-        input: { supporterId: 's1', primaryUserId: 'u1', status: 'ACTIVE' },
-      }),
-    );
-    const { Item } = lastInput();
-    expect(Item.PK).toBe('SUPPORTER#s1');
-    expect(Item.SK).toBe('USER#u1');
-    expect(Item.entityType).toBe('SupportLink');
-    expect(Item.supporterId).toBe('s1');
-    expect(Item.primaryUserId).toBe('u1');
-    // userId mirrors primaryUserId so it can be the supporterIndex sort key.
-    expect(Item.userId).toBe('u1');
-    expect(Item.status).toBe('ACTIVE');
-  });
-
-  it('createSupportLink defaults status to PENDING and validates ids', async () => {
-    await handler(
-      event('createSupportLink', { input: { supporterId: 's1', primaryUserId: 'u1' } }),
-    );
-    expect(lastInput().Item.status).toBe('PENDING');
-    await expect(
-      handler(event('createSupportLink', { input: { supporterId: 's1' } })),
-    ).rejects.toThrow('primaryUserId is required');
-  });
-
-  it('listPrimaryUsersBySupporter queries the supporterIndex by supporterId', async () => {
-    mockSend.mockResolvedValueOnce({ Items: [{ supporterId: 's1', userId: 'u1' }] });
+describe('users handler — listMyOrganizationUsers', () => {
+  it('reads the caller org from their profile, then queries orgIndex by THAT org', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Item: { userId: 'sub-1', organizationId: 'org-1' } }) // caller profile
+      .mockResolvedValueOnce({ Items: [{ userId: 'u2', role: 'PRIMARY_USER' }] }); // orgIndex query
     const result = (await handler(
-      event('listPrimaryUsersBySupporter', { supporterId: 's1' }),
+      event('listMyOrganizationUsers', {}, caller(['SupportPerson'], 'sub-1')),
+    )) as Connection<unknown>;
+    // First call = caller profile GET; second = orgIndex query scoped to the caller's own org.
+    const query = mockSend.mock.calls[1][0].input;
+    expect(query.IndexName).toBe('orgIndex');
+    expect(query.ExpressionAttributeValues).toEqual({ ':org': 'org-1', ':profileSk': '#PROFILE' });
+    // OrganizationMember rows co-tenant orgIndex; the filter keeps the roster to UserProfile rows.
+    expect(query.FilterExpression).toBe('SK = :profileSk');
+    expect(result.items).toHaveLength(1);
+  });
+
+  it('rejects when the caller has no current organization', async () => {
+    mockSend.mockResolvedValueOnce({ Item: { userId: 'sub-1' } }); // no organizationId
+    await expect(
+      handler(event('listMyOrganizationUsers', {}, caller(['SupportPerson'], 'sub-1'))),
+    ).rejects.toThrow('no current organization');
+  });
+
+  it('rejects an unauthenticated caller', async () => {
+    await expect(handler(event('listMyOrganizationUsers', {}, undefined))).rejects.toThrow(
+      'authenticated user is required',
+    );
+  });
+});
+
+describe('users handler — selectPrimaryUser / unselectPrimaryUser', () => {
+  const SP = 'support-1';
+  const PU = 'primary-1';
+  // selectPrimaryUser reads, in order: [0] supporter profile, [1] target profile, then (only
+  // if all checks pass) [2] the upsert. Queue EXACTLY the reads each path consumes so an
+  // unconsumed mockResolvedValueOnce never leaks into the next test.
+  const profileReads = (
+    supporter: Record<string, unknown> | undefined,
+    target: Record<string, unknown> | undefined,
+  ) => {
+    mockSend.mockResolvedValueOnce({ Item: supporter }).mockResolvedValueOnce({ Item: target });
+  };
+
+  it('a SupportPerson selects an in-org PRIMARY_USER → writes the link ACTIVE (supporter from identity)', async () => {
+    profileReads(
+      { userId: SP, role: 'SUPPORT_PERSON', organizationId: 'org-1' },
+      { userId: PU, role: 'PRIMARY_USER', organizationId: 'org-1' },
+    );
+    mockSend.mockResolvedValueOnce({
+      Attributes: {
+        PK: `SUPPORTER#${SP}`,
+        SK: `USER#${PU}`,
+        entityType: 'SupportLink',
+        supporterId: SP,
+        primaryUserId: PU,
+        userId: PU,
+        status: 'ACTIVE',
+        createdAt: 'c',
+        updatedAt: 'u',
+      },
+    });
+    const result = (await handler(
+      event('selectPrimaryUser', { input: { primaryUserId: PU } }, caller(['SupportPerson'], SP)),
+    )) as { status: string; supporterId: string };
+
+    const upsert = mockSend.mock.calls[2][0].input;
+    expect(upsert.Key).toEqual({ PK: `SUPPORTER#${SP}`, SK: `USER#${PU}` });
+    expect(upsert.ExpressionAttributeValues[':active']).toBe('ACTIVE');
+    expect(upsert.ExpressionAttributeValues[':supporterId']).toBe(SP); // derived from identity
+    // createdAt preserved on restore (if_not_exists) so a REVOKED→ACTIVE keeps the original.
+    expect(upsert.UpdateExpression).toContain('createdAt = if_not_exists(createdAt, :now)');
+    expect(result.status).toBe('ACTIVE');
+    // The returned link is stripped of storage attributes.
+    expect((result as Record<string, unknown>).PK).toBeUndefined();
+  });
+
+  it('rejects selecting a user outside the caller current organization', async () => {
+    profileReads(
+      { userId: SP, role: 'SUPPORT_PERSON', organizationId: 'org-1' },
+      { userId: PU, role: 'PRIMARY_USER', organizationId: 'org-2' }, // different org
+    );
+    await expect(
+      handler(event('selectPrimaryUser', { input: { primaryUserId: PU } }, caller(['SupportPerson'], SP))),
+    ).rejects.toThrow('not in your organization');
+  });
+
+  it('rejects selecting a non-PRIMARY_USER target', async () => {
+    profileReads(
+      { userId: SP, role: 'SUPPORT_PERSON', organizationId: 'org-1' },
+      { userId: PU, role: 'SUPPORT_PERSON', organizationId: 'org-1' },
+    );
+    await expect(
+      handler(event('selectPrimaryUser', { input: { primaryUserId: PU } }, caller(['SupportPerson'], SP))),
+    ).rejects.toThrow('not a primary user');
+  });
+
+  it('rejects when the caller has no organization', async () => {
+    mockSend.mockResolvedValueOnce({ Item: { userId: SP, role: 'SUPPORT_PERSON' } }); // no org
+    await expect(
+      handler(event('selectPrimaryUser', { input: { primaryUserId: PU } }, caller(['SupportPerson'], SP))),
+    ).rejects.toThrow('must belong to an organization');
+  });
+
+  it('a PRIMARY_USER cannot select (only a SupportPerson may)', async () => {
+    await expect(
+      handler(event('selectPrimaryUser', { input: { primaryUserId: PU } }, caller(['PrimaryUser'], 'p9'))),
+    ).rejects.toThrow('SupportPerson access required');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('unselectPrimaryUser soft-revokes the link (status REVOKED, never a delete)', async () => {
+    mockSend.mockResolvedValueOnce({
+      Attributes: { supporterId: SP, primaryUserId: PU, userId: PU, status: 'REVOKED' },
+    });
+    const result = (await handler(
+      event('unselectPrimaryUser', { input: { primaryUserId: PU } }, caller(['SupportPerson'], SP)),
+    )) as { status: string };
+    const cmd = lastInput();
+    expect(cmd.Key).toEqual({ PK: `SUPPORTER#${SP}`, SK: `USER#${PU}` });
+    expect(cmd.UpdateExpression).toContain('#status = :revoked');
+    expect(cmd.ExpressionAttributeValues[':revoked']).toBe('REVOKED');
+    // Conditioned on the link existing — never an upsert/create.
+    expect(cmd.ConditionExpression).toBe('attribute_exists(PK)');
+    expect(result.status).toBe('REVOKED');
+  });
+
+  it('a PRIMARY_USER cannot unselect', async () => {
+    await expect(
+      handler(event('unselectPrimaryUser', { input: { primaryUserId: PU } }, caller(['PrimaryUser'], 'p9'))),
+    ).rejects.toThrow('SupportPerson access required');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('unselectPrimaryUser 404s when no link exists', async () => {
+    mockSend.mockRejectedValueOnce(
+      Object.assign(new Error('cond'), { name: 'ConditionalCheckFailedException' }),
+    );
+    await expect(
+      handler(event('unselectPrimaryUser', { input: { primaryUserId: PU } }, caller(['SupportPerson'], SP))),
+    ).rejects.toThrow('no support link');
+  });
+});
+
+describe('users handler — support list queries', () => {
+  it('listMySupportList queries supporterIndex by the caller sub (identity-derived)', async () => {
+    mockSend.mockResolvedValueOnce({ Items: [{ supporterId: 'support-1', userId: 'primary-1' }] });
+    const result = (await handler(
+      event('listMySupportList', {}, caller(['SupportPerson'], 'support-1')),
     )) as Connection<unknown>;
     expect(lastInput().IndexName).toBe('supporterIndex');
-    expect(lastInput().ExpressionAttributeValues).toEqual({ ':sup': 's1' });
+    expect(lastInput().ExpressionAttributeValues).toEqual({ ':sup': 'support-1' });
     expect(result.items).toHaveLength(1);
   });
 });

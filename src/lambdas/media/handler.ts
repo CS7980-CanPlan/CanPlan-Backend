@@ -2,6 +2,8 @@ import { randomUUID } from 'crypto';
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { requireCaller } from '../../shared/authz';
+import { assertCanActForUser, assertCanReadTaskById } from '../../shared/delegation';
 import { dynamo, TABLE_NAME } from '../../shared/dynamodb';
 import { ENTITY, MEDIA_PREFIX, mediaSk, taskPk } from '../../shared/keys';
 import {
@@ -13,8 +15,10 @@ import {
 import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
 import { NotFoundError, ValidationError } from '../../shared/response';
 import { DOWNLOAD_URL_TTL_SECONDS, MEDIA_BUCKET, s3, UPLOAD_URL_TTL_SECONDS } from '../../shared/s3';
+import { readTaskMeta } from '../../shared/taskCascade';
 import type {
   AppSyncEvent,
+  AppSyncIdentity,
   Connection,
   CreateMediaAssetInput,
   CreateMediaUploadUrlInput,
@@ -23,6 +27,7 @@ import type {
   MediaAsset,
   MediaDownloadTarget,
   MediaUploadTarget,
+  Task,
 } from '../../shared/types';
 
 /**
@@ -33,36 +38,68 @@ import type {
  * Upload flow: createMediaUploadUrl → client PUTs the file to the returned uploadUrl
  * → createMediaAsset registers the metadata for the now-uploaded object.
  * Download: getMediaDownloadUrl returns a short-lived presigned GET for private media.
+ *
+ * Authorization: media operations are scoped to the task's owner. Write/mint operations
+ * (createMediaUploadUrl, createMediaAsset, deleteMediaAsset) authorize against the task's
+ * authoritative `ownerId` via `assertCanActForUser` — the owner, OR a SupportPerson with an
+ * ACTIVE SupportLink to that owner (a PRIMARY_USER in the same org). The stored asset owner is
+ * always the task's owner (a client-supplied ownerId is ignored). Reads (getMediaDownloadUrl,
+ * listMediaForTask) additionally allow a caller who holds an ACTIVE TaskAssignment referencing
+ * the task (an assigned primary user can view a SupportPerson's task media), but never mutate
+ * it. createTaskCoverImageUploadUrl only requires an authenticated caller (no task exists yet).
  */
 export const handler = async (
   event: AppSyncEvent<Record<string, unknown>>,
 ): Promise<MediaAsset | Connection<MediaAsset> | MediaUploadTarget | MediaDownloadTarget> => {
-  const { arguments: args } = event;
+  const { arguments: args, identity } = event;
   switch (event.info?.fieldName) {
     case 'createMediaUploadUrl':
-      return createMediaUploadUrl(args.input as CreateMediaUploadUrlInput);
+      return createMediaUploadUrl(args.input as CreateMediaUploadUrlInput, identity);
     case 'createTaskCoverImageUploadUrl':
-      return createTaskCoverImageUploadUrl(args.input as CreateTaskCoverImageUploadUrlInput);
+      return createTaskCoverImageUploadUrl(args.input as CreateTaskCoverImageUploadUrlInput, identity);
     case 'createMediaAsset':
-      return createMediaAsset(args.input as CreateMediaAssetInput);
+      return createMediaAsset(args.input as CreateMediaAssetInput, identity);
     case 'deleteMediaAsset':
-      return deleteMediaAsset(args.input as DeleteMediaAssetInput);
+      return deleteMediaAsset(args.input as DeleteMediaAssetInput, identity);
     case 'getMediaDownloadUrl':
-      return getMediaDownloadUrl(args.taskId as string, args.assetId as string);
+      return getMediaDownloadUrl(args.taskId as string, args.assetId as string, identity);
     case 'listMediaForTask':
-      return listMediaForTask(args.taskId as string, pageArgs(args));
+      return listMediaForTask(args.taskId as string, pageArgs(args), identity);
     default:
       throw new Error(`media handler: unsupported field "${event.info?.fieldName}"`);
   }
 };
 
 /**
+ * Load the task a media write targets and assert the caller may MANAGE it — the owner, or a
+ * SupportPerson with delegated access to the owner (`assertCanActForUser`). Reads the
+ * authoritative owner from the task #META row (never a client-supplied ownerId) and returns the
+ * task so callers can derive the asset owner from it.
+ */
+async function assertCanManageTask(
+  identity: AppSyncIdentity | undefined,
+  taskId: string,
+): Promise<Task> {
+  const task = await readTaskMeta(taskId);
+  if (!task) throw new NotFoundError(`task ${taskId} not found`);
+  await assertCanActForUser(identity, task.ownerId);
+  return task;
+}
+
+/**
  * Presigned GET for a registered media asset. Looks the asset up first so we only
  * ever sign keys that actually exist (no arbitrary-key probing), then signs its s3Key.
  */
-async function getMediaDownloadUrl(taskId: string, assetId: string): Promise<MediaDownloadTarget> {
+async function getMediaDownloadUrl(
+  taskId: string,
+  assetId: string,
+  identity: AppSyncIdentity | undefined,
+): Promise<MediaDownloadTarget> {
   if (!taskId?.trim()) throw new ValidationError('taskId is required and cannot be empty');
   if (!assetId?.trim()) throw new ValidationError('assetId is required and cannot be empty');
+  // Read access: the owner, or a user with an active assignment referencing the task. Authorize
+  // against the task before revealing whether the asset exists.
+  await assertCanReadTaskById(identity, taskId.trim());
 
   const result = await dynamo.send(
     new GetCommand({ TableName: TABLE_NAME, Key: { PK: taskPk(taskId), SK: mediaSk(assetId) } }),
@@ -79,11 +116,16 @@ async function getMediaDownloadUrl(taskId: string, assetId: string): Promise<Med
   return { downloadUrl, s3Key: asset.s3Key, expiresIn: DOWNLOAD_URL_TTL_SECONDS };
 }
 
-async function createMediaUploadUrl(input: CreateMediaUploadUrlInput): Promise<MediaUploadTarget> {
+async function createMediaUploadUrl(
+  input: CreateMediaUploadUrlInput,
+  identity: AppSyncIdentity | undefined,
+): Promise<MediaUploadTarget> {
   const taskId = input?.taskId?.trim();
   const contentType = input?.contentType?.trim();
   if (!taskId) throw new ValidationError('taskId is required and cannot be empty');
   if (!contentType) throw new ValidationError('contentType is required (e.g. image/png)');
+  // Minting an upload URL requires manage access to the task (owner or delegated SupportPerson).
+  await assertCanManageTask(identity, taskId);
 
   // Server-owned key under the task's prefix; the random id avoids collisions and
   // keeps clients from choosing arbitrary paths.
@@ -110,7 +152,12 @@ async function createMediaUploadUrl(input: CreateMediaUploadUrlInput): Promise<M
  */
 async function createTaskCoverImageUploadUrl(
   input: CreateTaskCoverImageUploadUrlInput,
+  identity: AppSyncIdentity | undefined,
 ): Promise<MediaUploadTarget> {
+  // No taskId exists yet (the task may not exist), so this is authenticated-only; the pending
+  // upload is promoted to a task-owned asset later by createTask/updateTask, which authorize
+  // the target owner (owner or delegated SupportPerson).
+  requireCaller(identity);
   const contentType = input?.contentType?.trim().toLowerCase();
   if (!contentType) {
     throw new ValidationError('contentType is required (image/jpeg, image/png, or image/webp)');
@@ -138,16 +185,21 @@ function fileExtension(fileName: string | undefined, contentType: string): strin
   return subtype || undefined;
 }
 
-async function createMediaAsset(input: CreateMediaAssetInput): Promise<MediaAsset> {
+async function createMediaAsset(
+  input: CreateMediaAssetInput,
+  identity: AppSyncIdentity | undefined,
+): Promise<MediaAsset> {
   const taskId = input?.taskId?.trim();
   const s3Key = input?.s3Key?.trim();
   const mimeType = input?.mimeType?.trim();
-  const ownerId = input?.ownerId?.trim();
   if (!taskId) throw new ValidationError('taskId is required and cannot be empty');
   if (!s3Key) throw new ValidationError('s3Key is required and cannot be empty');
   if (!input?.type) throw new ValidationError('type is required (IMAGE, AUDIO, or VIDEO)');
   if (!mimeType) throw new ValidationError('mimeType is required and cannot be empty');
-  if (!ownerId) throw new ValidationError('ownerId is required and cannot be empty');
+  // Registering media requires manage access to the task (owner or delegated SupportPerson).
+  // The asset owner is derived from the task's authoritative ownerId — any client-supplied
+  // input.ownerId is ignored — so a delegated SupportPerson stores the primary user as owner.
+  const task = await assertCanManageTask(identity, taskId);
 
   const now = new Date().toISOString();
   // Newly registered media is UNATTACHED (no stepId) — it is bound to a step only via
@@ -158,7 +210,7 @@ async function createMediaAsset(input: CreateMediaAssetInput): Promise<MediaAsse
     s3Key,
     type: input.type,
     mimeType,
-    ownerId,
+    ownerId: task.ownerId,
     size: input.size,
     createdAt: now,
     updatedAt: now,
@@ -190,11 +242,16 @@ async function createMediaAsset(input: CreateMediaAssetInput): Promise<MediaAsse
  * an already-absent key. An S3 delete failure is logged with full context (never
  * silently ignored) for a retry/cleanup job; it does not resurrect the reference.
  */
-async function deleteMediaAsset(input: DeleteMediaAssetInput): Promise<MediaAsset> {
+async function deleteMediaAsset(
+  input: DeleteMediaAssetInput,
+  identity: AppSyncIdentity | undefined,
+): Promise<MediaAsset> {
   const taskId = input?.taskId?.trim();
   const assetId = input?.assetId?.trim();
   if (!taskId) throw new ValidationError('taskId is required and cannot be empty');
   if (!assetId) throw new ValidationError('assetId is required and cannot be empty');
+  // Deleting media requires manage access to the task (owner or delegated SupportPerson).
+  await assertCanManageTask(identity, taskId);
 
   const result = await dynamo.send(
     new GetCommand({ TableName: TABLE_NAME, Key: { PK: taskPk(taskId), SK: mediaSk(assetId) } }),
@@ -218,8 +275,14 @@ async function deleteMediaAsset(input: DeleteMediaAssetInput): Promise<MediaAsse
   return out as unknown as MediaAsset;
 }
 
-async function listMediaForTask(taskId: string, page: PageArgs): Promise<Connection<MediaAsset>> {
+async function listMediaForTask(
+  taskId: string,
+  page: PageArgs,
+  identity: AppSyncIdentity | undefined,
+): Promise<Connection<MediaAsset>> {
   if (!taskId?.trim()) throw new ValidationError('taskId is required');
+  // Read access: the owner, or a user with an active assignment referencing the task.
+  await assertCanReadTaskById(identity, taskId.trim());
   return queryPage<MediaAsset>(
     {
       TableName: TABLE_NAME,

@@ -1,10 +1,13 @@
 // Authorization helpers for AppSync Lambda resolvers.
 //
 // Identity-scoped ownership: the authenticated caller's Cognito `sub` is the source of
-// truth for "who am I", and a resource owned by some `ownerId` may only be operated on by
-// the caller whose `sub` equals that `ownerId`. There is no delegated-role model yet, so
-// this is a strict self-ownership check. (Assignment authorization is intentionally out of
-// scope here.)
+// truth for "who am I", and `assertCallerOwns` enforces that a resource's `ownerId` equals
+// that `sub` — the strict self-ownership primitive (e.g. createTaskAssignment requires the
+// caller to own the referenced Task template).
+//
+// Delegated access — a SupportPerson acting for a selected PRIMARY_USER — is layered on top
+// in `delegation.ts` (`assertCanActForUser` / `assertCanReadTask`); this module only provides
+// the self-ownership building blocks (`requireCaller`, `assertCallerOwns`).
 
 import { UnauthorizedError } from './response';
 import type { AppSyncIdentity } from './types';

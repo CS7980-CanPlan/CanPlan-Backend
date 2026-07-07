@@ -2,8 +2,8 @@
 
 A **SystemAdmin-only** web portal for operating the CanPlan 2.0 backend. Administrators
 sign in with Cognito and manage users (invite support people / org admins, change base
-roles, grant or revoke SystemAdmin) and data (delete any task, fully delete a user) against
-the deployed AppSync GraphQL API.
+roles, grant or revoke SystemAdmin), organizations and membership, and destructive data
+actions (delete any task, fully delete a user) against the deployed AppSync GraphQL API.
 
 This portal is wired to the **real** backend — there is no mock-data mode. Every admin
 request carries the signed-in user's Cognito **ID token** in the `Authorization` header, and
@@ -91,7 +91,7 @@ src/
   features/
     login/        Login page + forced-new-password form
     forbidden/    Forbidden screen (authenticated non-admins)
-    admin/        Admin shell, overview, users + tasks sections, dangerous actions
+    admin/        Admin shell, overview, users, tasks, organizations, dangerous actions
   components/ui/  Reusable primitives (Button, TextField, Select, Badge, Alert, …)
   styles/         Global styles + design tokens
 ```
@@ -105,13 +105,16 @@ src/
 
 ## Admin operations
 
-Queries: `listAllUsers`, `listAllTasks` (paginated tables, cursor `nextToken`).
+Queries: `listAllUsers`, `listAllTasks`, `listAllOrganizations`,
+`adminListOrganizationUsers`, and `adminGetUserData` (paginated tables/detail reads,
+cursor `nextToken` where applicable).
 
 Mutations: `inviteSupportPerson`, `inviteOrganizationAdmin`, `setUserBaseRole`,
-`setSystemAdmin`, `adminDeleteTask`, `adminDeleteUser`. Each surfaces loading / success /
-validation / error states, shows the returned payload in a result panel, and invalidates the
-relevant React Query caches on success. Destructive deletes require typing the exact
-`userId` / `taskId` to enable the submit button.
+`setSystemAdmin`, `adminCreateOrganization`, `adminUpdateOrganization`,
+`adminDeleteOrganization`, `adminSetUserOrganization`, `adminDeleteTask`, and
+`adminDeleteUser`. Each surfaces loading / success / validation / error states, shows the
+returned payload in a result panel, and invalidates the relevant React Query caches on
+success. Destructive deletes require typed confirmation before enabling the submit button.
 
 ## Static deployment
 
