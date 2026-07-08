@@ -102,6 +102,21 @@ export interface TaskConnection {
   nextToken: string | null;
 }
 
+export interface SupportLinkConnection {
+  items: SupportLink[];
+  nextToken: string | null;
+}
+
+export interface CategoryConnection {
+  items: Category[];
+  nextToken: string | null;
+}
+
+export interface TaskAssignmentConnection {
+  items: TaskAssignment[];
+  nextToken: string | null;
+}
+
 export interface OrganizationConnection {
   items: Organization[];
   nextToken: string | null;
@@ -169,6 +184,29 @@ export interface DeleteOrganizationInput {
 export interface AdminSetUserOrganizationInput {
   userId: string;
   organizationId: string | null;
+}
+
+// ── Self-profile input (any signed-in user, edits their OWN profile) ─────────────
+/**
+ * Partial update of the caller's OWN profile. Omit a field to leave it unchanged.
+ * `organizationId`: a non-empty id joins that org (must exist & not be deleting); explicit
+ * `null` clears membership. `accessibilitySettings` is a full replacement (JSON string).
+ */
+export interface UpdateMyUserProfileInput {
+  displayName?: string;
+  accessibilitySettings?: string | null;
+  organizationId?: string | null;
+}
+
+// ── SupportPerson inputs ───────────────────────────────────────────────────────
+/** A SupportPerson selects a PRIMARY_USER in their org to support (supporter = caller). */
+export interface SelectPrimaryUserInput {
+  primaryUserId: string;
+}
+
+/** A SupportPerson un-selects a previously selected primary user (soft-revoke). */
+export interface UnselectPrimaryUserInput {
+  primaryUserId: string;
 }
 
 // ── Pagination args ──────────────────────────────────────────────────────────────

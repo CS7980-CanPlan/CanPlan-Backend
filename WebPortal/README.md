@@ -1,13 +1,23 @@
-# CanPlan 2.0 — Admin Web Portal
+# CanPlan 2.0 — Web Portal
 
-A **SystemAdmin-only** web portal for operating the CanPlan 2.0 backend. Administrators
-sign in with Cognito and manage users (invite support people / org admins, change base
-roles, grant or revoke SystemAdmin), organizations and membership, and destructive data
-actions (delete any task, fully delete a user) against the deployed AppSync GraphQL API.
+A web portal for operating the CanPlan 2.0 backend, with two role-scoped areas behind a
+common landing page:
 
-This portal is wired to the **real** backend — there is no mock-data mode. Every admin
-request carries the signed-in user's Cognito **ID token** in the `Authorization` header, and
-the AppSync API gates the admin operations to the `SystemAdmin` Cognito group.
+- **Admin portal** (`/admin`, `SystemAdmin`): manage users (invite support people / org
+  admins, change base roles, grant or revoke SystemAdmin), organizations and membership, and
+  destructive data actions (delete any task, fully delete a user).
+- **Support portal** (`/support`, `SupportPerson`), tabbed into: **People I support** (open a
+  supported user to review their tasks, categories, and schedule via delegated access);
+  **Manage people** (add/remove primary users from your own organization —
+  `selectPrimaryUser` / `unselectPrimaryUser`; users in other orgs are never visible); and
+  **My profile** (edit your display name and organization via `updateMyUserProfile`). The
+  organization field is a search-by-ID input — a non-admin can't browse all orgs
+  (`listAllOrganizations` is SystemAdmin-only), so paste an org id and the backend validates it.
+
+This portal is wired to the **real** backend — there is no mock-data mode. Every request
+carries the signed-in user's Cognito **ID token** in the `Authorization` header; the backend
+authorizes admin operations against the `SystemAdmin` group and support operations against the
+caller's `SupportPerson` role plus an ACTIVE `SupportLink` to the target primary user.
 
 ## Tech stack
 
@@ -90,12 +100,12 @@ npm run build
 src/
   app/            App shell — providers (React Query, Auth, Router) + route table
   auth/           Amplify config, AuthProvider/useAuth, RequireSystemAdmin/RequireSupportPerson guards
-  api/            GraphQL client, documents, raw admin API, React Query hooks, types
+  api/            GraphQL client + docs, raw admin & support APIs, React Query hooks, types
   config/         Typed env config (fails fast on missing vars)
   features/
     landing/      Public portal landing (links to each sign-in)
     login/        Shared login card, admin sign-in, forced-new-password form
-    support/      Support-person sign-in + support home placeholder
+    support/      Support-person portal: sign-in, shell/layout, home, manage, profile, user detail
     forbidden/    Forbidden screen (authenticated users lacking the area's group)
     admin/        Admin shell, overview, users, tasks, organizations, dangerous actions
   components/ui/  Reusable primitives (Button, TextField, Select, Badge, Alert, …)

@@ -4,7 +4,11 @@ import { RequireSupportPerson } from '../auth/RequireSupportPerson';
 import LandingPage from '../features/landing/LandingPage';
 import AdminLoginPage from '../features/login/AdminLoginPage';
 import SupportLoginPage from '../features/support/SupportLoginPage';
+import SupportLayout from '../features/support/SupportLayout';
 import SupportHomePage from '../features/support/SupportHomePage';
+import SupportManagePage from '../features/support/SupportManagePage';
+import SupportProfilePage from '../features/support/SupportProfilePage';
+import SupportUserDetailPage from '../features/support/SupportUserDetailPage';
 import ForbiddenPage from '../features/forbidden/ForbiddenPage';
 import AdminLayout from '../features/admin/AdminLayout';
 import AdminHomePage from '../features/admin/AdminHomePage';
@@ -43,16 +47,20 @@ export function AppRoutes() {
         <Route path="/admin/danger" element={<DangerZonePage />} />
       </Route>
 
-      {/* Support portal: sign-in at /support, guarded home under /support/home. */}
+      {/* Support portal: sign-in at /support, guarded shell under /support/*. */}
       <Route path="/support" element={<SupportLoginPage />} />
       <Route
-        path="/support/home"
         element={
           <RequireSupportPerson>
-            <SupportHomePage />
+            <SupportLayout />
           </RequireSupportPerson>
         }
-      />
+      >
+        <Route path="/support/home" element={<SupportHomePage />} />
+        <Route path="/support/manage" element={<SupportManagePage />} />
+        <Route path="/support/profile" element={<SupportProfilePage />} />
+        <Route path="/support/users/:userId" element={<SupportUserDetailPage />} />
+      </Route>
 
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
