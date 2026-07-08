@@ -12,7 +12,7 @@ the AppSync API gates the admin operations to the `SystemAdmin` Cognito group.
 ## Tech stack
 
 - **React** + **TypeScript** + **Vite**
-- **react-router-dom** — routing (login gate at `/`, guarded `/admin/*`)
+- **react-router-dom** — routing (public landing at `/`, admin sign-in at `/admin` + guarded `/admin/*`, support sign-in at `/support` + guarded `/support/home`)
 - **@tanstack/react-query** — query/mutation state, caching, invalidation
 - **graphql-request** — typed GraphQL calls to AppSync
 - **aws-amplify** — Cognito authentication (incl. forced-new-password flow)
@@ -21,14 +21,18 @@ the AppSync API gates the admin operations to the `SystemAdmin` Cognito group.
 
 ## Authentication & access flow
 
-1. The first screen at `/` is a **login page**. Users authenticate with Cognito
-   (`VITE_USER_POOL_ID` / `VITE_USER_POOL_CLIENT_ID`).
-2. Invited admins created with a temporary password hit the Cognito
-   `FORCE_CHANGE_PASSWORD` challenge; the login page shows a **set-new-password** step.
-3. After sign-in the portal inspects the ID token's `cognito:groups` claim:
-   - In the **`SystemAdmin`** group → redirected to `/admin`.
-   - Authenticated but **not** SystemAdmin → a **forbidden** screen with a sign-out action.
-4. Admin screens never render before the session check completes.
+1. The landing page at `/` is a **public entry page** with links to each sign-in:
+   **`/admin`** (administrators) and **`/support`** (support persons).
+2. Both sign-ins authenticate with Cognito (`VITE_USER_POOL_ID` / `VITE_USER_POOL_CLIENT_ID`)
+   using the same shared login card.
+3. Invited users created with a temporary password hit the Cognito
+   `FORCE_CHANGE_PASSWORD` challenge; the login card shows a **set-new-password** step.
+4. After sign-in the portal inspects the ID token's `cognito:groups` claim:
+   - Signing in at `/admin` as **`SystemAdmin`** → the admin console (`/admin/home`).
+   - Signing in at `/support` as **`SupportPerson`** → the support home (`/support/home`).
+   - Authenticated but lacking the group for the area → a **forbidden** screen with links
+     back to the portal home and a sign-out action.
+5. Guarded screens never render before the session check completes.
 
 Tokens are managed by Amplify's session store and read via `fetchAuthSession()` — they are
 **never** persisted to `localStorage` by this app. The GraphQL client fetches a fresh ID
@@ -85,12 +89,14 @@ npm run build
 ```
 src/
   app/            App shell — providers (React Query, Auth, Router) + route table
-  auth/           Amplify config, AuthProvider/useAuth, RequireSystemAdmin guard
+  auth/           Amplify config, AuthProvider/useAuth, RequireSystemAdmin/RequireSupportPerson guards
   api/            GraphQL client, documents, raw admin API, React Query hooks, types
   config/         Typed env config (fails fast on missing vars)
   features/
-    login/        Login page + forced-new-password form
-    forbidden/    Forbidden screen (authenticated non-admins)
+    landing/      Public portal landing (links to each sign-in)
+    login/        Shared login card, admin sign-in, forced-new-password form
+    support/      Support-person sign-in + support home placeholder
+    forbidden/    Forbidden screen (authenticated users lacking the area's group)
     admin/        Admin shell, overview, users, tasks, organizations, dangerous actions
   components/ui/  Reusable primitives (Button, TextField, Select, Badge, Alert, …)
   styles/         Global styles + design tokens

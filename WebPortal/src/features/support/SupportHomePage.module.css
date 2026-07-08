@@ -3,7 +3,9 @@
   display: grid;
   place-items: center;
   padding: 1.5rem;
-  background: var(--color-bg);
+  background:
+    radial-gradient(1200px 600px at 50% -10%, #eaf1fd 0%, transparent 60%),
+    var(--color-bg);
 }
 
 .card {
@@ -27,8 +29,8 @@
   width: 3.25rem;
   height: 3.25rem;
   border-radius: 50%;
-  background: var(--color-danger-bg, #fcebeb);
-  color: var(--color-danger);
+  background: var(--color-primary);
+  color: #fff;
 }
 
 .title {
@@ -40,12 +42,4 @@
   font-size: 0.9rem;
   margin: 0;
   line-height: 1.6;
-}
-
-.actions {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 0.6rem;
-  margin-top: 0.35rem;
 }

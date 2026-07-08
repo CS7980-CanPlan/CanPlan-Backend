@@ -1,6 +1,7 @@
-/** Shared auth types + the elevated group name (must match the backend Cognito group). */
+/** Shared auth types + the Cognito group names (must match the backend ROLE_GROUPS). */
 
 export const SYSTEM_ADMIN_GROUP = 'SystemAdmin';
+export const SUPPORT_PERSON_GROUP = 'SupportPerson';
 
 /** The minimal identity we surface from the Cognito ID token. */
 export interface AuthUser {
@@ -34,6 +35,8 @@ export interface AuthContextValue {
   groups: string[];
   /** True when the user belongs to the SystemAdmin group. */
   isSystemAdmin: boolean;
+  /** True when the user belongs to the SupportPerson group. */
+  isSupportPerson: boolean;
   /** True during the initial session bootstrap — gate all auth-dependent UI on this. */
   loading: boolean;
   signIn: (email: string, password: string) => Promise<SignInStatus>;

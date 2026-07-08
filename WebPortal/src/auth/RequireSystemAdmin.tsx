@@ -6,7 +6,7 @@ import { Spinner } from '../components/ui/Spinner';
 /**
  * Route guard for the admin area. Renders nothing auth-dependent until the session
  * bootstrap completes (so admin screens never flash before the check). Sends signed-out
- * users to the login page and authenticated non-admins to the forbidden screen.
+ * users to the admin sign-in and authenticated non-admins to the forbidden screen.
  */
 export function RequireSystemAdmin({ children }: { children: ReactNode }) {
   const { loading, user, isSystemAdmin } = useAuth();
@@ -18,7 +18,7 @@ export function RequireSystemAdmin({ children }: { children: ReactNode }) {
       </div>
     );
   }
-  if (!user) return <Navigate to="/" replace />;
+  if (!user) return <Navigate to="/admin" replace />;
   if (!isSystemAdmin) return <Navigate to="/forbidden" replace />;
   return <>{children}</>;
 }

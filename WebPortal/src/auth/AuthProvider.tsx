@@ -11,6 +11,7 @@ import {
   type AuthUser,
   type IdTokenPayload,
   type SignInStatus,
+  SUPPORT_PERSON_GROUP,
   SYSTEM_ADMIN_GROUP,
 } from './authTypes';
 
@@ -116,6 +117,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       idToken: session.idToken,
       groups: session.groups,
       isSystemAdmin: session.groups.includes(SYSTEM_ADMIN_GROUP),
+      isSupportPerson: session.groups.includes(SUPPORT_PERSON_GROUP),
       loading,
       signIn,
       completeNewPassword,

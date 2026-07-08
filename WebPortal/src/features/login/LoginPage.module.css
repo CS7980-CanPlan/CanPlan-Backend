@@ -63,3 +63,19 @@
   color: var(--color-text-muted);
   text-align: center;
 }
+
+.backLink {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  margin-top: 0.85rem;
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+  text-decoration: none;
+}
+
+.backLink:hover {
+  color: var(--color-primary);
+  text-decoration: underline;
+}
