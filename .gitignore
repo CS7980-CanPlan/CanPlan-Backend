@@ -12,3 +12,7 @@ coverage/
 
 # Local-only design docs (specs/plans) — personal reference, never pushed to the shared repo
 docs/superpowers/
+
+# Hidden test suites (e.g. issue-43) — kept out of normal commits and the implementation
+# agent's context. Run explicitly via `npx jest --config jest.hidden.config.js`.
+tests-hidden/
