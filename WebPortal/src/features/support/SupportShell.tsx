@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react';
 import { NavLink } from 'react-router-dom';
-import { LifeBuoy, LogOut, Settings, UserRound, Users } from 'lucide-react';
+import { LifeBuoy, ListChecks, LogOut, Settings, UserRound, Users } from 'lucide-react';
 import { useAuth } from '../../auth/useAuth';
 import { Button } from '../../components/ui/Button';
 import { Badge } from '../../components/ui/Badge';
@@ -16,6 +16,7 @@ interface TabDef {
 const TABS: TabDef[] = [
   { to: '/support/home', label: 'People I support', icon: <Users size={16} />, end: true },
   { to: '/support/manage', label: 'Manage people', icon: <Settings size={16} /> },
+  { to: '/support/tasks', label: 'Tasks', icon: <ListChecks size={16} /> },
   { to: '/support/profile', label: 'My profile', icon: <UserRound size={16} /> },
 ];
 

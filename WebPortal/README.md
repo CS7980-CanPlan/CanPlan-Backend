@@ -9,7 +9,9 @@ common landing page:
 - **Support portal** (`/support`, `SupportPerson`), tabbed into: **People I support** (open a
   supported user to review their tasks, categories, and schedule via delegated access);
   **Manage people** (add/remove primary users from your own organization —
-  `selectPrimaryUser` / `unselectPrimaryUser`; users in other orgs are never visible); and
+  `selectPrimaryUser` / `unselectPrimaryUser`; users in other orgs are never visible);
+  **Tasks** (create and manage your OWN task templates and assign them to supported users —
+  see [Support tasks module](#support-tasks-module)); and
   **My profile** (edit your display name and organization via `updateMyUserProfile`). The
   organization field is a search-by-ID input — a non-admin can't browse all orgs
   (`listAllOrganizations` is SystemAdmin-only), so paste an org id and the backend validates it.
@@ -108,6 +110,7 @@ src/
     landing/      Public portal landing (links to each sign-in)
     login/        Shared login card, admin sign-in, forced-new-password form
     support/      Support-person portal: sign-in, shell/layout, home, manage, profile, user detail
+      tasks/      Tasks module: template list/create/detail, step editor, assignment panel
     forbidden/    Forbidden screen (authenticated users lacking the area's group)
     admin/        Admin shell, overview, users, tasks, organizations, dangerous actions
   components/ui/  Reusable primitives (Button, TextField, Select, Badge, Alert, …)
@@ -116,10 +119,85 @@ src/
 
 ### Layering
 
-- **GraphQL documents** are centralized in `src/api/graphqlDocuments.ts`.
-- **Raw API calls** (no React) live in `src/api/adminApi.ts`.
-- **React Query hooks** wrap those in `src/api/adminHooks.ts`; components use only the hooks.
+- **GraphQL documents** are centralized in `src/api/graphqlDocuments.ts` (admin) and
+  `src/api/supportDocuments.ts` (support portal, including the tasks module).
+- **Raw API calls** (no React) live in `src/api/adminApi.ts` / `src/api/supportApi.ts`.
+- **React Query hooks** wrap those in `src/api/adminHooks.ts` / `src/api/supportHooks.ts`
+  (centralized query keys + post-mutation invalidation); components use only the hooks.
 - Inputs/results are strictly typed in `src/api/apiTypes.ts` to mirror the backend schema.
+
+## Support tasks module
+
+The **Tasks** tab (`/support/tasks`) is where a SupportPerson manages the reusable task
+templates **they own** and schedules them for supported users.
+
+### Routes
+
+| Route | Purpose |
+| ----- | ------- |
+| `/support/tasks` | "My task templates" — the caller's own templates (`listTasksByOwner` on the caller's Cognito `sub`), with create / open / assign / delete actions and cursor-based "Load more" pagination |
+| `/support/tasks/new` | Create a template: title, optional description, one of the caller's own categories, and an ordered text-step editor (add / remove / reorder before creation) |
+| `/support/tasks/:taskId` | Template detail: metadata editing, step editing/reordering/appending, the assignment workflow, and deletion |
+
+All three live inside the existing `RequireSupportPerson` / `SupportLayout` guard.
+
+### Owned templates vs. a supported user's own tasks
+
+A **Task is a reusable template with no scheduling fields**. This module only manages
+templates **owned by the signed-in SupportPerson**: `createTask` is always called **without
+`input.userId`** (so the returned `ownerId` is the caller's `sub`), and the list page queries
+`listTasksByOwner(ownerId: <caller sub>)`. Tasks owned by supported primary users are a
+different thing entirely — they remain visible read-only on each person's detail page under
+"People I support" and are never listed or edited in the Tasks tab. The detail page
+additionally refuses to manage a task whose `ownerId` is not the caller (delegated/assigned
+reads can load foreign tasks, so the UI double-checks).
+
+### Assignment workflow
+
+Assigning never copies the template — a `TaskAssignment` **references** the SupportPerson's
+template, and an active assignment is what grants the assigned primary user read access to
+the task and its steps.
+
+- Targets come from `listMySupportList` filtered to **`status === "ACTIVE"`** (REVOKED links
+  are never assignable); display names resolve through the `listMyOrganizationUsers` roster.
+  The backend additionally requires the caller to own the referenced task and to share an
+  organization with the target.
+- `assignedBy` is never sent — the backend derives it from the authenticated caller.
+- **ONE_TIME** sends `scheduledFor` (a local datetime) + `timezone` (IANA name, defaulting to
+  the browser's `Intl` timezone).
+- **RECURRING** sends `scheduleRule` (an RRULE such as `FREQ=DAILY;INTERVAL=2`; only
+  DAILY/WEEKLY/MONTHLY/YEARLY frequencies), `startDate` (`YYYY-MM-DD`), `startTime`
+  (`HH:mm`), optional `endDate` (not before `startDate`), and `timezone`. Fields of the
+  other schedule type are never mixed in.
+- Assignments are stored **per target user** (`listTaskAssignmentsForUser`), so the review
+  section has its own supported-user selector and filters the result to the current task —
+  after draining **every** `nextToken` page, so matches beyond the first page are never
+  missed. The support list and org roster reads drain all pages for the same reason (a
+  truncated page must not hide assignable people). Active and ended rows are shown
+  distinctly with human-readable schedules.
+- There is **no update-assignment mutation**: to change a schedule, stop
+  (`deleteTaskAssignment`, immediate soft-delete) or end (`endTaskAssignment` from a chosen
+  `effectiveDate`) the old assignment and create a new one. Both actions require an inline
+  confirmation, and the target user's assignment cache is invalidated afterwards.
+
+### Task deletion
+
+`deleteTask` is **rejected while any ACTIVE assignment still references the task** — the
+portal surfaces the backend's message and the fix is to stop/end those assignments first
+(never `adminDeleteTask`). Deletion requires typing `delete` to confirm. Editing or deleting
+template steps never rewrites `TaskInstanceStep` snapshots of occurrences a user already
+started.
+
+### Appending steps (`createTaskStep` contract)
+
+`createTaskStep.order` must equal the task's server-maintained next append position, which
+is not exposed via GraphQL. The portal derives it deterministically: with **N > 0** steps it
+first normalizes with `reorderTaskSteps` (which resets the append position to `N + 1`) and
+then appends with `order = N + 1`; with **zero** steps it appends at `order = 1` — the
+backend always accepts 1 on an empty task and resets its internal counter, so a task whose
+last step was deleted takes new steps again (this was previously a documented limitation and
+is now fixed server-side). Limits: 50 tasks per owner, 99 steps per task, and at most 97
+nested steps on `createTask` itself.
 
 ## Admin operations
 

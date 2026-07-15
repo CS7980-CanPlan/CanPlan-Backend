@@ -25,6 +25,23 @@ export interface Task {
   ownerId: string;
   title: string;
   categoryId?: string | null;
+  /** Per-owner display order (gaps allowed). Null only on un-migrated legacy rows. */
+  order?: number | null;
+  description?: string | null;
+  /** Optional cover image asset id (read-only in this portal — media is out of scope). */
+  coverImageAssetId?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  /** Populated only on the createTask response (the steps it just wrote). */
+  steps?: TaskStep[] | null;
+}
+
+/** One ordered text step of a Task template (media assets are not read by this portal). */
+export interface TaskStep {
+  stepId: string;
+  taskId: string;
+  order: number;
+  text: string;
   description?: string | null;
   createdAt?: string | null;
   updatedAt?: string | null;
@@ -99,6 +116,11 @@ export interface UserProfileConnection {
 
 export interface TaskConnection {
   items: Task[];
+  nextToken: string | null;
+}
+
+export interface TaskStepConnection {
+  items: TaskStep[];
   nextToken: string | null;
 }
 
@@ -207,6 +229,100 @@ export interface SelectPrimaryUserInput {
 /** A SupportPerson un-selects a previously selected primary user (soft-revoke). */
 export interface UnselectPrimaryUserInput {
   primaryUserId: string;
+}
+
+// ── Task-template inputs (SupportPerson-owned templates) ─────────────────────────
+/** A nested step at task creation (text + optional description; no media). */
+export interface CreateTaskStepNestedInput {
+  text: string;
+  description?: string;
+}
+
+/**
+ * Create a task template. This portal NEVER sends `userId` — omitting it makes the
+ * authenticated SupportPerson the owner (a non-self userId would create the task under a
+ * supported primary user instead, which is not this module's purpose).
+ */
+export interface CreateTaskInput {
+  title: string;
+  /** Omit for the owner's default category. Never send a blank string. */
+  categoryId?: string;
+  description?: string;
+  steps?: CreateTaskStepNestedInput[];
+}
+
+/** Partial edit of a task template. Omitted fields keep their current value. */
+export interface UpdateTaskInput {
+  taskId: string;
+  title?: string;
+  /** Omit ⇒ unchanged. Must be a real owned category id — never a blank string. */
+  categoryId?: string;
+  description?: string;
+}
+
+/** Append ONE step. `order` must equal the task's server-side next append position. */
+export interface CreateTaskStepInput {
+  taskId: string;
+  order: number;
+  text: string;
+  description?: string;
+}
+
+/** Partial edit of one step (text and/or description; media is out of scope here). */
+export interface UpdateTaskStepInput {
+  taskId: string;
+  stepId: string;
+  text?: string;
+  description?: string | null;
+}
+
+export interface DeleteTaskStepInput {
+  taskId: string;
+  stepId: string;
+}
+
+/** One step's target position in a whole-task reorder. */
+export interface ReorderTaskStepInput {
+  stepId: string;
+  order: number;
+}
+
+/** Atomic whole-set reorder: every current stepId exactly once with orders 1..N. */
+export interface ReorderTaskStepsInput {
+  taskId: string;
+  steps: ReorderTaskStepInput[];
+}
+
+// ── Task-assignment inputs (schedule rules) ──────────────────────────────────────
+/**
+ * Create a schedule rule binding an OWNED task template to a target user. `assignedBy` is
+ * intentionally absent — the backend derives it from the caller and ignores any input value.
+ * ONE_TIME sends scheduledFor + timezone; RECURRING sends scheduleRule + startDate +
+ * startTime (+ optional endDate) + timezone. Never mix the two shapes.
+ */
+export interface CreateTaskAssignmentInput {
+  taskId: string;
+  userId: string;
+  scheduleType: TaskAssignmentScheduleType;
+  scheduledFor?: string;
+  scheduleRule?: string;
+  startDate?: string;
+  endDate?: string;
+  startTime?: string;
+  timezone: string;
+}
+
+/** End an assignment from `effectiveDate` (YYYY-MM-DD) onward. */
+export interface EndTaskAssignmentInput {
+  userId: string;
+  assignmentId: string;
+  effectiveDate: string;
+}
+
+/** Soft-delete (stop immediately) an assignment. */
+export interface DeleteTaskAssignmentInput {
+  userId: string;
+  assignmentId: string;
 }
 
 // ── Pagination args ──────────────────────────────────────────────────────────────

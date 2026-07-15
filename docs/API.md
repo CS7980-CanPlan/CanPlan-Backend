@@ -877,6 +877,14 @@ categories via the optional `userId` — see below)
 > **`reorderTaskSteps`**. A missing/foreign task returns `NOT_FOUND`/`NOT_AUTHORIZED` (no
 > orphan steps are ever created).
 >
+> **An EMPTY task always appends at `order: 1`.** With zero steps there is nothing to
+> collide with, so the append position is 1 regardless of the internal counter — deleting a
+> task's last step does not strand it (the counter is stale after such a delete because
+> deletes never reclaim orders, and it is not readable via GraphQL). The append transaction
+> resets the counter accordingly, which also heals tasks emptied before this rule existed.
+> Clients can rely on: current step count `N > 0` ⇒ normalize with `reorderTaskSteps` then
+> append at `N + 1`; `N = 0` ⇒ append at `1`.
+>
 > A standalone create may include `media: [{ type, assetId }]` to attach existing uploaded
 > assets in the same transaction as the new step. Each type is allowed once and every entry
 > requires a non-null `assetId` of that exact type. The nested `createTask.steps` input does

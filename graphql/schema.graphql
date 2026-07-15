@@ -574,6 +574,11 @@ input CreateTaskStepNestedInput {
   description: String
 }
 
+# Append ONE step at the task's next append position. `order` must equal that server-
+# maintained position: for a task with N > 0 steps it is the value reorderTaskSteps last
+# normalized to (N + 1 right after a reorder); for a task with ZERO steps it is always 1 —
+# an emptied task (last step deleted) accepts order 1 again and the server resets its
+# internal counter.
 input CreateTaskStepInput {
   taskId: ID!
   order: Int!
@@ -1134,7 +1139,8 @@ type Mutation {
   # Edit an existing task template's fields (partial update). Errors if not found. Authorized
   # against the task's owner: the owner, or a SupportPerson with delegated access to the owner.
   updateTask(input: UpdateTaskInput!): Task
-  # Append a step to a task. Authorized against the task's owner (owner or delegated SupportPerson).
+  # Append a step to a task (order must be the next append position; 1 when the task has no
+  # steps). Authorized against the task's owner (owner or delegated SupportPerson).
   createTaskStep(input: CreateTaskStepInput!): TaskStep
   # Partial edit of one TaskStep: text, description, and/or type-specific media slots.
   # A step may have one IMAGE, one AUDIO, and one VIDEO asset. Errors if not found. Authorized

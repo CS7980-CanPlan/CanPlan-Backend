@@ -9,6 +9,9 @@ import SupportHomePage from '../features/support/SupportHomePage';
 import SupportManagePage from '../features/support/SupportManagePage';
 import SupportProfilePage from '../features/support/SupportProfilePage';
 import SupportUserDetailPage from '../features/support/SupportUserDetailPage';
+import SupportTasksPage from '../features/support/tasks/SupportTasksPage';
+import SupportTaskCreatePage from '../features/support/tasks/SupportTaskCreatePage';
+import SupportTaskDetailPage from '../features/support/tasks/SupportTaskDetailPage';
 import ForbiddenPage from '../features/forbidden/ForbiddenPage';
 import AdminLayout from '../features/admin/AdminLayout';
 import AdminHomePage from '../features/admin/AdminHomePage';
@@ -58,6 +61,9 @@ export function AppRoutes() {
       >
         <Route path="/support/home" element={<SupportHomePage />} />
         <Route path="/support/manage" element={<SupportManagePage />} />
+        <Route path="/support/tasks" element={<SupportTasksPage />} />
+        <Route path="/support/tasks/new" element={<SupportTaskCreatePage />} />
+        <Route path="/support/tasks/:taskId" element={<SupportTaskDetailPage />} />
         <Route path="/support/profile" element={<SupportProfilePage />} />
         <Route path="/support/users/:userId" element={<SupportUserDetailPage />} />
       </Route>

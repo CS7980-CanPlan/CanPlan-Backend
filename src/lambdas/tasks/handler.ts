@@ -475,13 +475,21 @@ async function deleteOldCoverImage(taskId: string, oldAssetId: string): Promise<
  * supplied `order` must equal it (any other value — e.g. one that duplicates an existing
  * step — is rejected; `reorderTaskSteps` is the supported way to insert/reorder).
  *
+ * EMPTY task special case: when `stepCount` is 0 there is no existing `order` to collide
+ * with, so the append position is always 1 — regardless of the stored `nextStepOrder`.
+ * Deleting a task's last step leaves `nextStepOrder` above 1 (delete never reclaims
+ * orders), and that counter is not exposed via GraphQL, so without this rule an emptied
+ * task could never take another standalone step. The transaction RESETS the counter to 2
+ * in that case, which also heals rows emptied before this rule existed.
+ *
  * Atomicity: a single transaction bumps the Task's `stepVersion`, increments `stepCount`
- * (conditioned `< 99`) + `nextStepOrder`, and writes the STEP row — all conditioned on the
- * Task's `stepVersion` still matching the value we read. Optional initial media assets are
- * attached in that same transaction, one per MediaType. Two simultaneous appends therefore
- * cannot both win or produce a duplicate `order`: the loser's `stepVersion` condition fails
- * and it gets a clear, retryable conflict error. Legacy tasks without step metadata are
- * rejected with a migration-required error (run the migration to backfill).
+ * (conditioned `< 99`) + `nextStepOrder` (reset to 2 on the empty path), and writes the
+ * STEP row — all conditioned on the Task's `stepVersion` still matching the value we read.
+ * Optional initial media assets are attached in that same transaction, one per MediaType.
+ * Two simultaneous appends therefore cannot both win or produce a duplicate `order`: the
+ * loser's `stepVersion` condition fails and it gets a clear, retryable conflict error.
+ * Legacy tasks without step metadata are rejected with a migration-required error (run the
+ * migration to backfill).
  */
 async function createTaskStep(
   identity: AppSyncIdentity | undefined,
@@ -515,7 +523,10 @@ async function createTaskStep(
   if (task.stepCount >= MAX_STEPS_PER_TASK) {
     throw new ValidationError(`a task may have at most ${MAX_STEPS_PER_TASK} steps`);
   }
-  const nextOrder = task.nextStepOrder;
+  // An empty task appends at 1, ignoring a stale nextStepOrder left by deleting the last
+  // step (see the doc comment above); the transaction below resets the counter to 2.
+  const appendingToEmptyTask = task.stepCount === 0;
+  const nextOrder = appendingToEmptyTask ? 1 : task.nextStepOrder;
   if (input.order !== nextOrder) {
     throw new ValidationError(
       `order must be ${nextOrder} (the next available position); use reorderTaskSteps to insert or reorder`,
@@ -580,7 +591,10 @@ async function createTaskStep(
               Key: { PK: taskPk(taskId), SK: META_SK },
               UpdateExpression:
                 'SET stepCount = stepCount + :one, stepVersion = stepVersion + :one, ' +
-                'nextStepOrder = nextStepOrder + :one, updatedAt = :now',
+                (appendingToEmptyTask
+                  ? // Reset a possibly-stale counter: the step just written has order 1.
+                    'nextStepOrder = :two, updatedAt = :now'
+                  : 'nextStepOrder = nextStepOrder + :one, updatedAt = :now'),
               // Serialize appends (version) + enforce the cap atomically.
               ConditionExpression:
                 'attribute_exists(PK) AND stepVersion = :expectedVersion AND stepCount < :max',
@@ -589,6 +603,7 @@ async function createTaskStep(
                 ':now': now,
                 ':expectedVersion': task.stepVersion,
                 ':max': MAX_STEPS_PER_TASK,
+                ...(appendingToEmptyTask ? { ':two': 2 } : {}),
               },
             },
           },

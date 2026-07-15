@@ -31,6 +31,18 @@ const TASK_FIELDS = `
   ownerId
   title
   categoryId
+  order
+  description
+  coverImageAssetId
+  createdAt
+  updatedAt
+`;
+
+const TASK_STEP_FIELDS = `
+  stepId
+  taskId
+  order
+  text
   description
   createdAt
   updatedAt
@@ -112,6 +124,27 @@ export const LIST_TASKS_BY_OWNER = /* GraphQL */ `
   }
 `;
 
+/** One task template. Readable by its owner or a delegated/assigned reader. */
+export const GET_TASK = /* GraphQL */ `
+  query GetTask($taskId: ID!) {
+    getTask(taskId: $taskId) {
+      ${TASK_FIELDS}
+    }
+  }
+`;
+
+/** A task's steps sorted by ascending order (same read access as getTask). */
+export const LIST_TASK_STEPS = /* GraphQL */ `
+  query ListTaskSteps($taskId: ID!, $limit: Int, $nextToken: String) {
+    listTaskSteps(taskId: $taskId, limit: $limit, nextToken: $nextToken) {
+      items {
+        ${TASK_STEP_FIELDS}
+      }
+      nextToken
+    }
+  }
+`;
+
 export const LIST_MY_CATEGORIES = /* GraphQL */ `
   query ListMyCategories($userId: ID, $limit: Int, $nextToken: String) {
     listMyCategories(userId: $userId, limit: $limit, nextToken: $nextToken) {
@@ -156,6 +189,101 @@ export const UNSELECT_PRIMARY_USER = /* GraphQL */ `
   mutation UnselectPrimaryUser($input: UnselectPrimaryUserInput!) {
     unselectPrimaryUser(input: $input) {
       ${SUPPORT_LINK_FIELDS}
+    }
+  }
+`;
+
+// ── Task-template mutations (SupportPerson-owned templates) ──────────────────────
+/**
+ * Create a task template owned by the CALLER. The portal never sends `input.userId`, so
+ * the returned ownerId is always the authenticated SupportPerson's sub. The response echoes
+ * the nested steps just written.
+ */
+export const CREATE_TASK = /* GraphQL */ `
+  mutation CreateTask($input: CreateTaskInput!) {
+    createTask(input: $input) {
+      ${TASK_FIELDS}
+      steps {
+        ${TASK_STEP_FIELDS}
+      }
+    }
+  }
+`;
+
+export const UPDATE_TASK = /* GraphQL */ `
+  mutation UpdateTask($input: UpdateTaskInput!) {
+    updateTask(input: $input) {
+      ${TASK_FIELDS}
+    }
+  }
+`;
+
+/** Rejected by the backend while any ACTIVE assignment still references the task. */
+export const DELETE_TASK = /* GraphQL */ `
+  mutation DeleteTask($taskId: ID!) {
+    deleteTask(taskId: $taskId) {
+      taskId
+      title
+    }
+  }
+`;
+
+export const CREATE_TASK_STEP = /* GraphQL */ `
+  mutation CreateTaskStep($input: CreateTaskStepInput!) {
+    createTaskStep(input: $input) {
+      ${TASK_STEP_FIELDS}
+    }
+  }
+`;
+
+export const UPDATE_TASK_STEP = /* GraphQL */ `
+  mutation UpdateTaskStep($input: UpdateTaskStepInput!) {
+    updateTaskStep(input: $input) {
+      ${TASK_STEP_FIELDS}
+    }
+  }
+`;
+
+export const DELETE_TASK_STEP = /* GraphQL */ `
+  mutation DeleteTaskStep($input: DeleteTaskStepInput!) {
+    deleteTaskStep(input: $input) {
+      ${TASK_STEP_FIELDS}
+    }
+  }
+`;
+
+/** Atomic whole-set renumber: send every current stepId once with orders 1..N. */
+export const REORDER_TASK_STEPS = /* GraphQL */ `
+  mutation ReorderTaskSteps($input: ReorderTaskStepsInput!) {
+    reorderTaskSteps(input: $input) {
+      ${TASK_STEP_FIELDS}
+    }
+  }
+`;
+
+// ── Task-assignment mutations (schedule rules) ───────────────────────────────────
+export const CREATE_TASK_ASSIGNMENT = /* GraphQL */ `
+  mutation CreateTaskAssignment($input: CreateTaskAssignmentInput!) {
+    createTaskAssignment(input: $input) {
+      ${TASK_ASSIGNMENT_FIELDS}
+    }
+  }
+`;
+
+/** End an assignment from a date onward (shortens/ends — never extends). */
+export const END_TASK_ASSIGNMENT = /* GraphQL */ `
+  mutation EndTaskAssignment($input: EndTaskAssignmentInput!) {
+    endTaskAssignment(input: $input) {
+      ${TASK_ASSIGNMENT_FIELDS}
+    }
+  }
+`;
+
+/** Soft-delete an assignment (stop immediately; unblocks deleteTask on the template). */
+export const DELETE_TASK_ASSIGNMENT = /* GraphQL */ `
+  mutation DeleteTaskAssignment($input: DeleteTaskAssignmentInput!) {
+    deleteTaskAssignment(input: $input) {
+      ${TASK_ASSIGNMENT_FIELDS}
     }
   }
 `;

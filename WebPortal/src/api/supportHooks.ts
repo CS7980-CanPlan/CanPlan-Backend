@@ -2,28 +2,53 @@
  * React Query hooks wrapping the raw SupportPerson API. Components use these (never supportApi
  * directly) so caching, loading/error state, and post-mutation invalidation are uniform.
  *
- * The support list and org roster are small (people in one organization), so each list hook
- * fetches a single generous page rather than exposing cursor pagination.
+ * The support list and org roster hooks DRAIN every `nextToken` page before returning:
+ * consumers filter them (ACTIVE links, PRIMARY_USER candidates, name lookups), and a single
+ * truncated page would silently hide selectable people.
  */
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
+  createTask,
+  createTaskAssignment,
+  createTaskStep,
+  deleteTask,
+  deleteTaskAssignment,
+  deleteTaskStep,
+  endTaskAssignment,
+  getTask,
   getUserProfile,
+  listAllMyOrganizationUsers,
+  listAllMySupportList,
+  listAllTaskAssignmentsForUser,
+  listAllTaskSteps,
   listMyCategories,
-  listMyOrganizationUsers,
-  listMySupportList,
   listTaskAssignmentsForUser,
   listTasksByOwner,
+  reorderTaskSteps,
   selectPrimaryUser,
   unselectPrimaryUser,
   updateMyUserProfile,
+  updateTask,
+  updateTaskStep,
 } from './supportApi';
 import type {
+  CreateTaskAssignmentInput,
+  CreateTaskInput,
+  CreateTaskStepInput,
+  DeleteTaskAssignmentInput,
+  DeleteTaskStepInput,
+  EndTaskAssignmentInput,
+  ReorderTaskStepsInput,
   SelectPrimaryUserInput,
   UnselectPrimaryUserInput,
   UpdateMyUserProfileInput,
+  UpdateTaskInput,
+  UpdateTaskStepInput,
 } from './apiTypes';
 
 const LIST_PAGE_SIZE = 100;
+/** Owned-template pages are small so "Load more" is visible well before the 50-task cap. */
+const OWNED_TASKS_PAGE_SIZE = 25;
 
 /** Centralized query keys so hooks and invalidation can't drift apart. */
 export const supportKeys = {
@@ -33,22 +58,29 @@ export const supportKeys = {
   tasks: (ownerId: string) => ['support', 'tasks', ownerId] as const,
   categories: (userId: string) => ['support', 'categories', userId] as const,
   assignments: (userId: string) => ['support', 'assignments', userId] as const,
+  ownedTasks: (ownerId: string) => ['support', 'ownedTasks', ownerId] as const,
+  task: (taskId: string) => ['support', 'task', taskId] as const,
+  taskSteps: (taskId: string) => ['support', 'taskSteps', taskId] as const,
 };
 
 // ── Queries ──────────────────────────────────────────────────────────────────────
-/** The caller's own support list (primary users they have selected — ACTIVE + REVOKED). */
+/**
+ * The caller's COMPLETE support list (ACTIVE + REVOKED), all pages drained. Kept in the
+ * connection shape ({ items, nextToken: null }) so existing consumers reading `data.items`
+ * see the full list without changes.
+ */
 export function useMySupportList() {
   return useQuery({
     queryKey: supportKeys.supportList,
-    queryFn: () => listMySupportList({ limit: LIST_PAGE_SIZE }),
+    queryFn: async () => ({ items: await listAllMySupportList(), nextToken: null }),
   });
 }
 
-/** The caller's own organization roster (used to pick primary users to support). */
+/** The caller's COMPLETE organization roster, all pages drained (same shape rationale). */
 export function useMyOrganizationUsers() {
   return useQuery({
     queryKey: supportKeys.orgUsers,
-    queryFn: () => listMyOrganizationUsers({ limit: LIST_PAGE_SIZE }),
+    queryFn: async () => ({ items: await listAllMyOrganizationUsers(), nextToken: null }),
   });
 }
 
@@ -88,6 +120,21 @@ export function useUserAssignments(userId: string | undefined) {
   });
 }
 
+/**
+ * ALL of one user's assignments, every page drained. The Tasks module filters these by
+ * taskId client-side (there is no by-task query), so partial pages would wrongly hide
+ * assignments that live beyond the first cursor. Its key extends
+ * `supportKeys.assignments(userId)`, so the assignment-mutation hooks' prefix invalidation
+ * refreshes this and the single-page variant together.
+ */
+export function useUserAssignmentsAll(userId: string | undefined) {
+  return useQuery({
+    queryKey: [...supportKeys.assignments(userId ?? ''), 'all'] as const,
+    queryFn: () => listAllTaskAssignmentsForUser(userId as string),
+    enabled: Boolean(userId),
+  });
+}
+
 // ── Mutations ────────────────────────────────────────────────────────────────────
 /**
  * Update the caller's own profile. Invalidates the caller's own cached profile plus the org
@@ -118,5 +165,153 @@ export function useUnselectPrimaryUser() {
   return useMutation({
     mutationFn: (input: UnselectPrimaryUserInput) => unselectPrimaryUser(input),
     onSuccess: () => qc.invalidateQueries({ queryKey: supportKeys.supportList }),
+  });
+}
+
+// ── Owned task templates (the Tasks module) ──────────────────────────────────────
+/**
+ * The caller's OWN task templates, cursor-paginated ("Load more"). `ownerId` must be the
+ * authenticated SupportPerson's Cognito sub — this hook is never pointed at a supported
+ * user (that read-only view is `useTasksByOwner` on the user-detail page).
+ */
+export function useOwnedTasks(ownerId: string | undefined) {
+  return useInfiniteQuery({
+    queryKey: supportKeys.ownedTasks(ownerId ?? ''),
+    queryFn: ({ pageParam }) =>
+      listTasksByOwner(ownerId as string, {
+        limit: OWNED_TASKS_PAGE_SIZE,
+        nextToken: pageParam,
+      }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) => lastPage.nextToken ?? undefined,
+    enabled: Boolean(ownerId),
+  });
+}
+
+/** One task template (owner or delegated/assigned read). Disabled until taskId is known. */
+export function useTask(taskId: string | undefined) {
+  return useQuery({
+    queryKey: supportKeys.task(taskId ?? ''),
+    queryFn: () => getTask(taskId as string),
+    enabled: Boolean(taskId),
+  });
+}
+
+/**
+ * ALL of a task's steps, sorted by order. Drains every `nextToken` page up front because
+ * reorder/append must operate on the complete current set (≤ 99 steps, so this is 1 page).
+ */
+export function useTaskSteps(taskId: string | undefined) {
+  return useQuery({
+    queryKey: supportKeys.taskSteps(taskId ?? ''),
+    queryFn: () => listAllTaskSteps(taskId as string),
+    enabled: Boolean(taskId),
+  });
+}
+
+/** Invalidate everything the task detail page reads for one task. */
+function invalidateTaskDetail(qc: ReturnType<typeof useQueryClient>, taskId: string) {
+  qc.invalidateQueries({ queryKey: supportKeys.task(taskId) });
+  qc.invalidateQueries({ queryKey: supportKeys.taskSteps(taskId) });
+}
+
+/** Invalidate every cached list of this owner's tasks (paged module list + legacy list). */
+function invalidateOwnerTaskLists(qc: ReturnType<typeof useQueryClient>, ownerId?: string) {
+  if (!ownerId) return;
+  qc.invalidateQueries({ queryKey: supportKeys.ownedTasks(ownerId) });
+  qc.invalidateQueries({ queryKey: supportKeys.tasks(ownerId) });
+}
+
+/** Create an OWNED task template. Invalidates the owner's template list. */
+export function useCreateTask(ownerId: string | undefined) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: CreateTaskInput) => createTask(input),
+    onSuccess: () => invalidateOwnerTaskLists(qc, ownerId),
+  });
+}
+
+export function useUpdateTask(ownerId: string | undefined) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: UpdateTaskInput) => updateTask(input),
+    onSuccess: (task) => {
+      invalidateTaskDetail(qc, task.taskId);
+      invalidateOwnerTaskLists(qc, ownerId);
+    },
+  });
+}
+
+/** Delete an owned template. The backend rejects it while active assignments reference it. */
+export function useDeleteTask(ownerId: string | undefined) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (taskId: string) => deleteTask(taskId),
+    onSuccess: (deleted) => {
+      qc.removeQueries({ queryKey: supportKeys.task(deleted.taskId) });
+      qc.removeQueries({ queryKey: supportKeys.taskSteps(deleted.taskId) });
+      invalidateOwnerTaskLists(qc, ownerId);
+    },
+  });
+}
+
+export function useCreateTaskStep(taskId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: CreateTaskStepInput) => createTaskStep(input),
+    onSuccess: () => invalidateTaskDetail(qc, taskId),
+  });
+}
+
+export function useUpdateTaskStep(taskId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: UpdateTaskStepInput) => updateTaskStep(input),
+    onSuccess: () => invalidateTaskDetail(qc, taskId),
+  });
+}
+
+export function useDeleteTaskStep(taskId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: DeleteTaskStepInput) => deleteTaskStep(input),
+    onSuccess: () => invalidateTaskDetail(qc, taskId),
+  });
+}
+
+export function useReorderTaskSteps(taskId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: ReorderTaskStepsInput) => reorderTaskSteps(input),
+    onSuccess: () => invalidateTaskDetail(qc, taskId),
+  });
+}
+
+// ── Task-assignment mutations (schedule rules for a target user) ─────────────────
+/** Create a schedule rule. Invalidates the TARGET user's assignment list. */
+export function useCreateTaskAssignment() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: CreateTaskAssignmentInput) => createTaskAssignment(input),
+    onSuccess: (assignment) =>
+      qc.invalidateQueries({ queryKey: supportKeys.assignments(assignment.userId) }),
+  });
+}
+
+export function useEndTaskAssignment() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: EndTaskAssignmentInput) => endTaskAssignment(input),
+    onSuccess: (assignment) =>
+      qc.invalidateQueries({ queryKey: supportKeys.assignments(assignment.userId) }),
+  });
+}
+
+export function useDeleteTaskAssignment() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: DeleteTaskAssignmentInput) => deleteTaskAssignment(input),
+    onSuccess: (assignment) =>
+      qc.invalidateQueries({ queryKey: supportKeys.assignments(assignment.userId) }),
   });
 }
