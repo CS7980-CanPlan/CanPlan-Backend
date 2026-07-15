@@ -49,6 +49,7 @@ export function NewPasswordRequiredForm({ email }: { email: string }) {
       <TextField
         label="New password"
         type="password"
+        showPasswordToggle
         autoComplete="new-password"
         required
         value={password}
@@ -58,6 +59,7 @@ export function NewPasswordRequiredForm({ email }: { email: string }) {
       <TextField
         label="Confirm new password"
         type="password"
+        showPasswordToggle
         autoComplete="new-password"
         required
         value={confirm}

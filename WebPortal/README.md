@@ -44,9 +44,11 @@ caller's `SupportPerson` role plus an ACTIVE `SupportLink` to the target primary
      back to the portal home and a sign-out action.
 5. Guarded screens never render before the session check completes.
 
-Tokens are managed by Amplify's session store and read via `fetchAuthSession()` — they are
-**never** persisted to `localStorage` by this app. The GraphQL client fetches a fresh ID
-token per request so a silently-refreshed token is always used.
+Tokens are managed by Amplify's browser session store and read via `fetchAuthSession()` —
+the app never handles or stores them manually. The GraphQL client fetches a fresh ID token
+per request so a silently-refreshed token is always used. ID and access tokens use their
+one-hour Cognito default lifetime and can refresh silently for up to **five days**; after
+that, the user must sign in again.
 
 > **Bootstrap the first admin:** there is no self-service way to become SystemAdmin. Add the
 > first admin to the `SystemAdmin` Cognito group manually (AWS console, or

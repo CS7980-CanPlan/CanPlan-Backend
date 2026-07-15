@@ -60,6 +60,9 @@ export class Auth extends Construct {
     this.userPoolClient = this.userPool.addClient('CanPlanUserPoolClient', {
       userPoolClientName: `CanPlan-${envName}-UserPoolClient`,
       generateSecret: false,
+      // ID/access tokens still refresh silently after their default one-hour lifetime,
+      // but require the user to authenticate again after five days.
+      refreshTokenValidity: cdk.Duration.days(5),
       authFlows: {
         userPassword: true,
         userSrp: true,

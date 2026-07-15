@@ -64,6 +64,28 @@
   white-space: nowrap;
 }
 
+@media (max-width: 640px) {
+  .topbarInner {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .topbarSpacer {
+    display: none;
+  }
+
+  .account {
+    width: 100%;
+    justify-content: flex-end;
+    gap: 0.5rem;
+  }
+
+  .accountEmail {
+    flex: 1;
+    max-width: none;
+  }
+}
+
 .tabs {
   max-width: 1180px;
   margin: 0 auto;
@@ -249,7 +271,16 @@
   font-size: 0.78rem;
 }
 .idCell {
+  display: inline-flex;
+  align-items: center;
+  width: 100%;
   max-width: 16rem;
+  min-width: 0;
+  vertical-align: middle;
+}
+.idCell .mono {
+  display: block;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -263,6 +294,7 @@
   padding: 0.15rem;
   border-radius: 4px;
   display: inline-flex;
+  flex: 0 0 auto;
   vertical-align: middle;
   margin-left: 0.25rem;
 }
@@ -433,6 +465,7 @@
 }
 .detailValue {
   font-size: 0.9rem;
+  min-width: 0;
   overflow-wrap: anywhere;
 }
 .sectionTitle {

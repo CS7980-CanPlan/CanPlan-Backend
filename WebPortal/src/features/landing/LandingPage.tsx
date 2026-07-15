@@ -11,16 +11,16 @@ interface PortalLink {
 
 const PORTALS: PortalLink[] = [
   {
-    to: '/admin',
-    icon: ShieldCheck,
-    title: 'Administrator',
-    description: 'Manage users, tasks, and organizations across the platform.',
-  },
-  {
     to: '/support',
     icon: LifeBuoy,
     title: 'Support Person',
     description: 'Sign in to support the primary users you are linked to.',
+  },
+  {
+    to: '/admin',
+    icon: ShieldCheck,
+    title: 'Administrator',
+    description: 'Manage users, tasks, and organizations across the platform.',
   },
 ];
 

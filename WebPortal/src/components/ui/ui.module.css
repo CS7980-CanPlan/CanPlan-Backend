@@ -88,6 +88,11 @@
   color: var(--color-danger);
   margin-left: 0.15rem;
 }
+.controlWrap {
+  position: relative;
+  display: flex;
+  min-width: 0;
+}
 .control {
   font: inherit;
   font-size: 0.875rem;
@@ -110,6 +115,37 @@
 }
 .controlInvalid {
   border-color: var(--color-danger);
+}
+.controlWithTrailingAction {
+  padding-right: 2.5rem;
+}
+.passwordToggle {
+  position: absolute;
+  top: 50%;
+  right: 0.25rem;
+  display: grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  color: var(--color-text-muted);
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transform: translateY(-50%);
+}
+.passwordToggle:not(:disabled):hover {
+  color: var(--color-text);
+  background: var(--color-bg);
+}
+.passwordToggle:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 1px;
+}
+.passwordToggle:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 .hint {
   font-size: 0.75rem;

@@ -104,6 +104,7 @@ export function LoginCard({ icon, brandText, subtitle, footnote, redirectFor }: 
             <TextField
               label="Password"
               type="password"
+              showPasswordToggle
               autoComplete="current-password"
               required
               value={password}
