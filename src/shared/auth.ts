@@ -20,3 +20,19 @@ export function requireGroup(identity: AppSyncIdentity | undefined, group: strin
     throw new UnauthorizedError(`Unauthorized: ${group} access required`);
   }
 }
+
+/**
+ * Throw UnauthorizedError unless the caller belongs to AT LEAST ONE of the given Cognito
+ * groups. The Lambda-side half of defense-in-depth for fields whose AppSync directive lists
+ * several allowed groups (e.g. the PrimaryUser/SupportPerson organization directory) — never
+ * rely on the GraphQL directive alone.
+ */
+export function requireAnyGroup(
+  identity: AppSyncIdentity | undefined,
+  groups: readonly string[],
+): void {
+  const memberships = getGroups(identity);
+  if (!groups.some((group) => memberships.includes(group))) {
+    throw new UnauthorizedError(`Unauthorized: one of [${groups.join(', ')}] access required`);
+  }
+}

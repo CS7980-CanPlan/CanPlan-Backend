@@ -7,11 +7,14 @@
 // Query pagination) and delete in BatchWriteItem chunks — non-transactional, but it
 // scales past the 100-item ceiling. See each caller for the ordering it relies on.
 
-import { BatchWriteCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
+import { BatchGetCommand, BatchWriteCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
 import { dynamo, TABLE_NAME } from './dynamodb';
 
 /** DynamoDB BatchWriteItem accepts at most 25 write requests per call. */
 export const BATCH_WRITE_LIMIT = 25;
+
+/** DynamoDB BatchGetItem accepts at most 100 keys per call. */
+export const BATCH_GET_LIMIT = 100;
 
 /** A bare composite primary key (the only attributes a delete needs). */
 export interface ItemKey {
@@ -32,9 +35,7 @@ export async function queryAllKeys(pk: string, skPrefix?: string): Promise<ItemK
     const result = await dynamo.send(
       new QueryCommand({
         TableName: TABLE_NAME,
-        KeyConditionExpression: skPrefix
-          ? 'PK = :pk AND begins_with(SK, :prefix)'
-          : 'PK = :pk',
+        KeyConditionExpression: skPrefix ? 'PK = :pk AND begins_with(SK, :prefix)' : 'PK = :pk',
         ExpressionAttributeValues: skPrefix ? { ':pk': pk, ':prefix': skPrefix } : { ':pk': pk },
         ProjectionExpression: 'PK, SK',
         ExclusiveStartKey: startKey,
@@ -78,6 +79,46 @@ export async function queryAllItems<T>(pk: string, skPrefix: string): Promise<T[
     KeyConditionExpression: 'PK = :pk AND begins_with(SK, :prefix)',
     ExpressionAttributeValues: { ':pk': pk, ':prefix': skPrefix },
   });
+}
+
+/**
+ * Read many items by key with BatchGetItem, in chunks of 100 and with a bounded retry for
+ * throttling-driven UnprocessedKeys (mirroring batchDelete/batchPut). Returns whatever items
+ * exist — DynamoDB simply omits missing keys, so the result may be shorter than `keys` and
+ * carries no ordering guarantee; callers index the items by key themselves. Throws if keys
+ * are still unprocessed after the retry budget rather than silently dropping rows.
+ */
+export async function batchGet(keys: ItemKey[]): Promise<Record<string, unknown>[]> {
+  const items: Record<string, unknown>[] = [];
+  for (let i = 0; i < keys.length; i += BATCH_GET_LIMIT) {
+    const chunk = keys.slice(i, i + BATCH_GET_LIMIT);
+    let requestKeys: ItemKey[] = chunk;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const result = await dynamo.send(
+        new BatchGetCommand({
+          RequestItems: {
+            [TABLE_NAME]: {
+              Keys: requestKeys.map(({ PK, SK }) => ({ PK, SK })),
+              // Current-support and directory filtering are authorization/availability views;
+              // they must not trust stale profile or deleting-org images.
+              ConsistentRead: true,
+            },
+          },
+        }),
+      );
+      items.push(...((result.Responses?.[TABLE_NAME] as Record<string, unknown>[]) ?? []));
+      const unprocessed = result.UnprocessedKeys?.[TABLE_NAME]?.Keys as ItemKey[] | undefined;
+      if (!unprocessed?.length) {
+        requestKeys = [];
+        break;
+      }
+      requestKeys = unprocessed;
+    }
+    if (requestKeys.length) {
+      throw new Error(`batchGet: ${requestKeys.length} key(s) still unprocessed after retries`);
+    }
+  }
+  return items;
 }
 
 /**

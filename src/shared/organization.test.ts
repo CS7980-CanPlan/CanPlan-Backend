@@ -31,6 +31,7 @@ describe('getOrganization', () => {
     mockSend.mockResolvedValueOnce({ Item: orgRow() });
     const org = await getOrganization('o1');
     expect(lastInput().Key).toEqual({ PK: 'ORG#o1', SK: '#META' });
+    expect(lastInput().ConsistentRead).toBe(true);
     expect(org?.organizationId).toBe('o1');
   });
 

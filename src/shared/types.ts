@@ -6,6 +6,14 @@
 // ── Enums (mirror graphql/schema.graphql) ─────────────────────────────────────
 export type UserRole = 'PRIMARY_USER' | 'SUPPORT_PERSON' | 'ORG_ADMIN';
 export type SupportLinkStatus = 'PENDING' | 'ACTIVE' | 'REVOKED';
+/**
+ * Machine-readable reason a SupportLink was soft-revoked (internal; not exposed in GraphQL):
+ *  - `ORG_MEMBERSHIP_CHANGED` — either party actually joined, left, or moved organizations, so
+ *    affected older relationships were revoked automatically. Sharing an org again does NOT
+ *    restore them; the SupportPerson must call selectPrimaryUser again.
+ *  - `UNSELECTED` — the SupportPerson explicitly called unselectPrimaryUser.
+ */
+export type SupportLinkRevocationReason = 'ORG_MEMBERSHIP_CHANGED' | 'UNSELECTED';
 export type MediaType = 'IMAGE' | 'AUDIO' | 'VIDEO';
 /** createAiTask fallback policy, chosen per request (not by role). */
 export type AiTaskGroundingMode = 'GROUNDED_ONLY' | 'ALLOW_UNGROUNDED_FALLBACK';
@@ -41,6 +49,16 @@ export interface UserProfile {
   displayName?: string;
   email?: string;
   organizationId?: string;
+  /**
+   * Internal organization membership SESSION id (never exposed in GraphQL). A fresh UUID is
+   * minted whenever the user actually joins an organization (from none) or moves to a different
+   * one; it is removed when they leave; and it is kept unchanged when organizationId is re-set
+   * to its current value. SupportLinks snapshot both parties' membership ids at selection time,
+   * so a link stops being effective the moment either membership session ends — even if both
+   * users later rejoin the same organization. Legacy profiles (org set before this field
+   * existed) are initialized lazily at runtime (`ensureOrganizationMembershipId`); no migration.
+   */
+  organizationMembershipId?: string;
   accessibilitySettings?: Record<string, unknown>;
   /**
    * Id of this user's mandatory default Category (a real Category row with
@@ -68,13 +86,28 @@ export interface SupportLink {
   /** Mirror of primaryUserId — the supporterIndex sort key. */
   userId: string;
   status: SupportLinkStatus;
+  /**
+   * Membership snapshot written by selectPrimaryUser (internal; not exposed in GraphQL):
+   * the organization the relationship was selected in, plus BOTH parties' current
+   * organizationMembershipId at selection time. Delegated access requires all three to still
+   * match the parties' live profiles — an ACTIVE status alone grants nothing. Absent on
+   * legacy links (selected before these fields existed), which therefore fail closed until
+   * the SupportPerson explicitly re-selects the user; there is no bulk backfill.
+   */
+  organizationId?: string;
+  supporterOrganizationMembershipId?: string;
+  primaryUserOrganizationMembershipId?: string;
+  /** Why a REVOKED link was revoked (internal); removed when the link is restored to ACTIVE. */
+  revokedReason?: SupportLinkRevocationReason;
   createdAt: string;
   updatedAt?: string;
 }
 
 /**
  * An organization a UserProfile.organizationId references. PK = ORG#<organizationId>,
- * SK = #META. Managed by SystemAdmin-only admin APIs.
+ * SK = #META. Created/renamed/deleted only by SystemAdmin admin APIs; PrimaryUser and
+ * SupportPerson may READ the directory of joinable organizations via
+ * listAvailableOrganizations / getOrganization (deleting orgs are excluded there).
  */
 export interface Organization {
   organizationId: string;
@@ -384,6 +417,8 @@ export interface CreateMyUserProfileInput {
  * ⇒ FULL replacement of the stored settings (never deep-merged).
  * `organizationId` (MVP self-service org membership): omitted (the key absent) ⇒ unchanged; a
  * non-empty string ⇒ set; explicit `null` ⇒ cleared. Any signed-in user may change their own.
+ * A real join/move/leave rotates or clears the internal membership session and soft-revokes
+ * affected SupportLinks; re-setting the current org preserves the session and revokes nothing.
  */
 export interface UpdateMyUserProfileInput {
   displayName?: string | null;
@@ -391,7 +426,7 @@ export interface UpdateMyUserProfileInput {
   organizationId?: string | null;
 }
 
-/** A SupportPerson selects a primary user (supporter derived from identity). Writes ACTIVE. */
+/** Explicitly select/reselect an in-org primary user; writes ACTIVE with a membership snapshot. */
 export interface SelectPrimaryUserInput {
   primaryUserId: string;
 }
@@ -828,7 +863,8 @@ export interface DeleteOrganizationInput {
  * Admin sets/clears ANOTHER user's organization membership (SystemAdmin-only — distinct from the
  * self-only updateMyUserProfile). `organizationId`: a non-null id joins that org (must exist and not
  * be deleting); explicit `null` clears membership. The field is required at runtime so omitted values
- * cannot accidentally clear a user's org. Membership rows are kept in step atomically.
+ * cannot accidentally clear a user's org. Membership rows are kept in step atomically; a real
+ * org change also rotates/clears the internal membership session and revokes affected links.
  */
 export interface AdminSetUserOrganizationInput {
   userId: string;

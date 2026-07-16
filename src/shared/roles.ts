@@ -16,12 +16,15 @@ const GROUP_TO_ROLE: Readonly<Record<string, UserRole>> = {
   OrganizationAdmin: 'ORG_ADMIN',
 };
 
+/** The Cognito group that maps to the PRIMARY_USER role (self-signup users). */
+export const PRIMARY_USER_GROUP = 'PrimaryUser';
+
 /** The Cognito group that maps to the SUPPORT_PERSON role (the delegated-access actor). */
 export const SUPPORT_PERSON_GROUP = 'SupportPerson';
 
 /**
  * True when the caller is a SupportPerson — the only role permitted to select/unselect
- * primary users and to act on a selected primary user's schedule via an active SupportLink.
+ * primary users and to act on a selected primary user's schedule via an effective SupportLink.
  * Membership in the Cognito group is the authorization source of truth (cheaper and stricter
  * than deriving the full role, which also rejects multi/zero base-role callers).
  */
@@ -37,7 +40,11 @@ export function isSupportPerson(identity: AppSyncIdentity | undefined): boolean 
  */
 export function roleFromIdentity(identity: AppSyncIdentity | undefined): UserRole {
   const roles = [
-    ...new Set(getGroups(identity).map((g) => GROUP_TO_ROLE[g]).filter((r): r is UserRole => Boolean(r))),
+    ...new Set(
+      getGroups(identity)
+        .map((g) => GROUP_TO_ROLE[g])
+        .filter((r): r is UserRole => Boolean(r)),
+    ),
   ];
 
   if (roles.length === 0) {

@@ -41,8 +41,8 @@ import type {
  *
  * Ownership: each operation resolves a target owner from an optional `userId` — omitted/null
  * means the authenticated caller (event.identity.sub); a non-self `userId` targets that
- * primary user and is authorized via `assertCanActForUser` (SupportPerson delegated access:
- * an ACTIVE SupportLink to a PRIMARY_USER in the same organization). Delegated writes always
+ * primary user and is authorized via `assertCanActForUser` (effective SupportPerson delegation:
+ * ACTIVE with a current organization/membership snapshot). Delegated writes always
  * key rows under the target user's partition, never the SupportPerson's. There is no
  * client-supplied ownerId beyond this delegation path.
  */

@@ -3,13 +3,19 @@
 // The strict self-ownership model in `authz.ts` answers "is the caller this resource's
 // owner?". This module adds the one delegated relationship CanPlan supports: a SupportPerson
 // acting on a PRIMARY_USER they have *selected*. Selection is a SupportLink
-// (PK = SUPPORTER#<supporterId>, SK = USER#<primaryUserId>); delegated access is granted only
-// while that link is ACTIVE *and* both parties currently share an organizationId — so a stale
-// link left over from before an org change never keeps granting access.
+// (PK = SUPPORTER#<supporterId>, SK = USER#<primaryUserId>). An ACTIVE status alone grants
+// NOTHING: the link must also carry the organization + membership-session snapshot written by
+// selectPrimaryUser, and that snapshot must still match BOTH parties' live profiles — the same
+// non-null organizationId and, on each side, the exact organizationMembershipId the
+// relationship was selected under. Because a membership id rotates on every real org join or
+// move (and clears on leave — see src/shared/organizationMembership.ts), a link left over from
+// before an org change never keeps granting access, even if both users later rejoin the same
+// organization; only an explicit re-selection restores it. Legacy links without the snapshot
+// fields fail closed the same way (no migration — the SupportPerson re-selects instead).
 //
 // Two access shapes live here:
 //  - `assertCanActForUser` — write/act on a user's schedule (TaskAssignment / TaskInstance).
-//    The caller is either that user (self) or their active SupportPerson in the same org.
+//    The caller is either that user (self) or their currently-effective SupportPerson.
 //  - `assertCanReadTask` — READ-ONLY access to a task template/steps/media. The owner always
 //    may; additionally a user who holds an ACTIVE assignment referencing the task may read it
 //    (so an assigned primary user can see the SupportPerson's template), but never mutate it.
@@ -33,7 +39,12 @@ import type { AppSyncIdentity, SupportLink, Task, UserProfile } from './types';
 /** Read a user's #PROFILE row (undefined if the profile doesn't exist). */
 export async function loadProfile(userId: string): Promise<UserProfile | undefined> {
   const result = await dynamo.send(
-    new GetCommand({ TableName: TABLE_NAME, Key: { PK: userPk(userId), SK: PROFILE_SK } }),
+    new GetCommand({
+      TableName: TABLE_NAME,
+      Key: { PK: userPk(userId), SK: PROFILE_SK },
+      // Authorization must observe a just-committed org leave/move immediately.
+      ConsistentRead: true,
+    }),
   );
   return result.Item as UserProfile | undefined;
 }
@@ -47,6 +58,8 @@ export async function loadSupportLink(
     new GetCommand({
       TableName: TABLE_NAME,
       Key: { PK: supporterPk(supporterId), SK: userLinkSk(primaryUserId) },
+      // A just-revoked link must never authorize through a stale read.
+      ConsistentRead: true,
     }),
   );
   return result.Item as SupportLink | undefined;
@@ -92,15 +105,79 @@ export async function hasActiveAssignmentForTask(userId: string, taskId: string)
 }
 
 /**
+ * Why a SupportLink is NOT a currently effective support relationship, or `null` when it is.
+ * The single source of truth shared by delegated-access checks (assertCanActForUser) and the
+ * support list (listMySupportList), so authorization and presentation can never disagree.
+ *
+ * A link is effective only when ALL hold:
+ *  - the link exists and its status is ACTIVE;
+ *  - both the supporter's and the target's profiles exist;
+ *  - the target's role is still PRIMARY_USER;
+ *  - both profiles carry the same non-null organizationId;
+ *  - the link's snapshot (organizationId + both organizationMembershipIds, written by
+ *    selectPrimaryUser) is present and matches that organization and both profiles' CURRENT
+ *    membership ids.
+ * A missing or mismatched snapshot/membership id fails closed: legacy ACTIVE links without the
+ *  snapshot, and links selected under an older membership session (either party left/moved —
+ * even back to the same org), grant nothing until the SupportPerson re-selects the user.
+ */
+export function supportLinkIneffectiveReason(
+  link: SupportLink | undefined,
+  supporterProfile: UserProfile | undefined,
+  targetProfile: UserProfile | undefined,
+): string | null {
+  if (!link || link.status !== 'ACTIVE') {
+    return 'no active support link to this user (select the user first)';
+  }
+  if (!targetProfile) {
+    return 'the selected user no longer has a profile (cannot delegate access)';
+  }
+  // Delegation only ever targets a PRIMARY_USER. A legacy/stale ACTIVE link pointing at a
+  // SUPPORT_PERSON or ORG_ADMIN must NOT grant access, regardless of org.
+  if (targetProfile.role !== 'PRIMARY_USER') {
+    return 'delegated access is only permitted for a primary user';
+  }
+  if (!supporterProfile) {
+    return 'the support person no longer has a profile (cannot delegate access)';
+  }
+  // Both parties must currently share an organization.
+  const supporterOrg = supporterProfile.organizationId?.trim();
+  const targetOrg = targetProfile.organizationId?.trim();
+  if (!supporterOrg || !targetOrg || supporterOrg !== targetOrg) {
+    return 'support person and user are no longer in the same organization';
+  }
+  // The link must have been selected in THAT organization, under BOTH parties' current
+  // membership sessions. Absent fields (legacy link, un-initialized legacy profile) fail
+  // closed exactly like a mismatch — ACTIVE status alone is insufficient.
+  if (
+    !link.organizationId ||
+    !link.supporterOrganizationMembershipId ||
+    !link.primaryUserOrganizationMembershipId ||
+    !supporterProfile.organizationMembershipId ||
+    !targetProfile.organizationMembershipId ||
+    link.organizationId !== supporterOrg ||
+    link.supporterOrganizationMembershipId !== supporterProfile.organizationMembershipId ||
+    link.primaryUserOrganizationMembershipId !== targetProfile.organizationMembershipId
+  ) {
+    return (
+      'the support link is stale (selected under a previous organization membership); ' +
+      'the support person must select the user again'
+    );
+  }
+  return null;
+}
+
+/**
  * Assert the caller may act on `targetUserId`'s schedule (TaskAssignment / TaskInstance) and
  * return the caller's id (Cognito `sub`). Two paths:
  *  - **Self:** the caller is the target user — always allowed (no extra reads).
- *  - **Delegated:** the caller is a SupportPerson holding an ACTIVE SupportLink to the target,
- *    the target is still a PRIMARY_USER, and the target currently shares the caller's
- *    organizationId. A revoked/missing link, a non-SupportPerson caller, a target that is not a
- *    primary user (e.g. a legacy link pointing at a SupportPerson/ORG_ADMIN), a deleted target,
- *    or an org mismatch (either party moved orgs after the link was created) is denied — so a
- *    stale link never grants access.
+ *  - **Delegated:** the caller is a SupportPerson whose SupportLink to the target is currently
+ *    EFFECTIVE per `supportLinkIneffectiveReason`: ACTIVE, target still a PRIMARY_USER, both
+ *    profiles present and in the same organization, and the link's organization + membership
+ *    snapshot matching both parties' current membership sessions. A revoked/missing link, a
+ *    non-SupportPerson caller, a deleted party, an org mismatch, or a stale/absent membership
+ *    snapshot (either party left or changed orgs after selection — even back to the same org,
+ *    or a legacy link without the snapshot) is denied, so a stale link never grants access.
  */
 export async function assertCanActForUser(
   identity: AppSyncIdentity | undefined,
@@ -112,7 +189,8 @@ export async function assertCanActForUser(
   // Self-access never needs a role, a link, or an org — a user always owns their own schedule.
   if (caller === target) return caller;
 
-  // Only a SupportPerson can be delegated access to another user.
+  // Only a SupportPerson can be delegated access to another user. Cognito group membership is
+  // the authorization source of truth.
   if (!isSupportPerson(identity)) {
     throw new UnauthorizedError(
       'Unauthorized: caller is not allowed to act on this user (no active support link)',
@@ -120,9 +198,10 @@ export async function assertCanActForUser(
   }
 
   const link = await loadSupportLink(caller, target);
+  // Skip the profile reads when the link alone already fails (missing/REVOKED).
   if (!link || link.status !== 'ACTIVE') {
     throw new UnauthorizedError(
-      'Unauthorized: no active support link to this user (select the user first)',
+      `Unauthorized: ${supportLinkIneffectiveReason(link, undefined, undefined)}`,
     );
   }
 
@@ -131,37 +210,15 @@ export async function assertCanActForUser(
     loadProfile(target),
   ]);
 
-  // The target must still be a real profile — a link pointing at a deleted user grants nothing.
-  if (!targetProfile) {
-    throw new UnauthorizedError(
-      'Unauthorized: the selected user no longer has a profile (cannot delegate access)',
-    );
-  }
-
-  // Delegation only ever targets a PRIMARY_USER. A legacy/stale ACTIVE link pointing at a
-  // SUPPORT_PERSON or ORG_ADMIN must NOT grant schedule access, regardless of org.
-  if (targetProfile.role !== 'PRIMARY_USER') {
-    throw new UnauthorizedError(
-      'Unauthorized: delegated schedule access is only permitted for a primary user',
-    );
-  }
-
-  // Both parties must currently share an organization — a link from before an org change
-  // does not keep granting access.
-  const supporterOrg = supporterProfile?.organizationId?.trim();
-  const targetOrg = targetProfile.organizationId?.trim();
-  if (!supporterOrg || !targetOrg || supporterOrg !== targetOrg) {
-    throw new UnauthorizedError(
-      'Unauthorized: support person and user are no longer in the same organization',
-    );
-  }
+  const reason = supportLinkIneffectiveReason(link, supporterProfile, targetProfile);
+  if (reason) throw new UnauthorizedError(`Unauthorized: ${reason}`);
 
   return caller;
 }
 
 /**
  * Non-throwing form of `assertCanActForUser`: returns true when the caller may act for
- * `targetUserId` (self or active SupportPerson delegation), false when a delegation check
+ * `targetUserId` (self or effective SupportPerson delegation), false when a delegation check
  * denies it. Any non-authorization error still propagates.
  */
 export async function canActForUser(
@@ -191,7 +248,7 @@ export async function assertCanReadTask(
 ): Promise<string> {
   const caller = requireCaller(identity);
   if (caller === task.ownerId) return caller;
-  // A delegated manager (SupportPerson with an active link to the owner) may read.
+  // A delegated manager (SupportPerson with an effective link to the owner) may read.
   if (await canActForUser(identity, task.ownerId)) return caller;
   // An assigned user (active assignment referencing this task) may read — read-only.
   if (await hasActiveAssignmentForTask(caller, task.taskId)) return caller;

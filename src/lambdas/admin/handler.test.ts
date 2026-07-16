@@ -44,7 +44,10 @@ const mockQueryAllItems = queryAllItems as jest.Mock;
 type Rec = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any -- loose command/transact-item mock helpers
 
 /** Default Cognito responses keyed by command type (overridable per test). */
-function defaultCognito(command: { constructor: { name: string }; input: Record<string, unknown> }) {
+function defaultCognito(command: {
+  constructor: { name: string };
+  input: Record<string, unknown>;
+}) {
   switch (command.constructor.name) {
     case 'AdminCreateUserCommand':
       return Promise.resolve({
@@ -95,9 +98,9 @@ const findGroupRemoves = () =>
 // ── Authorization ────────────────────────────────────────────────────────────────
 describe('admin handler — SystemAdmin authorization', () => {
   it('listAllUsers rejects a non-SystemAdmin', async () => {
-    await expect(
-      handler(event('listAllUsers', {}, { groups: ['SupportPerson'] })),
-    ).rejects.toThrow('Unauthorized: SystemAdmin access required');
+    await expect(handler(event('listAllUsers', {}, { groups: ['SupportPerson'] }))).rejects.toThrow(
+      'Unauthorized: SystemAdmin access required',
+    );
     expect(mockSend).not.toHaveBeenCalled();
   });
 
@@ -106,7 +109,9 @@ describe('admin handler — SystemAdmin authorization', () => {
       handler(event('setSystemAdmin', { input: { userId: 'u', enabled: true } }, { groups: [] })),
     ).rejects.toThrow('SystemAdmin');
     await expect(
-      handler(event('adminDeleteUser', { input: { userId: 'u' } }, { groups: ['OrganizationAdmin'] })),
+      handler(
+        event('adminDeleteUser', { input: { userId: 'u' } }, { groups: ['OrganizationAdmin'] }),
+      ),
     ).rejects.toThrow('SystemAdmin');
     expect(mockCognito).not.toHaveBeenCalled();
     expect(mockCascade).not.toHaveBeenCalled();
@@ -194,9 +199,19 @@ describe('admin handler — adminCreateOrganization', () => {
 describe('admin handler — adminUpdateOrganization', () => {
   it('renames an existing org (aliases the reserved word name), returning the clean row', async () => {
     mockSend
-      .mockResolvedValueOnce({ Item: { organizationId: 'o1', name: 'Old', createdAt: 'c', updatedAt: 'u' } }) // existence check
       .mockResolvedValueOnce({
-        Attributes: { PK: 'ORG#o1', SK: '#META', entityType: 'Organization', organizationId: 'o1', name: 'New', createdAt: 'c', updatedAt: 'u2' },
+        Item: { organizationId: 'o1', name: 'Old', createdAt: 'c', updatedAt: 'u' },
+      }) // existence check
+      .mockResolvedValueOnce({
+        Attributes: {
+          PK: 'ORG#o1',
+          SK: '#META',
+          entityType: 'Organization',
+          organizationId: 'o1',
+          name: 'New',
+          createdAt: 'c',
+          updatedAt: 'u2',
+        },
       });
     const result = (await handler(
       event('adminUpdateOrganization', { input: { organizationId: 'o1', name: '  New  ' } }),
@@ -241,20 +256,38 @@ describe('admin handler — adminUpdateOrganization', () => {
 describe('admin handler — adminDeleteOrganization', () => {
   const ORG = { organizationId: 'o1', name: 'Acme', createdAt: 'c', updatedAt: 'u' };
 
-  /** Route dynamo.send: org #META GET, MEMBER# query pages, per-member transactions + org writes. */
-  function routeDelete(opts: { org?: Record<string, unknown>; memberPages?: Array<Array<{ userId: string }>> }) {
+  /**
+   * Route dynamo.send: org #META GET, MEMBER# query pages, per-member transactions + org writes.
+   * SupportLink revocation-sweep queries (run after each successful detach) are answered with
+   * `linkRows` for the member's SUPPORTER# partition and [] for incoming reverse pointers, so they
+   * never consume the MEMBER# pages.
+   */
+  function routeDelete(opts: {
+    org?: Record<string, unknown>;
+    memberPages?: Array<Array<{ userId: string }>>;
+    linkRows?: Array<{ PK: string; SK: string }>;
+  }) {
     const pages = opts.memberPages ?? [[]];
     let queryIdx = 0;
     mockSend.mockImplementation((cmd: { constructor: { name: string }; input: Rec }) => {
       const name = cmd.constructor.name;
       if (name === 'GetCommand') return Promise.resolve({ Item: opts.org });
       if (name === 'QueryCommand') {
-        const page = pages[queryIdx] ?? [];
-        const more = queryIdx < pages.length - 1;
-        queryIdx += 1;
-        return Promise.resolve({ Items: page, LastEvaluatedKey: more ? { k: queryIdx } : undefined });
+        // The MEMBER# roster query is the only one keyed by the ':member' prefix.
+        if (cmd.input.ExpressionAttributeValues?.[':member']) {
+          const page = pages[queryIdx] ?? [];
+          const more = queryIdx < pages.length - 1;
+          queryIdx += 1;
+          return Promise.resolve({
+            Items: page,
+            LastEvaluatedKey: more ? { k: queryIdx } : undefined,
+          });
+        }
+        // Revocation-sweep queries: outgoing canonical links may carry rows; incoming pointers [].
+        const incoming = cmd.input.ExpressionAttributeValues?.[':prefix'] === 'INCOMING_SUPPORT#';
+        return Promise.resolve({ Items: incoming ? [] : (opts.linkRows ?? []) });
       }
-      return Promise.resolve({}); // UpdateCommand (mark deleting) + TransactWriteCommand (detach) + DeleteCommand
+      return Promise.resolve({}); // UpdateCommand (mark deleting / revoke) + TransactWriteCommand (detach) + DeleteCommand
     });
   }
 
@@ -271,33 +304,48 @@ describe('admin handler — adminDeleteOrganization', () => {
   });
 
   it('marks deleting, detaches every member via consistent MEMBER# rows, deletes the org row last, no Scan', async () => {
-    routeDelete({ org: ORG, memberPages: [[{ userId: 'u1' }, { userId: 'u2' }], [{ userId: 'u3' }]] });
+    routeDelete({
+      org: ORG,
+      memberPages: [[{ userId: 'u1' }, { userId: 'u2' }], [{ userId: 'u3' }]],
+    });
     const result = (await handler(
       event('adminDeleteOrganization', { input: { organizationId: 'o1' } }),
     )) as { organization: { organizationId: string }; removedUsers: number };
 
-    // 1) Org marked deleting (the only standalone UpdateCommand — member updates ride transactions).
+    // 1) Org marked deleting (a standalone UpdateCommand on the ORG# row — member detach and
+    //    guarded SupportLink revocation both use transactions).
     const mark = dynamoCalls()
       .filter((c) => c.constructor.name === 'UpdateCommand')
       .map((c) => c.input)
       .find((u: Rec) => u.Key.PK === 'ORG#o1');
     expect(mark.UpdateExpression).toContain('deleting = :true');
 
-    // 2) Every member detached in its OWN transaction: conditional profile REMOVE + membership Delete.
+    // 2) Every member detached in its OWN transaction: conditional profile REMOVE (org + the
+    //    internal membership session) + membership Delete.
     const memberTx = dynamoCalls()
       .filter((c) => c.constructor.name === 'TransactWriteCommand')
       .map((c) => c.input.TransactItems);
     const profileUpdates = memberTx.map((items: Rec[]) => items.find((t: Rec) => t.Update)!.Update);
-    expect(profileUpdates.map((u: Rec) => u.Key.PK).sort()).toEqual(['USER#u1', 'USER#u2', 'USER#u3']);
+    expect(profileUpdates.map((u: Rec) => u.Key.PK).sort()).toEqual([
+      'USER#u1',
+      'USER#u2',
+      'USER#u3',
+    ]);
     for (const u of profileUpdates) {
       expect(u.Key.SK).toBe('#PROFILE');
-      expect(u.UpdateExpression).toBe('SET updatedAt = :now REMOVE organizationId');
+      expect(u.UpdateExpression).toBe(
+        'SET updatedAt = :now REMOVE organizationId, organizationMembershipId',
+      );
       expect(u.ConditionExpression).toBe('organizationId = :org');
       expect(u.ExpressionAttributeValues[':org']).toBe('o1');
     }
     // …and the same transaction deletes that member's row under the org partition.
     const memberDeletes = memberTx.map((items: Rec[]) => items.find((t: Rec) => t.Delete)!.Delete);
-    expect(memberDeletes.map((d: Rec) => d.Key.SK).sort()).toEqual(['MEMBER#u1', 'MEMBER#u2', 'MEMBER#u3']);
+    expect(memberDeletes.map((d: Rec) => d.Key.SK).sort()).toEqual([
+      'MEMBER#u1',
+      'MEMBER#u2',
+      'MEMBER#u3',
+    ]);
     for (const d of memberDeletes) expect(d.Key.PK).toBe('ORG#o1');
 
     // 3) Members found via a STRONGLY-CONSISTENT base-table Query of ORG#o1 / begins_with MEMBER#
@@ -322,6 +370,48 @@ describe('admin handler — adminDeleteOrganization', () => {
     // 5) Result.
     expect(result.removedUsers).toBe(3);
     expect(result.organization.organizationId).toBe('o1');
+  });
+
+  it("soft-revokes each detached member's ACTIVE SupportLinks (a detach is an org leave)", async () => {
+    routeDelete({
+      org: ORG,
+      memberPages: [[{ userId: 'u1' }]],
+      linkRows: [{ PK: 'SUPPORTER#u1', SK: 'USER#p1' }],
+    });
+    await handler(event('adminDeleteOrganization', { input: { organizationId: 'o1' } }));
+
+    // The sweep queried both link directions for the detached member …
+    const sweepQueries = dynamoCalls()
+      .filter((c) => c.constructor.name === 'QueryCommand')
+      .map((c) => c.input)
+      .filter((q: Rec) => !q.ExpressionAttributeValues?.[':member']);
+    expect(
+      sweepQueries.some((q: Rec) => q.ExpressionAttributeValues[':pk'] === 'SUPPORTER#u1'),
+    ).toBe(true);
+    expect(
+      sweepQueries.some(
+        (q: Rec) =>
+          q.ConsistentRead === true &&
+          q.ExpressionAttributeValues[':pk'] === 'USER#u1' &&
+          q.ExpressionAttributeValues[':prefix'] === 'INCOMING_SUPPORT#',
+      ),
+    ).toBe(true);
+    // … and revoked the ACTIVE link with the machine-readable reason (soft — never a Delete).
+    const revoke = dynamoCalls()
+      .filter((c) => c.constructor.name === 'TransactWriteCommand')
+      .flatMap((c) => c.input.TransactItems)
+      .map((item: Rec) => item.Update)
+      .find((update: Rec | undefined) => update?.Key?.PK === 'SUPPORTER#u1');
+    expect(revoke.UpdateExpression).toBe(
+      'SET #status = :revoked, revokedReason = :reason, updatedAt = :now',
+    );
+    expect(revoke.ExpressionAttributeValues[':reason']).toBe('ORG_MEMBERSHIP_CHANGED');
+    expect(
+      dynamoCalls().some(
+        (c) =>
+          c.constructor.name === 'DeleteCommand' && String(c.input.Key.PK).startsWith('SUPPORTER#'),
+      ),
+    ).toBe(false);
   });
 
   it('handles an empty org: marks deleting, deletes the row, removedUsers = 0, no member transactions', async () => {
@@ -368,7 +458,9 @@ describe('admin handler — adminDeleteOrganization', () => {
     // The moved profile was NOT counted as detached, and the org #META row is still deleted.
     expect(result.removedUsers).toBe(0);
     expect(
-      dynamoCalls().some((c) => c.constructor.name === 'DeleteCommand' && c.input.Key.SK === '#META'),
+      dynamoCalls().some(
+        (c) => c.constructor.name === 'DeleteCommand' && c.input.Key.SK === '#META',
+      ),
     ).toBe(true);
   });
 
@@ -418,7 +510,13 @@ describe('admin handler — adminListOrganizationUsers', () => {
         const pk = cmd.input.Key.PK as string;
         if (pk === 'USER#gone') return Promise.resolve({}); // membership row → missing profile
         return Promise.resolve({
-          Item: { PK: pk, SK: '#PROFILE', entityType: 'UserProfile', userId: pk.replace('USER#', ''), role: 'PRIMARY_USER' },
+          Item: {
+            PK: pk,
+            SK: '#PROFILE',
+            entityType: 'UserProfile',
+            userId: pk.replace('USER#', ''),
+            role: 'PRIMARY_USER',
+          },
         });
       }
       return Promise.resolve({});
@@ -448,7 +546,10 @@ describe('admin handler — adminListOrganizationUsers', () => {
     const start = { PK: 'ORG#o1', SK: 'MEMBER#u5' };
     mockSend.mockResolvedValue({ Items: [], LastEvaluatedKey: undefined });
     await handler(
-      event('adminListOrganizationUsers', { organizationId: 'o1', nextToken: encodeNextToken(start)! }),
+      event('adminListOrganizationUsers', {
+        organizationId: 'o1',
+        nextToken: encodeNextToken(start)!,
+      }),
     );
     expect(dynamoCalls()[0].input.ExclusiveStartKey).toEqual(start);
   });
@@ -462,14 +563,21 @@ describe('admin handler — adminListOrganizationUsers', () => {
 
 // ── adminSetUserOrganization ──────────────────────────────────────────────────────
 describe('admin handler — adminSetUserOrganization', () => {
-  const tx = () => dynamoCalls().find((c) => c.constructor.name === 'TransactWriteCommand').input.TransactItems;
+  const tx = () =>
+    dynamoCalls().find((c) => c.constructor.name === 'TransactWriteCommand').input.TransactItems;
 
-  it('adds a user to an org: pre-reads, verifies the org, transacts profile update + member put', async () => {
+  it('adds a user to an org: pre-reads, verifies the org, transacts profile update + member put, mints a session', async () => {
     mockSend
       .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER' } }) // pre-read: no org
-      .mockResolvedValueOnce({ Item: { organizationId: 'o1', name: 'Acme', createdAt: 'c', updatedAt: 'u' } }) // assertUsableOrganization
+      .mockResolvedValueOnce({
+        Item: { organizationId: 'o1', name: 'Acme', createdAt: 'c', updatedAt: 'u' },
+      }) // assertUsableOrganization
       .mockResolvedValueOnce({}) // TransactWrite
-      .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER', organizationId: 'o1' } }); // read-back
+      .mockResolvedValueOnce({}) // revocation sweep: outgoing links query (joining IS an org change)
+      .mockResolvedValueOnce({}) // revocation sweep: incoming links query
+      .mockResolvedValueOnce({
+        Item: { userId: 'target', role: 'PRIMARY_USER', organizationId: 'o1' },
+      }); // read-back
     const result = (await handler(
       event('adminSetUserOrganization', { input: { userId: 'target', organizationId: 'o1' } }),
     )) as { organizationId?: string };
@@ -477,76 +585,189 @@ describe('admin handler — adminSetUserOrganization', () => {
     const items = tx();
     const update = items.find((t: Rec) => t.Update).Update;
     expect(update.Key).toEqual({ PK: 'USER#target', SK: '#PROFILE' });
-    expect(update.UpdateExpression).toBe('SET organizationId = :org, updatedAt = :now');
+    // Joining from no org mints a fresh internal membership session id in the same write.
+    expect(update.UpdateExpression).toBe(
+      'SET organizationId = :org, organizationMembershipId = :membershipId, updatedAt = :now',
+    );
     expect(update.ExpressionAttributeValues[':org']).toBe('o1');
+    expect(typeof update.ExpressionAttributeValues[':membershipId']).toBe('string');
     // Bound to the pre-read state (no org) so a concurrent move can't leave a stale membership row.
-    expect(update.ConditionExpression).toBe('attribute_exists(PK) AND attribute_not_exists(organizationId)');
+    expect(update.ConditionExpression).toBe(
+      'attribute_exists(PK) AND attribute_not_exists(organizationId)',
+    );
     const orgCheck = items.find((t: Rec) => t.ConditionCheck).ConditionCheck;
     expect(orgCheck.Key).toEqual({ PK: 'ORG#o1', SK: '#META' });
-    expect(orgCheck.ConditionExpression).toBe('attribute_exists(PK) AND attribute_not_exists(deleting)');
+    expect(orgCheck.ConditionExpression).toBe(
+      'attribute_exists(PK) AND attribute_not_exists(deleting)',
+    );
     const put = items.find((t: Rec) => t.Put).Put.Item;
-    expect(put).toMatchObject({ PK: 'ORG#o1', SK: 'MEMBER#target', entityType: 'OrganizationMember', userId: 'target' });
+    expect(put).toMatchObject({
+      PK: 'ORG#o1',
+      SK: 'MEMBER#target',
+      entityType: 'OrganizationMember',
+      userId: 'target',
+    });
     expect(items.some((t: Rec) => t.Delete)).toBe(false); // no previous org ⇒ no delete
     expect(result.organizationId).toBe('o1');
   });
 
-  it('removes a user from their org with organizationId: null (transaction deletes the membership row)', async () => {
+  it('removes a user from their org with organizationId: null (drops the membership row + session, revokes links)', async () => {
     mockSend
-      .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER', organizationId: 'o1' } }) // pre-read: in o1
+      .mockResolvedValueOnce({
+        Item: {
+          userId: 'target',
+          role: 'PRIMARY_USER',
+          organizationId: 'o1',
+          organizationMembershipId: 'mid-1',
+        },
+      }) // pre-read: in o1
       .mockResolvedValueOnce({}) // TransactWrite
+      .mockResolvedValueOnce({}) // revocation sweep: outgoing links query
+      .mockResolvedValueOnce({}) // revocation sweep: incoming links query
       .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER' } }); // read-back: no org
     const result = (await handler(
-      event('adminSetUserOrganization', { input: { userId: 'target', organizationId: null } as Record<string, unknown> }),
+      event('adminSetUserOrganization', {
+        input: { userId: 'target', organizationId: null } as Record<string, unknown>,
+      }),
     )) as { organizationId?: string };
 
     const items = tx();
     const update = items.find((t: Rec) => t.Update).Update;
-    expect(update.UpdateExpression).toBe('SET updatedAt = :now REMOVE organizationId');
+    // Leaving removes BOTH the org and the internal membership session.
+    expect(update.UpdateExpression).toBe(
+      'SET updatedAt = :now REMOVE organizationId, organizationMembershipId',
+    );
     // Bound to the pre-read org so a concurrent move can't orphan the new org's membership row.
-    expect(update.ConditionExpression).toBe('attribute_exists(PK) AND organizationId = :prevOrg');
+    expect(update.ConditionExpression).toBe(
+      'attribute_exists(PK) AND organizationId = :prevOrg AND organizationMembershipId = :prevMembershipId',
+    );
     expect(update.ExpressionAttributeValues[':prevOrg']).toBe('o1');
+    expect(update.ExpressionAttributeValues[':prevMembershipId']).toBe('mid-1');
     const del = items.find((t: Rec) => t.Delete).Delete;
     expect(del.Key).toEqual({ PK: 'ORG#o1', SK: 'MEMBER#target' });
     // Clearing needs no org existence check or member put — and never reads an ORG# row.
     expect(items.some((t: Rec) => t.ConditionCheck)).toBe(false);
     expect(items.some((t: Rec) => t.Put)).toBe(false);
-    expect(dynamoCalls().some((c) => c.constructor.name === 'GetCommand' && String(c.input.Key.PK).startsWith('ORG#'))).toBe(false);
+    expect(
+      dynamoCalls().some(
+        (c) => c.constructor.name === 'GetCommand' && String(c.input.Key.PK).startsWith('ORG#'),
+      ),
+    ).toBe(false);
+    // Leaving IS an org change → the revocation sweep queried both link directions.
+    expect(dynamoCalls().filter((c) => c.constructor.name === 'QueryCommand')).toHaveLength(2);
     expect(result.organizationId).toBeUndefined();
   });
 
-  it('moving a user to a different org deletes the old membership row', async () => {
+  it('moving a user to a different org rotates the session, deletes the old membership row, and revokes links', async () => {
     mockSend
-      .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER', organizationId: 'o1' } }) // pre-read: in o1
-      .mockResolvedValueOnce({ Item: { organizationId: 'o2', name: 'New', createdAt: 'c', updatedAt: 'u' } }) // assertUsable o2
+      .mockResolvedValueOnce({
+        Item: {
+          userId: 'target',
+          role: 'PRIMARY_USER',
+          organizationId: 'o1',
+          organizationMembershipId: 'mid-old',
+        },
+      }) // pre-read: in o1
+      .mockResolvedValueOnce({
+        Item: { organizationId: 'o2', name: 'New', createdAt: 'c', updatedAt: 'u' },
+      }) // assertUsable o2
       .mockResolvedValueOnce({}) // TransactWrite
-      .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER', organizationId: 'o2' } }); // read-back
-    await handler(event('adminSetUserOrganization', { input: { userId: 'target', organizationId: 'o2' } }));
+      .mockResolvedValueOnce({}) // sweep: outgoing links (none)
+      .mockResolvedValueOnce({ Items: [{ supporterId: 'other-sp' }] }) // sweep: incoming pointer
+      .mockResolvedValueOnce({}) // revocation update for the found link
+      .mockResolvedValueOnce({
+        Item: { userId: 'target', role: 'PRIMARY_USER', organizationId: 'o2' },
+      }); // read-back
+    await handler(
+      event('adminSetUserOrganization', { input: { userId: 'target', organizationId: 'o2' } }),
+    );
 
     const items = tx();
     const update = items.find((t: Rec) => t.Update).Update;
-    // The profile write is bound to the pre-read org (o1), so a concurrent move aborts this one.
-    expect(update.ConditionExpression).toBe('attribute_exists(PK) AND organizationId = :prevOrg');
+    // The profile write is bound to the pre-read org (o1), so a concurrent move aborts this one,
+    // and the move mints a FRESH membership session id (never reuses mid-old).
+    expect(update.ConditionExpression).toBe(
+      'attribute_exists(PK) AND organizationId = :prevOrg AND organizationMembershipId = :prevMembershipId',
+    );
     expect(update.ExpressionAttributeValues[':prevOrg']).toBe('o1');
+    expect(update.ExpressionAttributeValues[':prevMembershipId']).toBe('mid-old');
+    expect(update.UpdateExpression).toContain('organizationMembershipId = :membershipId');
+    expect(update.ExpressionAttributeValues[':membershipId']).not.toBe('mid-old');
     expect(items.find((t: Rec) => t.Put).Put.Item.PK).toBe('ORG#o2');
-    expect(items.find((t: Rec) => t.Delete).Delete.Key).toEqual({ PK: 'ORG#o1', SK: 'MEMBER#target' });
+    expect(items.find((t: Rec) => t.Delete).Delete.Key).toEqual({
+      PK: 'ORG#o1',
+      SK: 'MEMBER#target',
+    });
+    // The ACTIVE link found by the sweep was soft-revoked with the machine-readable reason.
+    const revoke = dynamoCalls()
+      .filter((c) => c.constructor.name === 'TransactWriteCommand')
+      .flatMap((c) => c.input.TransactItems)
+      .map((item: Rec) => item.Update)
+      .find((update: Rec | undefined) => String(update?.Key?.PK).startsWith('SUPPORTER#'));
+    expect(revoke.ExpressionAttributeValues[':revoked']).toBe('REVOKED');
+    expect(revoke.ExpressionAttributeValues[':reason']).toBe('ORG_MEMBERSHIP_CHANGED');
+  });
+
+  it('re-setting the SAME org keeps the membership session (if-absent init) and revokes nothing', async () => {
+    mockSend
+      .mockResolvedValueOnce({
+        Item: {
+          userId: 'target',
+          role: 'PRIMARY_USER',
+          organizationId: 'o1',
+          organizationMembershipId: 'mid-keep',
+        },
+      }) // pre-read: already in o1
+      .mockResolvedValueOnce({
+        Item: { organizationId: 'o1', name: 'Acme', createdAt: 'c', updatedAt: 'u' },
+      }) // assertUsable o1
+      .mockResolvedValueOnce({}) // TransactWrite
+      .mockResolvedValueOnce({
+        Item: { userId: 'target', role: 'PRIMARY_USER', organizationId: 'o1' },
+      }); // read-back
+    await handler(
+      event('adminSetUserOrganization', { input: { userId: 'target', organizationId: 'o1' } }),
+    );
+
+    const update = tx().find((t: Rec) => t.Update).Update;
+    // Same org ⇒ NOT a leave-and-rejoin: keep the stored id (if_not_exists also lazily
+    // initializes a legacy profile without ever rotating an existing one).
+    expect(update.UpdateExpression).toBe(
+      'SET organizationId = :org, organizationMembershipId = if_not_exists(organizationMembershipId, :membershipId), updatedAt = :now',
+    );
+    expect(update.ExpressionAttributeValues[':membershipId']).toBe('mid-keep');
+    // No org change ⇒ NO revocation sweep queries.
+    expect(dynamoCalls().filter((c) => c.constructor.name === 'QueryCommand')).toHaveLength(0);
   });
 
   it('aborts with a conflict error when the profile moved orgs concurrently (item-0 guard fails)', async () => {
     mockSend
-      .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER', organizationId: 'o1' } }) // pre-read: in o1
-      .mockResolvedValueOnce({ Item: { organizationId: 'o2', name: 'New', createdAt: 'c', updatedAt: 'u' } }) // assertUsable o2
+      .mockResolvedValueOnce({
+        Item: { userId: 'target', role: 'PRIMARY_USER', organizationId: 'o1' },
+      }) // pre-read: in o1
+      .mockResolvedValueOnce({
+        Item: { organizationId: 'o2', name: 'New', createdAt: 'c', updatedAt: 'u' },
+      }) // assertUsable o2
       .mockRejectedValueOnce(
         Object.assign(new Error('canceled'), {
           name: 'TransactionCanceledException',
           // item 0 = profile guard (organizationId = :prevOrg) failed: the user moved since pre-read.
-          CancellationReasons: [{ Code: 'ConditionalCheckFailed' }, { Code: 'None' }, { Code: 'None' }],
+          CancellationReasons: [
+            { Code: 'ConditionalCheckFailed' },
+            { Code: 'None' },
+            { Code: 'None' },
+          ],
         }),
       );
     await expect(
-      handler(event('adminSetUserOrganization', { input: { userId: 'target', organizationId: 'o2' } })),
+      handler(
+        event('adminSetUserOrganization', { input: { userId: 'target', organizationId: 'o2' } }),
+      ),
     ).rejects.toThrow('changed concurrently');
     // The transaction is atomic: nothing (including the stale o1 delete) was committed.
-    expect(dynamoCalls().filter((c) => c.constructor.name === 'TransactWriteCommand')).toHaveLength(1);
+    expect(dynamoCalls().filter((c) => c.constructor.name === 'TransactWriteCommand')).toHaveLength(
+      1,
+    );
   });
 
   it('rejects an OMITTED organizationId (only null clears), so a dropped variable cannot wipe an org', async () => {
@@ -561,7 +782,9 @@ describe('admin handler — adminSetUserOrganization', () => {
       .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER' } }) // pre-read
       .mockResolvedValueOnce({}); // assertUsableOrganization GET → no Item
     await expect(
-      handler(event('adminSetUserOrganization', { input: { userId: 'target', organizationId: 'gone' } })),
+      handler(
+        event('adminSetUserOrganization', { input: { userId: 'target', organizationId: 'gone' } }),
+      ),
     ).rejects.toThrow('organization gone not found');
     expect(dynamoCalls().some((c) => c.constructor.name === 'TransactWriteCommand')).toBe(false);
   });
@@ -569,9 +792,13 @@ describe('admin handler — adminSetUserOrganization', () => {
   it('rejects adding a user to a deleting org (VALIDATION)', async () => {
     mockSend
       .mockResolvedValueOnce({ Item: { userId: 'target', role: 'PRIMARY_USER' } }) // pre-read
-      .mockResolvedValueOnce({ Item: { organizationId: 'o1', name: 'X', deleting: true, createdAt: 'c', updatedAt: 'u' } }); // deleting
+      .mockResolvedValueOnce({
+        Item: { organizationId: 'o1', name: 'X', deleting: true, createdAt: 'c', updatedAt: 'u' },
+      }); // deleting
     await expect(
-      handler(event('adminSetUserOrganization', { input: { userId: 'target', organizationId: 'o1' } })),
+      handler(
+        event('adminSetUserOrganization', { input: { userId: 'target', organizationId: 'o1' } }),
+      ),
     ).rejects.toThrow('being deleted');
     expect(dynamoCalls().some((c) => c.constructor.name === 'TransactWriteCommand')).toBe(false);
   });
@@ -579,7 +806,9 @@ describe('admin handler — adminSetUserOrganization', () => {
   it('rejects when the target user has no profile (NotFound)', async () => {
     mockSend.mockResolvedValueOnce({}); // pre-read → no profile
     await expect(
-      handler(event('adminSetUserOrganization', { input: { userId: 'ghost', organizationId: 'o1' } })),
+      handler(
+        event('adminSetUserOrganization', { input: { userId: 'ghost', organizationId: 'o1' } }),
+      ),
     ).rejects.toThrow('user ghost not found');
     expect(dynamoCalls().some((c) => c.constructor.name === 'TransactWriteCommand')).toBe(false);
   });
@@ -594,20 +823,24 @@ describe('admin handler — adminSetUserOrganization', () => {
 describe('admin handler — adminGetUserData', () => {
   it('aggregates profile, tasks, categories, task assignments, and support links (no Scan)', async () => {
     // GetCommand → profile; taskOwnerIndex → tasks; primaryUserSupportLinkIndex → primary-side links.
-    mockSend.mockImplementation((command: { constructor: { name: string }; input?: Record<string, unknown> }) => {
-      const input = command.input ?? {};
-      if (command.constructor.name === 'GetCommand') {
-        return Promise.resolve({ Item: { userId: 'u1', role: 'PRIMARY_USER' } });
-      }
-      if (input.IndexName === 'taskOwnerIndex') return Promise.resolve({ Items: [{ taskId: 't1' }] });
-      if (input.IndexName === 'primaryUserSupportLinkIndex') {
-        return Promise.resolve({ Items: [{ supporterId: 's9', primaryUserId: 'u1' }] });
-      }
-      return Promise.resolve({});
-    });
+    mockSend.mockImplementation(
+      (command: { constructor: { name: string }; input?: Record<string, unknown> }) => {
+        const input = command.input ?? {};
+        if (command.constructor.name === 'GetCommand') {
+          return Promise.resolve({ Item: { userId: 'u1', role: 'PRIMARY_USER' } });
+        }
+        if (input.IndexName === 'taskOwnerIndex')
+          return Promise.resolve({ Items: [{ taskId: 't1' }] });
+        if (input.IndexName === 'primaryUserSupportLinkIndex') {
+          return Promise.resolve({ Items: [{ supporterId: 's9', primaryUserId: 'u1' }] });
+        }
+        return Promise.resolve({});
+      },
+    );
     // queryAllItems(pk, prefix) drives categories / task assignments / supporter-side links.
     mockQueryAllItems.mockImplementation((_pk: string, prefix: string) => {
-      if (prefix === 'CATEGORY#') return Promise.resolve([{ categoryId: 'c1' }, { categoryId: 'c2' }]);
+      if (prefix === 'CATEGORY#')
+        return Promise.resolve([{ categoryId: 'c1' }, { categoryId: 'c2' }]);
       if (prefix === 'TASK_ASSIGNMENT#') return Promise.resolve([{ assignmentId: 'a1' }]);
       if (prefix === 'USER#') return Promise.resolve([{ supporterId: 'u1', primaryUserId: 'p1' }]);
       return Promise.resolve([]);
@@ -634,7 +867,9 @@ describe('admin handler — adminGetUserData', () => {
   });
 
   it('rejects a blank userId', async () => {
-    await expect(handler(event('adminGetUserData', { userId: '   ' }))).rejects.toThrow('userId is required');
+    await expect(handler(event('adminGetUserData', { userId: '   ' }))).rejects.toThrow(
+      'userId is required',
+    );
   });
 });
 
@@ -655,12 +890,16 @@ describe('admin handler — invite', () => {
   });
 
   it('handles an already-existing user (UsernameExistsException) by adopting it', async () => {
-    mockCognito.mockImplementation((command: { constructor: { name: string }; input: Record<string, unknown> }) => {
-      if (command.constructor.name === 'AdminCreateUserCommand') {
-        return Promise.reject(Object.assign(new Error('exists'), { name: 'UsernameExistsException' }));
-      }
-      return defaultCognito(command);
-    });
+    mockCognito.mockImplementation(
+      (command: { constructor: { name: string }; input: Record<string, unknown> }) => {
+        if (command.constructor.name === 'AdminCreateUserCommand') {
+          return Promise.reject(
+            Object.assign(new Error('exists'), { name: 'UsernameExistsException' }),
+          );
+        }
+        return defaultCognito(command);
+      },
+    );
     await handler(event('inviteSupportPerson', { input: { email: 'exists@e.com' } }));
     // Looked the user up via AdminGetUser, then still applied the group.
     expect(cognitoNames()).toContain('AdminGetUserCommand');
@@ -756,6 +995,7 @@ describe('admin handler — adminDeleteUser', () => {
       .mockResolvedValueOnce([
         { PK: 'USER#target', SK: '#PROFILE' },
         { PK: 'USER#target', SK: 'CATEGORY#c1' },
+        { PK: 'USER#target', SK: 'INCOMING_SUPPORT#x' },
       ]) // user partition rows
       .mockResolvedValueOnce([{ PK: 'SUPPORTER#target', SK: 'USER#p1' }]); // supporter-side links
   }
@@ -777,8 +1017,10 @@ describe('admin handler — adminDeleteUser', () => {
     };
     expect(mockCascade).toHaveBeenCalledTimes(2);
     expect(result.deletedTasks).toBe(2);
-    expect(result.deletedUserItems).toBe(2);
-    expect(result.deletedSupportLinks).toBe(2); // 1 supporter-side + 1 primary-side
+    expect(result.deletedUserItems).toBe(3);
+    // 1 supporter-side + 1 primary-side; the durable pointer and compatibility GSI return the
+    // same canonical target-side link, which must be de-duplicated.
+    expect(result.deletedSupportLinks).toBe(2);
     expect(result.deletedCognitoUser).toBe(true);
     // Disable happens before delete; delete is the LAST Cognito call.
     expect(cognitoNames().indexOf('AdminDisableUserCommand')).toBeLessThan(
@@ -787,7 +1029,7 @@ describe('admin handler — adminDeleteUser', () => {
     expect(cognitoNames().at(-1)).toBe('AdminDeleteUserCommand');
   });
 
-  it('deletes active TaskAssignments that reference the owner\'s tasks (even in another user\'s partition)', async () => {
+  it("deletes active TaskAssignments that reference the owner's tasks (even in another user's partition)", async () => {
     mockFindUsername.mockResolvedValue('target@e.com');
     // t1 is assigned to ANOTHER user; that active assignment would dangle once t1's template
     // is cascaded, so adminDeleteUser must remove it explicitly.
@@ -860,7 +1102,9 @@ describe('admin handler — adminDeleteUser', () => {
       .mockResolvedValueOnce([]); // supporter-side links
     await handler(event('adminDeleteUser', { input: { userId: 'target' } }));
 
-    const txCallIndex = dynamoCalls().findIndex((c) => c.constructor.name === 'TransactWriteCommand');
+    const txCallIndex = dynamoCalls().findIndex(
+      (c) => c.constructor.name === 'TransactWriteCommand',
+    );
     expect(txCallIndex).toBeGreaterThanOrEqual(0);
     const txItems = dynamoCalls()[txCallIndex].input.TransactItems;
     expect(txItems).toContainEqual({

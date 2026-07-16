@@ -98,7 +98,10 @@ export class Api extends Construct {
       { typeName: 'Query', fieldName: 'getReportDownloadUrl' },
     ]);
 
-    // UserProfile + SupportLink (incl. SupportPerson selection of primary users).
+    // UserProfile + SupportLink (incl. SupportPerson selection of primary users) plus the
+    // read-only organization directory (listAvailableOrganizations / getOrganization — gated
+    // to the PrimaryUser/SupportPerson Cognito groups in the schema AND re-checked in the
+    // Lambda; the SystemAdmin-only listAllOrganizations stays on the admin Lambda).
     wire('UsersDataSource', props.usersFn, [
       { typeName: 'Mutation', fieldName: 'createUserProfile' },
       { typeName: 'Mutation', fieldName: 'updateMyUserProfile' },
@@ -106,7 +109,10 @@ export class Api extends Construct {
       { typeName: 'Mutation', fieldName: 'unselectPrimaryUser' },
       { typeName: 'Query', fieldName: 'getUserProfile' },
       { typeName: 'Query', fieldName: 'listMyOrganizationUsers' },
+      { typeName: 'Query', fieldName: 'listAvailableOrganizations' },
+      { typeName: 'Query', fieldName: 'getOrganization' },
       { typeName: 'Query', fieldName: 'listMySupportList' },
+      { typeName: 'Query', fieldName: 'listMySupportLinkHistory' },
     ]);
 
     // User-owned task categories (private to the caller — owner derived from identity).

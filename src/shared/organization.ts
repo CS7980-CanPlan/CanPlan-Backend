@@ -1,7 +1,9 @@
 // Organization lookup + integrity helpers shared by the admin Lambda and the user-profile
 // membership writes. An Organization is a real persisted row (PK = ORG#<organizationId>,
 // SK = #META, entityType = Organization) that a UserProfile.organizationId references —
-// membership is no longer a free-form string. Managed only by SystemAdmin admin APIs.
+// membership is no longer a free-form string. Created/renamed/deleted only by SystemAdmin
+// admin APIs; PrimaryUser and SupportPerson may READ the joinable directory via the users
+// Lambda's listAvailableOrganizations / getOrganization.
 
 import { GetCommand } from '@aws-sdk/lib-dynamodb';
 import { dynamo, TABLE_NAME } from './dynamodb';
@@ -14,7 +16,12 @@ export async function getOrganization(organizationId: string): Promise<Organizat
   const id = organizationId?.trim();
   if (!id) return undefined;
   const result = await dynamo.send(
-    new GetCommand({ TableName: TABLE_NAME, Key: { PK: organizationPk(id), SK: META_SK } }),
+    new GetCommand({
+      TableName: TABLE_NAME,
+      Key: { PK: organizationPk(id), SK: META_SK },
+      // Join checks and the public directory must immediately observe the deleting marker.
+      ConsistentRead: true,
+    }),
   );
   return result.Item as Organization | undefined;
 }

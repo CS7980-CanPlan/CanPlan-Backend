@@ -14,7 +14,12 @@ import {
 } from '../../shared/media';
 import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
 import { NotFoundError, ValidationError } from '../../shared/response';
-import { DOWNLOAD_URL_TTL_SECONDS, MEDIA_BUCKET, s3, UPLOAD_URL_TTL_SECONDS } from '../../shared/s3';
+import {
+  DOWNLOAD_URL_TTL_SECONDS,
+  MEDIA_BUCKET,
+  s3,
+  UPLOAD_URL_TTL_SECONDS,
+} from '../../shared/s3';
 import { readTaskMeta } from '../../shared/taskCascade';
 import type {
   AppSyncEvent,
@@ -42,7 +47,8 @@ import type {
  * Authorization: media operations are scoped to the task's owner. Write/mint operations
  * (createMediaUploadUrl, createMediaAsset, deleteMediaAsset) authorize against the task's
  * authoritative `ownerId` via `assertCanActForUser` — the owner, OR a SupportPerson with an
- * ACTIVE SupportLink to that owner (a PRIMARY_USER in the same org). The stored asset owner is
+ * effective SupportLink to that owner (ACTIVE with a current organization/membership snapshot).
+ * The stored asset owner is
  * always the task's owner (a client-supplied ownerId is ignored). Reads (getMediaDownloadUrl,
  * listMediaForTask) additionally allow a caller who holds an ACTIVE TaskAssignment referencing
  * the task (an assigned primary user can view a SupportPerson's task media), but never mutate
@@ -56,7 +62,10 @@ export const handler = async (
     case 'createMediaUploadUrl':
       return createMediaUploadUrl(args.input as CreateMediaUploadUrlInput, identity);
     case 'createTaskCoverImageUploadUrl':
-      return createTaskCoverImageUploadUrl(args.input as CreateTaskCoverImageUploadUrlInput, identity);
+      return createTaskCoverImageUploadUrl(
+        args.input as CreateTaskCoverImageUploadUrlInput,
+        identity,
+      );
     case 'createMediaAsset':
       return createMediaAsset(args.input as CreateMediaAssetInput, identity);
     case 'deleteMediaAsset':
@@ -219,7 +228,12 @@ async function createMediaAsset(
   await dynamo.send(
     new PutCommand({
       TableName: TABLE_NAME,
-      Item: { PK: taskPk(taskId), SK: mediaSk(asset.assetId), entityType: ENTITY.MEDIA_ASSET, ...asset },
+      Item: {
+        PK: taskPk(taskId),
+        SK: mediaSk(asset.assetId),
+        entityType: ENTITY.MEDIA_ASSET,
+        ...asset,
+      },
     }),
   );
 
@@ -265,7 +279,9 @@ async function deleteMediaAsset(
   // than being reported as a successful deletion.
   const complete = await purgeMediaAsset(asset, { event: 'deleteMediaAsset' });
   if (!complete) {
-    throw new Error(`deleteMediaAsset: media object ${assetId} could not be deleted; retry the operation`);
+    throw new Error(
+      `deleteMediaAsset: media object ${assetId} could not be deleted; retry the operation`,
+    );
   }
 
   const out: Record<string, unknown> = { ...asset };

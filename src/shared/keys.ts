@@ -78,6 +78,9 @@ export const MEDIA_PREFIX = 'MEDIA#';
 // S3 key across retries even after the MediaAsset row has been removed.
 export const TASK_MEDIA_CLEANUP_PREFIX = 'CLEANUP_MEDIA#';
 export const USER_LINK_PREFIX = 'USER#';
+// Internal reverse SupportLink pointers colocated in the primary user's USER# partition. They
+// let organization-change cleanup discover target-side links with a strongly-consistent query.
+export const INCOMING_SUPPORT_LINK_PREFIX = 'INCOMING_SUPPORT#';
 // Report rows (one AI progress report), under USER#<primaryUserId>, chronologically
 // sortable so listReports returns newest-first via the SK.
 export const REPORT_PREFIX = 'REPORT#';
@@ -121,6 +124,9 @@ export const taskCategoryKey = (ownerId: string, categoryId: string): string =>
 export const categorySk = (categoryId: string): string => `${CATEGORY_PREFIX}${categoryId}`;
 /** SupportLink SK — one row per managed primary user under a supporter. */
 export const userLinkSk = (primaryUserId: string): string => `USER#${primaryUserId}`;
+/** Reverse SupportLink pointer SK — one pointer per supporter under the primary user's partition. */
+export const incomingSupportLinkSk = (supporterId: string): string =>
+  `${INCOMING_SUPPORT_LINK_PREFIX}${supporterId}`;
 /**
  * TaskStep SK — keyed by the stable, immutable stepId (STEP#<stepId>), NOT by `order`.
  * `order` is a plain item attribute, so a step can be reordered with a single in-place
