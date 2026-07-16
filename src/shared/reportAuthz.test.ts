@@ -11,7 +11,7 @@ type Rec = Record<string, any>; // eslint-disable-line @typescript-eslint/no-exp
 
 /**
  * Mock DynamoDB by command + key so the REAL delegation rules (SupportPerson group, ACTIVE link,
- * PRIMARY_USER target, shared org) run against controlled data:
+ * PRIMARY_USER target, shared org, matching membership snapshot) run against controlled data:
  *  - profiles: by userId (#PROFILE GET)
  *  - links: by `${supporterId}->${primaryUserId}` (SUPPORTER#/USER# GET)
  */
@@ -45,17 +45,38 @@ afterEach(() => jest.clearAllMocks());
 /** A SupportPerson caller identity (Cognito group is the authorization source of truth). */
 const supporter: AppSyncIdentity = { sub: 'sup-1', groups: ['SupportPerson'] };
 
-/** Wire up the happy-path world: an active link between same-org SupportPerson and PrimaryUser. */
+/**
+ * Wire up the happy-path world: an ACTIVE link between a same-org SupportPerson and PrimaryUser
+ * whose selection snapshot (organization + both membership sessions) still matches both profiles
+ * — the only combination that grants delegated access.
+ */
 function grantHappyPath(): void {
   db.profiles = {
-    'sup-1': { userId: 'sup-1', role: 'SUPPORT_PERSON', organizationId: 'org-1' },
-    'pu-1': { userId: 'pu-1', role: 'PRIMARY_USER', organizationId: 'org-1' },
+    'sup-1': {
+      userId: 'sup-1',
+      role: 'SUPPORT_PERSON',
+      organizationId: 'org-1',
+      organizationMembershipId: 'mid-sup',
+    },
+    'pu-1': {
+      userId: 'pu-1',
+      role: 'PRIMARY_USER',
+      organizationId: 'org-1',
+      organizationMembershipId: 'mid-pu',
+    },
   };
-  db.links = { 'sup-1->pu-1': { status: 'ACTIVE' } };
+  db.links = {
+    'sup-1->pu-1': {
+      status: 'ACTIVE',
+      organizationId: 'org-1',
+      supporterOrganizationMembershipId: 'mid-sup',
+      primaryUserOrganizationMembershipId: 'mid-pu',
+    },
+  };
 }
 
 describe('assertCanAccessUserReports', () => {
-  it('allows a same-org SupportPerson with an ACTIVE link to a PRIMARY_USER, returning the caller id', async () => {
+  it('allows a SupportPerson whose ACTIVE link matches both users current membership snapshot', async () => {
     grantHappyPath();
     await expect(assertCanAccessUserReports(supporter, 'pu-1')).resolves.toBe('sup-1');
   });
@@ -108,6 +129,21 @@ describe('assertCanAccessUserReports', () => {
   it('rejects an organization mismatch between supporter and target', async () => {
     grantHappyPath();
     db.profiles!['pu-1'] = { userId: 'pu-1', role: 'PRIMARY_USER', organizationId: 'org-2' };
+    await expect(assertCanAccessUserReports(supporter, 'pu-1')).rejects.toThrow(UnauthorizedError);
+  });
+
+  it('rejects a legacy ACTIVE link without a membership snapshot (fails closed until re-selected)', async () => {
+    grantHappyPath();
+    db.links = { 'sup-1->pu-1': { status: 'ACTIVE' } };
+    await expect(assertCanAccessUserReports(supporter, 'pu-1')).rejects.toThrow(UnauthorizedError);
+  });
+
+  it('rejects a link selected under an older membership session (e.g. the target left and rejoined the org)', async () => {
+    grantHappyPath();
+    db.profiles!['pu-1'] = {
+      ...db.profiles!['pu-1'],
+      organizationMembershipId: 'mid-pu-rejoined',
+    };
     await expect(assertCanAccessUserReports(supporter, 'pu-1')).rejects.toThrow(UnauthorizedError);
   });
 });

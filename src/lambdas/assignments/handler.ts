@@ -66,10 +66,18 @@ const MAX_TRANSACTION_ITEMS = 100;
 const MAX_INSTANCE_STEPS = MAX_TRANSACTION_ITEMS - 1;
 
 /** Persisted instance statuses a client may set via updateTaskInstanceStatus. */
-const SETTABLE_INSTANCE_STATUSES: readonly TaskInstanceStatus[] = ['IN_PROGRESS', 'COMPLETED', 'SKIPPED'];
+const SETTABLE_INSTANCE_STATUSES: readonly TaskInstanceStatus[] = [
+  'IN_PROGRESS',
+  'COMPLETED',
+  'SKIPPED',
+];
 
 /** A TaskInstance is terminal (frozen) once it reaches one of these. */
-const TERMINAL_STATUSES: readonly PersistedTaskInstanceStatus[] = ['COMPLETED', 'SKIPPED', 'CANCELLED'];
+const TERMINAL_STATUSES: readonly PersistedTaskInstanceStatus[] = [
+  'COMPLETED',
+  'SKIPPED',
+  'CANCELLED',
+];
 
 /**
  * Bounded retries for an active-step close that lost an optimistic-concurrency race. Each retry
@@ -108,7 +116,10 @@ export const handler = async (
     case 'startTaskInstance':
       return startTaskInstance(args.input as StartTaskInstanceInput, identity);
     case 'setTaskInstanceStepCompletion':
-      return setTaskInstanceStepCompletion(args.input as SetTaskInstanceStepCompletionInput, identity);
+      return setTaskInstanceStepCompletion(
+        args.input as SetTaskInstanceStepCompletionInput,
+        identity,
+      );
     case 'startTaskInstanceStep':
       return startTaskInstanceStep(args.input as StartTaskInstanceStepInput, identity);
     case 'pauseTaskInstanceTimer':
@@ -169,7 +180,7 @@ async function createTaskAssignment(
   if (!taskId) throw new ValidationError('taskId is required and cannot be empty');
   if (!userId) throw new ValidationError('userId is required and cannot be empty');
 
-  // The caller may only assign to themselves or to a primary user they have actively selected.
+  // The caller may only assign to themselves or through effective delegation to a primary user.
   const caller = requireCaller(identity);
   await assertCanActForUser(identity, userId);
 
@@ -177,7 +188,7 @@ async function createTaskAssignment(
   const schedule = normalizeSchedule(input);
 
   // The referenced template must exist AND be owned by the caller — a SupportPerson schedules
-  // their OWN task template for a selected primary user. The assignment references the template
+  // their OWN task template for a primary user they can currently act for. The assignment references the template
   // by id; it is never copied into the primary user's account.
   const task = await dynamo.send(
     new GetCommand({ TableName: TABLE_NAME, Key: { PK: taskPk(taskId), SK: META_SK } }),
@@ -353,7 +364,11 @@ async function setTaskInstanceStepCompletion(
 
   const parsed = parseInstanceId(instanceId);
   if (!parsed) throw new ValidationError(`invalid instanceId "${instanceId}"`);
-  const instanceSk = taskInstanceSk(parsed.scheduledDate, parsed.scheduledTime, parsed.assignmentId);
+  const instanceSk = taskInstanceSk(
+    parsed.scheduledDate,
+    parsed.scheduledTime,
+    parsed.assignmentId,
+  );
 
   for (let attempt = 0; ; attempt++) {
     const instance = await getInstance(
@@ -362,7 +377,8 @@ async function setTaskInstanceStepCompletion(
       parsed.scheduledTime,
       parsed.assignmentId,
     );
-    if (!instance) throw new NotFoundError(`task instance ${instanceId} not found for user ${userId}`);
+    if (!instance)
+      throw new NotFoundError(`task instance ${instanceId} not found for user ${userId}`);
     const status = instance.status as PersistedTaskInstanceStatus;
     if (TERMINAL_STATUSES.includes(status)) {
       throw new ValidationError(`cannot change step completion on a ${status} instance`);
@@ -392,7 +408,12 @@ async function setTaskInstanceStepCompletion(
                     'SET completed = :true, completedAt = :now, ' +
                     'activeDurationSeconds = if_not_exists(activeDurationSeconds, :zero) + :delta, ' +
                     'updatedAt = :now',
-                  ExpressionAttributeValues: { ':true': true, ':now': now, ':zero': 0, ':delta': delta },
+                  ExpressionAttributeValues: {
+                    ':true': true,
+                    ':now': now,
+                    ':zero': 0,
+                    ':delta': delta,
+                  },
                   ConditionExpression: 'attribute_exists(PK)',
                 },
               },
@@ -403,7 +424,12 @@ async function setTaskInstanceStepCompletion(
                   UpdateExpression:
                     'SET activeDurationSeconds = if_not_exists(activeDurationSeconds, :zero) + :delta, ' +
                     'updatedAt = :now REMOVE activeStepId, activeStepStartedAt',
-                  ExpressionAttributeValues: { ':zero': 0, ':delta': delta, ':now': now, ...guard.values },
+                  ExpressionAttributeValues: {
+                    ':zero': 0,
+                    ':delta': delta,
+                    ':now': now,
+                    ...guard.values,
+                  },
                   ConditionExpression: `attribute_exists(PK) AND ${guard.condition}`,
                 },
               },
@@ -476,7 +502,11 @@ async function startTaskInstanceStep(
 
   const parsed = parseInstanceId(instanceId);
   if (!parsed) throw new ValidationError(`invalid instanceId "${instanceId}"`);
-  const instanceSk = taskInstanceSk(parsed.scheduledDate, parsed.scheduledTime, parsed.assignmentId);
+  const instanceSk = taskInstanceSk(
+    parsed.scheduledDate,
+    parsed.scheduledTime,
+    parsed.assignmentId,
+  );
 
   // Re-read + re-plan on each attempt: the instance write is guarded on the active pointer we
   // observed, so a concurrent close/switch fails the condition and we retry against fresh state.
@@ -487,7 +517,8 @@ async function startTaskInstanceStep(
       parsed.scheduledTime,
       parsed.assignmentId,
     );
-    if (!instance) throw new NotFoundError(`task instance ${instanceId} not found for user ${userId}`);
+    if (!instance)
+      throw new NotFoundError(`task instance ${instanceId} not found for user ${userId}`);
     const status = instance.status as PersistedTaskInstanceStatus;
     if (TERMINAL_STATUSES.includes(status)) {
       throw new ValidationError(`cannot change timing on a ${status} instance`);
@@ -500,7 +531,11 @@ async function startTaskInstanceStep(
     if (activeStepId === stepId) {
       const step = await loadInstanceStep(userId, instanceId, stepId);
       if (!step) throw new NotFoundError(`step ${stepId} not found for instance ${instanceId}`);
-      return { instance: presentInstance(instance), activeStep: presentStep(step), previousStep: null };
+      return {
+        instance: presentInstance(instance),
+        activeStep: presentStep(step),
+        previousStep: null,
+      };
     }
 
     // The step being started must be a real snapshot on this instance.
@@ -529,7 +564,13 @@ async function startTaskInstanceStep(
             'SET activeStepId = :stepId, activeStepStartedAt = :now, ' +
             'activeDurationSeconds = if_not_exists(activeDurationSeconds, :zero) + :delta, ' +
             'updatedAt = :now',
-          ExpressionAttributeValues: { ':stepId': stepId, ':now': now, ':zero': 0, ':delta': delta, ...guard.values },
+          ExpressionAttributeValues: {
+            ':stepId': stepId,
+            ':now': now,
+            ':zero': 0,
+            ':delta': delta,
+            ...guard.values,
+          },
           ConditionExpression: `attribute_exists(PK) AND ${guard.condition}`,
         },
       },
@@ -580,7 +621,11 @@ async function startTaskInstanceStep(
           })
         : null;
 
-    return { instance: instanceResult, activeStep: activeStepResult, previousStep: previousStepResult };
+    return {
+      instance: instanceResult,
+      activeStep: activeStepResult,
+      previousStep: previousStepResult,
+    };
   }
 }
 
@@ -603,7 +648,11 @@ async function pauseTaskInstanceTimer(
 
   const parsed = parseInstanceId(instanceId);
   if (!parsed) throw new ValidationError(`invalid instanceId "${instanceId}"`);
-  const instanceSk = taskInstanceSk(parsed.scheduledDate, parsed.scheduledTime, parsed.assignmentId);
+  const instanceSk = taskInstanceSk(
+    parsed.scheduledDate,
+    parsed.scheduledTime,
+    parsed.assignmentId,
+  );
 
   for (let attempt = 0; ; attempt++) {
     const instance = await getInstance(
@@ -612,7 +661,8 @@ async function pauseTaskInstanceTimer(
       parsed.scheduledTime,
       parsed.assignmentId,
     );
-    if (!instance) throw new NotFoundError(`task instance ${instanceId} not found for user ${userId}`);
+    if (!instance)
+      throw new NotFoundError(`task instance ${instanceId} not found for user ${userId}`);
     const status = instance.status as PersistedTaskInstanceStatus;
     if (TERMINAL_STATUSES.includes(status)) {
       throw new ValidationError(`cannot change timing on a ${status} instance`);
@@ -676,7 +726,11 @@ async function pauseTaskInstanceTimer(
           })
         : null;
 
-    return { instance: presentInstance(merged), activeStep: null, previousStep: previousStepResult };
+    return {
+      instance: presentInstance(merged),
+      activeStep: null,
+      previousStep: previousStepResult,
+    };
   }
 }
 
@@ -719,7 +773,8 @@ async function updateTaskInstanceStatus(
     parsed.scheduledTime,
     parsed.assignmentId,
   );
-  if (!instance) throw new NotFoundError(`task instance ${instanceId} not found for user ${userId}`);
+  if (!instance)
+    throw new NotFoundError(`task instance ${instanceId} not found for user ${userId}`);
   const current = instance.status as PersistedTaskInstanceStatus;
   const isUndoSkip = current === 'SKIPPED' && status === 'IN_PROGRESS';
   if (TERMINAL_STATUSES.includes(current) && !isUndoSkip) {
@@ -793,7 +848,11 @@ async function finalizeInstance(
   instance0: Record<string, unknown>,
   target: 'COMPLETED' | 'SKIPPED',
 ): Promise<TaskInstance> {
-  const instanceSk = taskInstanceSk(parsed.scheduledDate, parsed.scheduledTime, parsed.assignmentId);
+  const instanceSk = taskInstanceSk(
+    parsed.scheduledDate,
+    parsed.scheduledTime,
+    parsed.assignmentId,
+  );
   const instanceId = instance0.instanceId as string;
   const isCompleted = target === 'COMPLETED';
 
@@ -806,7 +865,8 @@ async function finalizeInstance(
         parsed.scheduledTime,
         parsed.assignmentId,
       );
-      if (!reread) throw new NotFoundError(`task instance ${instanceId} not found for user ${userId}`);
+      if (!reread)
+        throw new NotFoundError(`task instance ${instanceId} not found for user ${userId}`);
       // A concurrent writer already reached a terminal state — stop fighting; return current state.
       if (TERMINAL_STATUSES.includes(reread.status as PersistedTaskInstanceStatus)) {
         return presentInstance(reread);
@@ -824,8 +884,12 @@ async function finalizeInstance(
     const delta = plan?.delta ?? 0;
 
     const elapsed =
-      isCompleted && instance.startedAt ? elapsedSecondsBetween(instance.startedAt as string, now) : 0;
-    const setStamp = isCompleted ? 'completedAt = :now, elapsedSeconds = :elapsed' : 'skippedAt = :now';
+      isCompleted && instance.startedAt
+        ? elapsedSecondsBetween(instance.startedAt as string, now)
+        : 0;
+    const setStamp = isCompleted
+      ? 'completedAt = :now, elapsedSeconds = :elapsed'
+      : 'skippedAt = :now';
     const removeStamp = isCompleted ? 'skippedAt' : 'completedAt';
     const guard = activePointerGuard(instance);
 
@@ -1136,7 +1200,10 @@ async function listTaskAssignmentsForUser(
     {
       TableName: TABLE_NAME,
       KeyConditionExpression: 'PK = :pk AND begins_with(SK, :prefix)',
-      ExpressionAttributeValues: { ':pk': userPk(userId.trim()), ':prefix': TASK_ASSIGNMENT_PREFIX },
+      ExpressionAttributeValues: {
+        ':pk': userPk(userId.trim()),
+        ':prefix': TASK_ASSIGNMENT_PREFIX,
+      },
     },
     page,
   );
@@ -1178,7 +1245,11 @@ async function getTaskInstanceViews(
   for (const assignment of assignments) {
     const occurrences = expandOccurrences(assignment, start, end);
     for (const occ of occurrences) {
-      const instanceId = taskInstanceId(assignment.assignmentId, occ.scheduledDate, occ.scheduledTime);
+      const instanceId = taskInstanceId(
+        assignment.assignmentId,
+        occ.scheduledDate,
+        occ.scheduledTime,
+      );
       covered.add(instanceId);
       const real = instanceById.get(instanceId);
       const title = titles.get(assignment.taskId) ?? '';
@@ -1206,7 +1277,10 @@ async function getTaskInstanceViews(
   // Real instances with no matching virtual slot (cancelled exceptions, ended assignments, …).
   for (const inst of instances) {
     if (covered.has(inst.instanceId)) continue;
-    const title = titles.get(inst.taskId) ?? titles.get(assignmentById.get(inst.assignmentId)?.taskId ?? '') ?? '';
+    const title =
+      titles.get(inst.taskId) ??
+      titles.get(assignmentById.get(inst.assignmentId)?.taskId ?? '') ??
+      '';
     views.push(viewFromInstance(inst, title, nowMs));
   }
 
@@ -1232,7 +1306,12 @@ async function getTaskInstance(
   const parsed = parseInstanceId(id);
   if (!parsed) throw new ValidationError(`invalid instanceId "${id}"`);
 
-  const item = await getInstance(userId, parsed.scheduledDate, parsed.scheduledTime, parsed.assignmentId);
+  const item = await getInstance(
+    userId,
+    parsed.scheduledDate,
+    parsed.scheduledTime,
+    parsed.assignmentId,
+  );
   if (!item) return null;
   return presentInstanceRead(item, Date.now());
 }
@@ -1515,7 +1594,13 @@ function numberOr(value: unknown, fallback: number): number {
  * step's accumulated `activeDurationSeconds`. `if_not_exists` defaults a legacy row missing the
  * field to 0 before adding.
  */
-function closeStepTxItem(userId: string, instanceId: string, stepId: string, delta: number, now: string) {
+function closeStepTxItem(
+  userId: string,
+  instanceId: string,
+  stepId: string,
+  delta: number,
+  now: string,
+) {
   return {
     Update: {
       TableName: TABLE_NAME,
@@ -1561,7 +1646,11 @@ function planActiveStepClose(
   // Corrupt (no startedAt) or stale (snapshot gone): clear the pointer, count nothing.
   if (!startedAt || !activeStepRow) return { delta: 0, activeStepId, stepTxItem: null };
   const delta = elapsedSecondsBetween(startedAt, now);
-  return { delta, activeStepId, stepTxItem: closeStepTxItem(userId, instanceId, activeStepId, delta, now) };
+  return {
+    delta,
+    activeStepId,
+    stepTxItem: closeStepTxItem(userId, instanceId, activeStepId, delta, now),
+  };
 }
 
 /** True for the DynamoDB errors a lost optimistic-concurrency (active-pointer) race surfaces as. */
@@ -1612,11 +1701,7 @@ export function deriveInstanceStatus(
 }
 
 /** Project a stored TaskInstance row into a calendar view (status derived). */
-function viewFromInstance(
-  inst: TaskInstance,
-  title: string,
-  nowMs: number,
-): TaskInstanceView {
+function viewFromInstance(inst: TaskInstance, title: string, nowMs: number): TaskInstanceView {
   return {
     instanceId: inst.instanceId,
     assignmentId: inst.assignmentId,
@@ -1628,7 +1713,11 @@ function viewFromInstance(
     scheduledFor: inst.scheduledFor,
     timezone: inst.timezone,
     // A stored row's status is always persisted (never the derived OVERDUE).
-    status: deriveInstanceStatus(inst.status as PersistedTaskInstanceStatus, inst.scheduledFor, nowMs),
+    status: deriveInstanceStatus(
+      inst.status as PersistedTaskInstanceStatus,
+      inst.scheduledFor,
+      nowMs,
+    ),
     isVirtual: false,
     isException: inst.isException ?? false,
   };

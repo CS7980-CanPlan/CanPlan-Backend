@@ -3,11 +3,12 @@
  * generateReport, saveReport, listReports, getReportDownloadUrl, and deleteReport.
  *
  * Reports are a SUPPORT-PERSON surface: a caller may only touch a primary user's reports as
- * that user's active supporter. Concretely, access is granted only when ALL hold:
+ * that user's currently effective supporter. Concretely, access is granted only when ALL hold:
  *   - the caller is in the Cognito `SupportPerson` group,
  *   - the caller holds an ACTIVE SupportLink to the target user,
  *   - the target is still a `PRIMARY_USER`, and
- *   - both parties currently share an organization.
+ *   - both parties currently share an organization and the link's organization/membership
+ *     snapshot still matches both live profiles.
  * A primary user may NOT access their own reports (self-access is explicitly denied) — reports
  * are produced for a supporter, not the subject. This mirrors the delegation rules enforced for
  * every other cross-user operation (see assertCanActForUser), minus the self path.
@@ -21,7 +22,7 @@ import type { AppSyncIdentity } from './types';
 /**
  * Assert the caller may access `targetUserId`'s reports and return the caller's id (Cognito
  * `sub`). Throws UnauthorizedError when the caller is unauthenticated, is the target themselves,
- * or lacks active SupportPerson delegation to the (same-org, primary-user) target.
+ * or lacks effective SupportPerson delegation to the target.
  */
 export async function assertCanAccessUserReports(
   identity: AppSyncIdentity | undefined,
@@ -39,9 +40,9 @@ export async function assertCanAccessUserReports(
     );
   }
 
-  // Delegated access: active SupportLink, target is a PRIMARY_USER, and a shared organization.
-  // assertCanActForUser enforces exactly this (and rejects a non-SupportPerson caller); reusing
-  // it keeps the reports rule in lock-step with every other cross-user operation.
+  // assertCanActForUser enforces the full effective-link rule (ACTIVE, PRIMARY_USER target,
+  // shared organization, and matching membership snapshot) and rejects non-SupportPerson
+  // callers; reusing it keeps reports in lock-step with every other cross-user operation.
   await assertCanActForUser(identity, target);
   return caller;
 }

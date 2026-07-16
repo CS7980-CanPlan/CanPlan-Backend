@@ -1,6 +1,6 @@
 # CanPlan 2.0 — Frontend API Reference
 
-_Last updated: 2026-07-06. Version: SupportPerson delegation (schedules, categories, task templates) + organization management + AI progress reports (two-step generate → save, SupportPerson-only)._
+_Last updated: 2026-07-15. Version: SupportPerson delegation (schedules, categories, task templates) + organization management, membership-session-bound SupportLink lifecycle, and the PrimaryUser/SupportPerson organization directory + AI progress reports (two-step generate → save, SupportPerson-only)._
 
 > ## 🚨 Breaking change — categories, default category, Task status, TaskStep keys
 >
@@ -51,8 +51,9 @@ human-readable companion.
 >
 > The **report operations** — `generateReport`, `saveReport`, `listReports`,
 > `getReportDownloadUrl`, `deleteReport` — are a **SupportPerson-only** surface: the caller must
-> be a `SUPPORT_PERSON` with an **ACTIVE** `SupportLink` to the target `PRIMARY_USER` in the
-> **same organization** (the same delegation rule as everything else, below). A primary user may
+> be a `SUPPORT_PERSON` with a **currently effective** `SupportLink` to the target
+> `PRIMARY_USER` (ACTIVE, same current organization, and a selection snapshot matching both
+> live membership sessions — the same delegation rule as everything else, below). A primary user may
 > **not** access their own reports. See
 > [AI progress reports](#ai-progress-reports--two-step-generate--save).
 >
@@ -62,11 +63,20 @@ human-readable companion.
 > their own instances.
 >
 > **SupportPerson delegated access.** A `SUPPORT_PERSON` may act on a `PRIMARY_USER`
-> they have **selected** — `selectPrimaryUser` writes an **ACTIVE** `SupportLink`. Delegation
-> is granted only while (a) the caller's role is `SUPPORT_PERSON`, (b) the `SupportLink` is
-> `ACTIVE`, (c) the **target is still a `PRIMARY_USER`** (a legacy link pointing at a
-> SupportPerson/ORG_ADMIN, or at a deleted user, grants nothing), and (d) the primary user
-> **currently shares the SupportPerson's `organizationId`**. With it, a SupportPerson may use
+> they have **selected** — `selectPrimaryUser` writes an **ACTIVE** `SupportLink` carrying an
+> internal **selection snapshot**: the organization it was selected in plus both parties'
+> current organization **membership session** ids. Delegation is granted only while ALL hold:
+> (a) the caller is in the `SupportPerson` Cognito group, (b) the `SupportLink` is `ACTIVE`,
+> (c) **both profiles still exist** and the **target is still a `PRIMARY_USER`** (a link
+> pointing at a SupportPerson/ORG_ADMIN, or at a deleted user, grants nothing), (d) both
+> parties **currently share the same non-null `organizationId`**, and (e) the link's snapshot
+> **still matches** — the stored organization equals the current one and each stored membership
+> id equals that party's live one. A missing or mismatched snapshot **fails closed**: an ACTIVE
+> status alone is never sufficient. Because a membership session id rotates on every real org
+> join/move and clears on leave, a link from before an organization change stays dead **even if
+> both users later rejoin the same organization** — only an explicit `selectPrimaryUser`
+> restores it (see [SupportLink lifecycle](#supportlink-lifecycle--organization-membership-sessions)).
+> With effective delegation, a SupportPerson may use
 > **every assignment / instance operation** for the selected user (`createTaskAssignment`,
 > `startTaskInstance`, `setTaskInstanceStepCompletion`, `updateTaskInstanceStatus`,
 > `cancelTaskInstance`, `endTaskAssignment`, `deleteTaskAssignment`,
@@ -76,8 +86,9 @@ human-readable companion.
 > media, and list their tasks (`createTask` with `userId`, `updateTask`, `deleteTask`,
 > `createTaskStep`, `updateTaskStep`, `deleteTaskStep`, `reorderTaskSteps`, `updateTaskOrder`,
 > `createMediaUploadUrl`, `createMediaAsset`, `deleteMediaAsset`, `listTasksByOwner`,
-> `listTasksByCategory`). A **stale** link (after either party changes org, the target's role
-> changes, or the link is revoked) stops granting access immediately.
+> `listTasksByCategory`). A **stale** link (either party left/changed org — the backend also
+> auto-revokes it, the target's role changed, or the link was revoked) stops granting access
+> immediately.
 >
 > **Read-only access for assigned templates/media.** A user who holds an **active
 > assignment referencing a task** may READ that task and its resources even though they don't
@@ -87,7 +98,7 @@ human-readable companion.
 >
 > **Assignments are owner-of-template + delegated-for-user.** `createTaskAssignment` requires
 > the caller to **own the referenced Task template** AND be allowed to act for the target
-> `userId` (self or active delegation). `assignedBy` is always derived from the caller's
+> `userId` (self or effective delegation). `assignedBy` is always derived from the caller's
 > identity — a client-supplied `assignedBy` is ignored.
 >
 > **SupportLink mutations are identity-derived.** `selectPrimaryUser` / `unselectPrimaryUser`
@@ -105,9 +116,9 @@ human-readable companion.
 ## Identity & the `userId` field
 
 **Invariant: for any operation that takes a `userId`/`ownerId`, the id you pass is either
-your own Cognito `sub` or the id of a user you may act for through delegation.** For Task,
+your own Cognito `sub` or the id of a user you may act for through effective delegation.** For Task,
 category, scheduling, and media operations this is now **enforced** — passing an id you
-neither own nor hold active SupportPerson delegation for returns `NOT_AUTHORIZED` (see the
+neither own nor hold effective SupportPerson delegation for returns `NOT_AUTHORIZED` (see the
 authorization model above). It is also load-bearing in how data is keyed and read back:
 
 - A user's profile is stored at the key derived from their Cognito `sub`
@@ -118,7 +129,7 @@ authorization model above). It is also load-bearing in how data is keyed and rea
 - The `userId`/`ownerId`-argument operations (`createTaskAssignment`, `startTaskInstance`,
   `getTaskInstanceViews`, `listTaskInstanceSteps`, and the Task/category/media writes) are
   authorized against that id: it must be your own, or one you may act for as a delegated
-  SupportPerson. A non-self id you have no active delegation for is rejected — it will
+  SupportPerson. A non-self id you have no effective delegation for is rejected — it will
   **not** silently write to another partition. (The newer `getTaskInstance` /
   `listTaskInstances` / `batchGetTaskInstances` reads take **no `userId`** and always
   resolve the owner from your identity.)
@@ -130,7 +141,7 @@ authorization model above). It is also load-bearing in how data is keyed and rea
 **Rule of thumb:** decode the `sub` claim from your Cognito ID token once at sign-in
 and use it as the `userId`/`ownerId` for everything that is "about me." Treat ids
 that come from a list response (e.g. a supporter acting on a primary user) as the
-only legitimate source of *someone else's* id.
+only legitimate source of _someone else's_ id.
 
 ---
 
@@ -140,13 +151,13 @@ All requests are a single `POST` to the GraphQL URL with a JSON body of
 `{ query, variables }`. There is one URL for the whole API — you select the
 operation in the query, not the path.
 
-| | |
-|---|---|
-| **Endpoint** | The `GraphQLApiUrl` printed by `cdk deploy` (e.g. `https://xxxx.appsync-api.<region>.amazonaws.com/graphql`) |
-| **Method** | `POST` |
-| **Auth (primary)** | Cognito User Pool JWT in the `Authorization` header |
-| **Auth (secondary)** | API key in the `x-api-key` header — for `healthCheck` and tooling only |
-| **Content-Type** | `application/json` |
+|                      |                                                                                                              |
+| -------------------- | ------------------------------------------------------------------------------------------------------------ |
+| **Endpoint**         | The `GraphQLApiUrl` printed by `cdk deploy` (e.g. `https://xxxx.appsync-api.<region>.amazonaws.com/graphql`) |
+| **Method**           | `POST`                                                                                                       |
+| **Auth (primary)**   | Cognito User Pool JWT in the `Authorization` header                                                          |
+| **Auth (secondary)** | API key in the `x-api-key` header — for `healthCheck` and tooling only                                       |
+| **Content-Type**     | `application/json`                                                                                           |
 
 > **Which auth do I use?** Frontend clients (mobile app + web portal) authenticate
 > users against the Cognito User Pool and send the user's **ID token** (JWT) in the
@@ -171,11 +182,15 @@ A minimal `fetch` wrapper the frontend can build on:
 ```ts
 const GRAPHQL_URL = import.meta.env.VITE_GRAPHQL_URL;
 
-async function graphql<T>(query: string, variables: Record<string, unknown>, idToken: string): Promise<T> {
+async function graphql<T>(
+  query: string,
+  variables: Record<string, unknown>,
+  idToken: string,
+): Promise<T> {
   const res = await fetch(GRAPHQL_URL, {
-    method: "POST",
+    method: 'POST',
     headers: {
-      "Content-Type": "application/json",
+      'Content-Type': 'application/json',
       Authorization: idToken, // Cognito ID token (JWT)
     },
     body: JSON.stringify({ query, variables }),
@@ -198,20 +213,26 @@ Every entity lives in one DynamoDB table keyed by a composite `PK`/`SK`, with an
 `entityType` discriminator. The frontend never sees `PK`/`SK` — it works with the
 GraphQL types below. The key layout (for reference):
 
-| Entity | PK | SK |
-|---|---|---|
-| UserProfile | `USER#<userId>` | `#PROFILE` |
-| Organization | `ORG#<organizationId>` | `#META` |
-| OrganizationMember | `ORG#<organizationId>` | `MEMBER#<userId>` (internal; strongly-consistent membership row, never exposed in GraphQL) |
-| SupportLink | `SUPPORTER#<supporterId>` | `USER#<primaryUserId>` |
-| Category | `USER#<ownerId>` | `CATEGORY#<categoryId>` |
-| Task (template) | `TASK#<taskId>` | `#META` |
-| TaskStep | `TASK#<taskId>` | `STEP#<stepId>` (stable id key; `order` is a plain attribute) |
-| TaskAssignment | `USER#<userId>` | `TASK_ASSIGNMENT#<assignmentId>` |
-| TaskInstance | `USER#<userId>` | `TASK_INSTANCE#<scheduledDate>#<scheduledTime>#<assignmentId>` |
-| TaskInstanceStep | `USER#<userId>` | `TASK_INSTANCE_STEP#<instanceId>#STEP#<stepId>` |
-| MediaAsset | `TASK#<taskId>` | `MEDIA#<assetId>` |
-| Report | `USER#<primaryUserId>` | `REPORT#<createdAt>#<reportId>` (chronological, so `listReports` reads newest-first) |
+| Entity             | PK                        | SK                                                                                         |
+| ------------------ | ------------------------- | ------------------------------------------------------------------------------------------ |
+| UserProfile        | `USER#<userId>`           | `#PROFILE`                                                                                 |
+| Organization       | `ORG#<organizationId>`    | `#META`                                                                                    |
+| OrganizationMember | `ORG#<organizationId>`    | `MEMBER#<userId>` (internal; strongly-consistent membership row, never exposed in GraphQL) |
+| SupportLink        | `SUPPORTER#<supporterId>` | `USER#<primaryUserId>`                                                                     |
+| Category           | `USER#<ownerId>`          | `CATEGORY#<categoryId>`                                                                    |
+| Task (template)    | `TASK#<taskId>`           | `#META`                                                                                    |
+| TaskStep           | `TASK#<taskId>`           | `STEP#<stepId>` (stable id key; `order` is a plain attribute)                              |
+| TaskAssignment     | `USER#<userId>`           | `TASK_ASSIGNMENT#<assignmentId>`                                                           |
+| TaskInstance       | `USER#<userId>`           | `TASK_INSTANCE#<scheduledDate>#<scheduledTime>#<assignmentId>`                             |
+| TaskInstanceStep   | `USER#<userId>`           | `TASK_INSTANCE_STEP#<instanceId>#STEP#<stepId>`                                            |
+| MediaAsset         | `TASK#<taskId>`           | `MEDIA#<assetId>`                                                                          |
+| Report             | `USER#<primaryUserId>`    | `REPORT#<createdAt>#<reportId>` (chronological, so `listReports` reads newest-first)       |
+
+`UserProfile.organizationMembershipId` is an internal organization-membership session id; it
+is not part of the GraphQL `UserProfile` type. A real join or move creates a new id, leaving
+clears it, and setting the same organization preserves it. `selectPrimaryUser` snapshots both
+parties' current ids plus the organization onto the `SupportLink`, which prevents an old link
+from becoming valid merely because the users later rejoin the same organization.
 
 Seven GSIs serve the cross-cutting lists: `supporterIndex` (users managed by a
 supporter), `primaryUserSupportLinkIndex` (`SupportLink`s by primary user — keyed on
@@ -261,13 +282,13 @@ real Category row. Categories also keep an internal, transactionally-maintained 
 
 ## Enums
 
-| Enum | Values |
-|---|---|
-| `UserRole` | `PRIMARY_USER`, `SUPPORT_PERSON`, `ORG_ADMIN` — a server-derived projection of Cognito group membership (`PrimaryUser`/`SupportPerson`/`OrganizationAdmin`); **Cognito groups are the authorization source of truth**. `SystemAdmin` is an elevated group, not a `UserRole`. |
-| `TaskAssignmentScheduleType` | `ONE_TIME`, `RECURRING` |
-| `TaskInstanceStatus` | `TO_DO`, `IN_PROGRESS`, `OVERDUE`, `COMPLETED`, `SKIPPED`, `CANCELLED` — `OVERDUE` is **derived** at read time (a non-terminal occurrence whose `scheduledFor` is in the past) and cannot be set by a mutation; `CANCELLED` is set via `cancelTaskInstance` |
-| `MediaType` | `IMAGE`, `AUDIO`, `VIDEO` |
-| `SupportLinkStatus` | `PENDING`, `ACTIVE`, `REVOKED` |
+| Enum                         | Values                                                                                                                                                                                                                                                                       |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `UserRole`                   | `PRIMARY_USER`, `SUPPORT_PERSON`, `ORG_ADMIN` — a server-derived projection of Cognito group membership (`PrimaryUser`/`SupportPerson`/`OrganizationAdmin`); **Cognito groups are the authorization source of truth**. `SystemAdmin` is an elevated group, not a `UserRole`. |
+| `TaskAssignmentScheduleType` | `ONE_TIME`, `RECURRING`                                                                                                                                                                                                                                                      |
+| `TaskInstanceStatus`         | `TO_DO`, `IN_PROGRESS`, `OVERDUE`, `COMPLETED`, `SKIPPED`, `CANCELLED` — `OVERDUE` is **derived** at read time (a non-terminal occurrence whose `scheduledFor` is in the past) and cannot be set by a mutation; `CANCELLED` is set via `cancelTaskInstance`                  |
+| `MediaType`                  | `IMAGE`, `AUDIO`, `VIDEO`                                                                                                                                                                                                                                                    |
+| `SupportLinkStatus`          | `PENDING`, `ACTIVE`, `REVOKED`                                                                                                                                                                                                                                               |
 
 ### `AWSJSON` fields — encoding (foot-gun)
 
@@ -319,7 +340,9 @@ key (`x-api-key`) **or** a Cognito JWT — letting monitors/CI verify connectivi
 without a signed-in user. (Every other field requires a Cognito JWT.)
 
 ```graphql
-query { healthCheck }
+query {
+  healthCheck
+}
 ```
 
 ```bash
@@ -335,21 +358,22 @@ curl -s "$GRAPHQL_URL" \
 ### `createTask` — mutation
 
 Creates a **reusable task template**, plus one `TaskStep` item per nested step (each stored as
-its own row). By default the task is owned by the authenticated caller; a `SupportPerson` may
-create it **under a selected primary user** by passing that user's id as `userId`. A `Task`
+its own row). By default the task is owned by the authenticated caller; a `SupportPerson` with
+effective delegation may create it **under that primary user** by passing the user's id as
+`userId`. A `Task`
 carries **no schedule** — scheduling a task for a user is a separate operation, see
 `createTaskAssignment`.
 
 **Input — `CreateTaskInput`**
 
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `userId` | `ID` | — | Optional target owner. Omitted/null/blank ⇒ the caller. A non-self value requires SupportPerson delegated access (`NOT_AUTHORIZED` otherwise); the task is created under that primary user |
-| `title` | `String!` | ✅ | Non-empty after trimming |
-| `categoryId` | `ID` | — | Optional; omitted/null ⇒ the **target owner's** default category. A **blank string is rejected**. A supplied id must be a real, owned (by the target owner), non-deleting Category (see below) |
-| `description` | `String` | — | Optional |
-| `steps` | `[CreateTaskStepNestedInput!]` | — | Ordered; each becomes a `STEP#<stepId>` item; max **97**, or max **96** when `coverImageS3Key` is supplied |
-| `coverImageS3Key` | `String` | — | Optional cover image (pending key from `createTaskCoverImageUploadUrl`) |
+| Field             | Type                           | Required | Notes                                                                                                                                                                                          |
+| ----------------- | ------------------------------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `userId`          | `ID`                           | —        | Optional target owner. Omitted/null/blank ⇒ the caller. A non-self value requires SupportPerson delegated access (`NOT_AUTHORIZED` otherwise); the task is created under that primary user     |
+| `title`           | `String!`                      | ✅       | Non-empty after trimming                                                                                                                                                                       |
+| `categoryId`      | `ID`                           | —        | Optional; omitted/null ⇒ the **target owner's** default category. A **blank string is rejected**. A supplied id must be a real, owned (by the target owner), non-deleting Category (see below) |
+| `description`     | `String`                       | —        | Optional                                                                                                                                                                                       |
+| `steps`           | `[CreateTaskStepNestedInput!]` | —        | Ordered; each becomes a `STEP#<stepId>` item; max **97**, or max **96** when `coverImageS3Key` is supplied                                                                                     |
+| `coverImageS3Key` | `String`                       | —        | Optional cover image (pending key from `createTaskCoverImageUploadUrl`)                                                                                                                        |
 
 > **No arbitrary `ownerId`.** The owner is the caller's Cognito `sub`, or the `userId` target
 > when the caller is a delegated SupportPerson — never a free-form client-supplied owner. The
@@ -402,7 +426,12 @@ mutation CreateTask($input: CreateTaskInput!) {
     categoryId
     order
     createdAt
-    steps { stepId order text description }
+    steps {
+      stepId
+      order
+      text
+      description
+    }
   }
 }
 ```
@@ -449,15 +478,18 @@ fields are marked `!` and everything else is optional; see
 
 **Users & support**
 
-| Operation | Input | Returns |
-|---|---|---|
-| `createUserProfile` | `input: { displayName!, organizationId, accessibilitySettings }` (`CreateMyUserProfileInput`) | `UserProfile` — creates the **caller's own** profile **and its default category** atomically; `displayName` is required, while `userId` (Cognito `sub`), `email`, `role`, and `defaultCategoryId` are derived server-side and cannot be supplied by the client. A supplied `organizationId` must reference an **existing, non-deleting Organization** (`NOT_FOUND`/`VALIDATION` otherwise) |
-| `updateMyUserProfile` | `input: { displayName, accessibilitySettings, organizationId }` (`UpdateMyUserProfileInput`) | `UserProfile!` — **partial** update of the **caller's own** profile; `organizationId` is editable but must reference an **existing, non-deleting Organization** (or `null` to clear); see below |
-| `getUserProfile` | `userId!` | `UserProfile` · `null` if not found |
-| `listMyOrganizationUsers` | `limit, nextToken` | `UserProfileConnection!` — **the caller's OWN** org roster (orgIndex projection: `userId`, `displayName`, `role`). The org is read from the caller's profile (no `organizationId` argument), so a SupportPerson can only ever list their own org. `VALIDATION` if the caller has no current org |
-| `selectPrimaryUser` | `input: { primaryUserId! }` (`SelectPrimaryUserInput`) | `SupportLink!` — a **SupportPerson** selects an in-org `PRIMARY_USER` (supporter = caller); writes/restores the link **ACTIVE**; see below |
-| `unselectPrimaryUser` | `input: { primaryUserId! }` (`UnselectPrimaryUserInput`) | `SupportLink!` — soft-revokes the link (**REVOKED**, never deleted); see below |
-| `listMySupportList` | `limit, nextToken` | `SupportLinkConnection!` — the caller's OWN support list (every primary user they selected, ACTIVE + REVOKED), via supporterIndex on the caller's sub |
+| Operation                    | Input                                                                                         | Returns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ---------------------------- | --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `createUserProfile`          | `input: { displayName!, organizationId, accessibilitySettings }` (`CreateMyUserProfileInput`) | `UserProfile` — creates the **caller's own** profile **and its default category** atomically; `displayName` is required, while `userId` (Cognito `sub`), `email`, `role`, and `defaultCategoryId` are derived server-side and cannot be supplied by the client. A supplied `organizationId` must reference an **existing, non-deleting Organization** (`NOT_FOUND`/`VALIDATION` otherwise). A **repeated** call for an existing profile follows the same [organization-change lifecycle](#supportlink-lifecycle--organization-membership-sessions) as `updateMyUserProfile` |
+| `updateMyUserProfile`        | `input: { displayName, accessibilitySettings, organizationId }` (`UpdateMyUserProfileInput`)  | `UserProfile!` — **partial** update of the **caller's own** profile; `organizationId` is editable but must reference an **existing, non-deleting Organization** (or `null` to clear); every real join/move/leave **soft-revokes affected older SupportLinks**; see below                                                                                                                                                                                                                                                                                                    |
+| `getUserProfile`             | `userId!`                                                                                     | `UserProfile` · `null` if not found                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `listMyOrganizationUsers`    | `limit, nextToken`                                                                            | `UserProfileConnection!` — **the caller's OWN** org roster (orgIndex projection: `userId`, `displayName`, `role`). The org is read from the caller's profile (no `organizationId` argument), so a SupportPerson can only ever list their own org. `VALIDATION` if the caller has no current org                                                                                                                                                                                                                                                                             |
+| `listAvailableOrganizations` | `limit, nextToken`                                                                            | `OrganizationConnection!` — the **read-only organization directory** for `PrimaryUser`/`SupportPerson`: every joinable org, newest-first, deleting orgs excluded; see [Organization directory](#organization-directory-primaryuser--supportperson)                                                                                                                                                                                                                                                                                                                          |
+| `getOrganization`            | `organizationId!`                                                                             | `Organization` — one directory entry (`PrimaryUser`/`SupportPerson`); `null` if it doesn't exist **or is being deleted**; see [Organization directory](#organization-directory-primaryuser--supportperson)                                                                                                                                                                                                                                                                                                                                                                  |
+| `selectPrimaryUser`          | `input: { primaryUserId! }` (`SelectPrimaryUserInput`)                                        | `SupportLink!` — a **SupportPerson** explicitly selects an in-org `PRIMARY_USER` (supporter = caller); writes/restores the link **ACTIVE** with a fresh membership snapshot, atomically verified against both live profiles; see below                                                                                                                                                                                                                                                                                                                                      |
+| `unselectPrimaryUser`        | `input: { primaryUserId! }` (`UnselectPrimaryUserInput`)                                      | `SupportLink!` — soft-revokes the link (**REVOKED**, never deleted); see below                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `listMySupportList`          | `limit, nextToken`                                                                            | `SupportLinkConnection!` — **SupportPerson only**; the caller's **currently effective** support relationships: ACTIVE links whose membership snapshot still matches both parties (REVOKED, stale, and legacy links are excluded). Read consistently from the caller's SupportLink partition; a page may hold fewer than `limit` items while `nextToken` is non-null — keep paging until it is `null`                                                                                                                                                                        |
+| `listMySupportLinkHistory`   | `limit, nextToken`                                                                            | `SupportLinkConnection!` — **SupportPerson only**; unfiltered history/debug view of the caller's public SupportLink fields (all stored statuses, including stale/legacy entries), read consistently from the caller's SupportLink partition. Presence here says **nothing** about current access                                                                                                                                                                                                                                                                            |
 
 > **Profile bootstrap — the client must create the profile on first run.** There is
 > **no automatic profile creation.** The Cognito Post Confirmation trigger does one
@@ -475,10 +507,12 @@ fields are marked `!` and everything else is optional; see
 > **`createUserProfile` semantics.** On the **first** call it writes the profile and its
 > default category in one transaction; the profile records the generated
 > `defaultCategoryId`. The profile write is **last-write-wins, not create-only** — calling
-> it again **overwrites** the editable profile fields (and resets `createdAt`/`updatedAt`
-> to "now"); it does **not** error on a pre-existing profile and does **not** merge. A
+> it again **overwrites** the editable profile fields and refreshes `updatedAt` while preserving
+> the original `createdAt`; it does **not** error on a pre-existing profile and does **not** merge. A
 > re-call **preserves** the existing `defaultCategoryId` and never creates a second default
-> category. So guard it behind the `getUserProfile` null-check above, or treat a second
+> category. Because this is a full replacement, omitting `organizationId` on a repeated call
+> means **leave the current organization** (and drives the SupportLink lifecycle); it does not
+> mean “keep the existing organization.” So guard it behind the `getUserProfile` null-check above, or treat a second
 > call as a deliberate full replace of the editable fields.
 >
 > **`updateMyUserProfile` semantics.** A **partial update** of the **caller's own** profile
@@ -500,49 +534,170 @@ fields are marked `!` and everything else is optional; see
 > - **`organizationId`** (org membership) — the key **omitted** ⇒ unchanged; a **non-empty
 >   string** ⇒ set it, but it must **reference an existing, non-deleting `Organization`** (a
 >   missing org is `NOT_FOUND`, a deleting org is `VALIDATION`); explicit **`null`** ⇒ clear it;
->   a blank/whitespace string is rejected (use `null` to clear). Organizations are created and
->   managed by SystemAdmin (see [Admin organizations](#admin-organizations--queries--mutations-systemadmin-only)).
+>   a blank/whitespace string is rejected (use `null` to clear). Browse joinable organizations
+>   with [`listAvailableOrganizations` / `getOrganization`](#organization-directory-primaryuser--supportperson);
+>   they are created and managed by SystemAdmin (see
+>   [Admin organizations](#admin-organizations--queries--mutations-systemadmin-only)).
 >   **Any signed-in user may set their own** `organizationId` to a valid org in this MVP — there
 >   is no org-admin-approved join flow yet. Changing it moves you in `listMyOrganizationUsers`/
->   `orgIndex` and **affects SupportPerson delegation**: a supporter only keeps delegated access
->   while you still share their org (see the authorization model).
+>   `orgIndex` and **drives the SupportLink lifecycle**: every real join, move, or leave starts or
+>   ends an internal membership session and **soft-revokes every affected older ACTIVE
+>   SupportLink touching you** (as supporter or as primary user); rejoining later does **not** restore them — the
+>   SupportPerson must call `selectPrimaryUser` again. Re-supplying your **current** org is a
+>   no-op: nothing rotates and nothing is revoked. See
+>   [SupportLink lifecycle](#supportlink-lifecycle--organization-membership-sessions).
 >
-> Setting/moving/clearing `organizationId` is **transactional and keeps a strongly-consistent
+> Setting/moving/clearing `organizationId` is **transactional and keeps an
 > `OrganizationMember` row** (`ORG#<org>`/`MEMBER#<user>`) in lockstep: setting reads the current
-> profile first, then in one transaction updates the profile, re-checks the target org exists and
-> isn't deleting, writes the new membership row, and (when moving) deletes the old one; clearing
-> deletes the membership row in the same transaction. This membership row — not the eventually
-> consistent `orgIndex` — is what `adminDeleteOrganization` relies on to detach members safely.
+> profile first, then in one transaction updates the profile (bound to the org seen at that
+> read — a concurrent org change aborts with a retryable `VALIDATION` "changed concurrently"),
+> re-checks the target org exists and isn't deleting, writes the new membership row, and (when
+> moving) deletes the old one; clearing deletes the membership row in the same transaction. This
+> membership row — read with `ConsistentRead: true`, unlike the eventually consistent `orgIndex`
+> — is what `adminDeleteOrganization` relies on to detach members safely.
 >
 > The server also stamps a fresh `updatedAt`. Use this for ordinary profile edits; use
 > `createUserProfile` only for first-run creation (or a deliberate full replace).
 >
-> **`selectPrimaryUser` / `unselectPrimaryUser` (SupportPerson).** A **SupportPerson** selects a
-> `PRIMARY_USER` in their **own current organization** to support; the supporter is always the
-> caller's identity (never client-supplied). `selectPrimaryUser` writes (or **restores** a
-> previously revoked) `SupportLink` as **ACTIVE**, preserving the original `createdAt`; the
-> target must exist, be a `PRIMARY_USER`, and currently share the caller's `organizationId`
-> (else `NOT_AUTHORIZED`/`VALIDATION`). `unselectPrimaryUser` **soft-revokes** (status
-> `REVOKED`) — it never hard-deletes, so re-selecting restores the row; `NOT_FOUND` if no link
-> exists. **Only a SupportPerson** may call either (a primary user gets `NOT_AUTHORIZED`). An
-> **ACTIVE** link (plus the same-organization + `PRIMARY_USER` checks) is what grants delegated
-> access. List your selections with `listMySupportList`.
->
+> **`selectPrimaryUser` / `unselectPrimaryUser` (SupportPerson).** A **SupportPerson**
+> explicitly selects a `PRIMARY_USER` in their **own current organization** to support; the
+> supporter is always the caller's identity (never client-supplied), and the Cognito
+> `SupportPerson` group is the authorization source of truth. `selectPrimaryUser` writes — or
+> **restores** a previously revoked or legacy link — as **ACTIVE**, preserving the original
+> `createdAt` and stamping a fresh internal **selection snapshot** (the organization plus both
+> parties' current membership-session ids). The target must exist, be a `PRIMARY_USER`, and
+> currently share the caller's `organizationId` (else `NOT_AUTHORIZED`/`VALIDATION`); the write
+> is one DynamoDB transaction that **re-verifies both live profiles**, so a selection racing an
+> organization change fails with a retryable `VALIDATION` error instead of activating a stale
+> relationship. `unselectPrimaryUser` **soft-revokes** (status `REVOKED`) — it never
+> hard-deletes, so re-selecting restores the same row; `NOT_FOUND` if no link exists. **Only a
+> SupportPerson** may call either (a primary user gets `NOT_AUTHORIZED`). Delegated access
+> requires an **effective** link — ACTIVE **and** a still-matching snapshot (see the
+> authorization model). List your current selections with `listMySupportList`; unfiltered history with
+> `listMySupportLinkHistory`.
+
+### Organization directory (PrimaryUser + SupportPerson)
+
+`listAvailableOrganizations` and `getOrganization` are the read-only directory used by the
+organization picker. They expose only `organizationId`, `name`, `createdAt`, and `updatedAt`;
+they never expose members, internal keys, `entityType`, or the internal `deleting` flag.
+Organizations being deleted are treated as unavailable: the list excludes them and the get
+query returns `null` for them.
+
+| Caller                    | Directory access                        | Organization management |
+| ------------------------- | --------------------------------------- | ----------------------- |
+| `PrimaryUser`             | Yes                                     | No                      |
+| `SupportPerson`           | Yes                                     | No                      |
+| `OrganizationAdmin`       | No (not granted in this MVP)            | No                      |
+| `SystemAdmin` only        | Use `listAllOrganizations` / admin APIs | Yes                     |
+| API key / unauthenticated | No                                      | No                      |
+
+The directory fields are restricted to the `PrimaryUser` and `SupportPerson` Cognito groups at
+the AppSync edge and are checked again in the users Lambda. A `SystemAdmin` who also holds one
+of those base roles can use the directory; otherwise they use the existing SystemAdmin APIs.
+
+```graphql
+query AvailableOrganizations($limit: Int, $nextToken: String) {
+  listAvailableOrganizations(limit: $limit, nextToken: $nextToken) {
+    items {
+      organizationId
+      name
+      createdAt
+      updatedAt
+    }
+    nextToken
+  }
+}
+
+query Organization($organizationId: ID!) {
+  getOrganization(organizationId: $organizationId) {
+    organizationId
+    name
+    createdAt
+    updatedAt
+  }
+}
+```
+
+The directory is newest-first and index-backed; it never scans the table. Because DynamoDB
+applies the deleting-org filter after reading an index page, a page can contain fewer than the
+requested `limit` (including zero) while `nextToken` is still non-null. Continue paging until
+the token is `null`.
+
+Directory access is read-only. Joining still happens by passing the chosen `organizationId` to
+`createUserProfile` or `updateMyUserProfile`; creating, renaming, deleting, and assigning other
+users remain SystemAdmin-only operations.
+
+### SupportLink lifecycle & organization membership sessions
+
+The current support relationship follows this lifecycle:
+
+```text
+selectPrimaryUser in the same organization
+  -> ACTIVE and snapshot both current membership sessions
+
+either party actually joins, leaves, or moves organization
+  -> immediately ineffective and soft-revoked to REVOKED
+
+the users later share an organization again
+  -> still REVOKED; no automatic restoration
+
+SupportPerson explicitly calls selectPrimaryUser again
+  -> revalidated and restored to ACTIVE
+```
+
+A real join or move creates a fresh internal `UserProfile.organizationMembershipId`; leaving
+clears it. Re-supplying the current `organizationId` preserves the existing id and does not
+revoke links. The membership id is never exposed through GraphQL. An effective SupportLink
+must snapshot the current organization and both parties' current membership ids, in addition
+to being ACTIVE and targeting a current `PRIMARY_USER`. This makes an old relationship fail
+closed even if both parties later rejoin the same organization.
+
+The lifecycle is applied by every runtime organization-change path:
+
+- `updateMyUserProfile`;
+- a repeated `createUserProfile` call for an existing profile;
+- `adminSetUserOrganization`; and
+- member detachment during `adminDeleteOrganization`.
+
+The organization/profile membership write commits transactionally with its
+`OrganizationMember` row. After an actual change, the backend performs an idempotent,
+paginated soft-revocation sweep for links where the user is either the SupportPerson or the
+PrimaryUser. Each explicit selection also commits an internal reverse pointer atomically with
+the canonical link, so target-side cleanup uses a strongly-consistent base-table query rather
+than waiting for GSI propagation. The rotated/cleared membership id is still the immediate
+authorization boundary, so a stale row cannot grant access while status cleanup completes.
+
+There is deliberately **no bulk migration or backfill for membership-session fields**. Legacy
+data is handled lazily and fails closed:
+
+- An in-org profile without `organizationMembershipId` receives one through a conditional,
+  if-absent write when it next participates in organization membership or
+  `selectPrimaryUser`. This does not count as an organization change and does not revoke links.
+- A legacy SupportLink without a complete selection snapshot grants no delegated access and is
+  excluded from `listMySupportList`, even if its stored status is ACTIVE.
+- The SupportPerson upgrades only the intended legacy relationship by explicitly calling
+  `selectPrimaryUser`; that call revalidates both live profiles and atomically writes the current
+  snapshot plus the internal reverse pointer used by target-side status cleanup.
+- `listMySupportLinkHistory` retains ACTIVE, REVOKED, stale, and legacy entries for history or
+  debugging. Presence there does not imply access.
+
 **Categories** (self by default; a SupportPerson may manage a selected primary user's
 categories via the optional `userId` — see below)
 
-| Operation | Input | Returns |
-|---|---|---|
-| `createCategory` | `input: { userId, name!, color, sortOrder }` | `Category` · `name`/`color` trimmed; `categoryId` server-generated; `isDefault: false`; owned by the target user. The reserved name `No Category` is rejected |
-| `listMyCategories` | `userId, limit, nextToken` | `CategoryConnection!` — the target user's categories (incl. their `isDefault` default) |
-| `updateCategory` | `input: { userId, categoryId!, name, color, sortOrder }` | `Category!` — partial edit; see below |
-| `deleteCategory` | `input: { userId, categoryId! }` | `Category!` — the deleted (non-default) category; reparents its tasks first; see below |
+| Operation          | Input                                                    | Returns                                                                                                                                                       |
+| ------------------ | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `createCategory`   | `input: { userId, name!, color, sortOrder }`             | `Category` · `name`/`color` trimmed; `categoryId` server-generated; `isDefault: false`; owned by the target user. The reserved name `No Category` is rejected |
+| `listMyCategories` | `userId, limit, nextToken`                               | `CategoryConnection!` — the target user's categories (incl. their `isDefault` default)                                                                        |
+| `updateCategory`   | `input: { userId, categoryId!, name, color, sortOrder }` | `Category!` — partial edit; see below                                                                                                                         |
+| `deleteCategory`   | `input: { userId, categoryId! }`                         | `Category!` — the deleted (non-default) category; reparents its tasks first; see below                                                                        |
 
 > **Whose categories? (`userId`)** Every category operation resolves a target owner from an
 > optional `userId`: **omitted/null (or your own id) ⇒ your own categories** — unchanged from
 > before. A **non-self `userId`** targets that primary user's categories and requires
-> **SupportPerson delegated access**: an ACTIVE SupportLink to that `PRIMARY_USER` in the same
-> organization (the same rule as scheduling — `assertCanActForUser`). Anything else is
+> **SupportPerson delegated access**: a currently effective SupportLink to that `PRIMARY_USER`
+> (ACTIVE plus a current organization/membership snapshot — the same rule as scheduling and
+> `assertCanActForUser`). Anything else is
 > `NOT_AUTHORIZED` and performs **no** writes. Categories always remain owned by the **target
 > user's** partition — a delegated create/update/delete keys (and reparents) rows under the
 > primary user, never the SupportPerson.
@@ -582,25 +737,29 @@ categories via the optional `userId` — see below)
 >
 > ```graphql
 > mutation DeleteCategory($input: DeleteCategoryInput!) {
->   deleteCategory(input: $input) { categoryId name isDefault }
+>   deleteCategory(input: $input) {
+>     categoryId
+>     name
+>     isDefault
+>   }
 > }
 > ```
 
 **Tasks & steps**
 
-| Operation | Input | Returns |
-|---|---|---|
-| `getTask` | `taskId!` | `Task` · `null` if not found · `steps` is `null` here (use `listTaskSteps`) · readable by the **owner, a delegated SupportPerson, OR a user with an active assignment referencing the task** (read-only) |
-| `listTaskSteps` | `taskId!, limit, nextToken` | `TaskStepConnection!` — steps sorted by ascending `order`, order preserved across pages; readable by the **owner, a delegated SupportPerson, OR an assignee** (read-only); see below |
-| `listTasksByOwner` | `ownerId!, limit, nextToken` | `TaskConnection!` — tasks sorted by ascending per-owner `order` (un-ordered legacy rows last), order preserved across pages; `ownerId` is the caller **or a primary user the caller (a SupportPerson) has delegated access to** |
-| `listTasksByCategory` | `ownerId!, categoryId!, limit, nextToken` | `TaskConnection!` — tasks in one real category; **`categoryId` is required** and is validated (owned + exists + not deleting → `NOT_FOUND`/`VALIDATION`, never a silent empty result); same access as `listTasksByOwner` (self or delegated) |
-| `updateTask` | `input: { taskId!, title, categoryId, description, coverImageS3Key }` | `Task` — **partial edit**; owner **or delegated SupportPerson**; see below |
-| `createTaskStep` | `input: { taskId!, order!, text!, description, media }` | `TaskStep` — **appends** one step at the end, optionally with initial type-specific media (owner or delegated SupportPerson); see below |
-| `updateTaskStep` | `input: { taskId!, stepId!, text, description, media }` | `TaskStep` — **partial edit** of one step and its type-specific media slots (owner or delegated SupportPerson); see below |
-| `deleteTaskStep` | `input: { taskId!, stepId! }` | `TaskStep` — the deleted step; also deletes all its media assets (owner or delegated SupportPerson); see below |
-| `reorderTaskSteps` | `input: { taskId!, steps: [{ stepId!, order! }] }` | `[TaskStep!]!` — atomically renumbers all steps (owner or delegated SupportPerson); see below |
-| `updateTaskOrder` | `input: { userId, tasks: [{ taskId!, order! }] }` | `[Task!]!` — atomically reorders **all of a target owner's tasks** in one transaction; omitted/null `userId` ⇒ the caller, a non-self value requires delegated access; see below |
-| `deleteTask` | `taskId!` | `Task` — the deleted template (minus internal fields); cascades to all its steps + media (owner or delegated SupportPerson); see below |
+| Operation             | Input                                                                 | Returns                                                                                                                                                                                                                                      |
+| --------------------- | --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `getTask`             | `taskId!`                                                             | `Task` · `null` if not found · `steps` is `null` here (use `listTaskSteps`) · readable by the **owner, a delegated SupportPerson, OR a user with an active assignment referencing the task** (read-only)                                     |
+| `listTaskSteps`       | `taskId!, limit, nextToken`                                           | `TaskStepConnection!` — steps sorted by ascending `order`, order preserved across pages; readable by the **owner, a delegated SupportPerson, OR an assignee** (read-only); see below                                                         |
+| `listTasksByOwner`    | `ownerId!, limit, nextToken`                                          | `TaskConnection!` — tasks sorted by ascending per-owner `order` (un-ordered legacy rows last), order preserved across pages; `ownerId` is the caller **or a primary user the caller (a SupportPerson) has delegated access to**              |
+| `listTasksByCategory` | `ownerId!, categoryId!, limit, nextToken`                             | `TaskConnection!` — tasks in one real category; **`categoryId` is required** and is validated (owned + exists + not deleting → `NOT_FOUND`/`VALIDATION`, never a silent empty result); same access as `listTasksByOwner` (self or delegated) |
+| `updateTask`          | `input: { taskId!, title, categoryId, description, coverImageS3Key }` | `Task` — **partial edit**; owner **or delegated SupportPerson**; see below                                                                                                                                                                   |
+| `createTaskStep`      | `input: { taskId!, order!, text!, description, media }`               | `TaskStep` — **appends** one step at the end, optionally with initial type-specific media (owner or delegated SupportPerson); see below                                                                                                      |
+| `updateTaskStep`      | `input: { taskId!, stepId!, text, description, media }`               | `TaskStep` — **partial edit** of one step and its type-specific media slots (owner or delegated SupportPerson); see below                                                                                                                    |
+| `deleteTaskStep`      | `input: { taskId!, stepId! }`                                         | `TaskStep` — the deleted step; also deletes all its media assets (owner or delegated SupportPerson); see below                                                                                                                               |
+| `reorderTaskSteps`    | `input: { taskId!, steps: [{ stepId!, order! }] }`                    | `[TaskStep!]!` — atomically renumbers all steps (owner or delegated SupportPerson); see below                                                                                                                                                |
+| `updateTaskOrder`     | `input: { userId, tasks: [{ taskId!, order! }] }`                     | `[Task!]!` — atomically reorders **all of a target owner's tasks** in one transaction; omitted/null `userId` ⇒ the caller, a non-self value requires delegated access; see below                                                             |
+| `deleteTask`          | `taskId!`                                                             | `Task` — the deleted template (minus internal fields); cascades to all its steps + media (owner or delegated SupportPerson); see below                                                                                                       |
 
 > **`updateTask` is a partial edit.** Only the fields you include change; omitted
 > fields keep their current value. `ownerId` is immutable and **steps are not edited
@@ -616,9 +775,15 @@ categories via the optional `userId` — see below)
 >
 > ```graphql
 > mutation UpdateTask($input: UpdateTaskInput!) {
->   updateTask(input: $input) { taskId title categoryId updatedAt }
+>   updateTask(input: $input) {
+>     taskId
+>     title
+>     categoryId
+>     updatedAt
+>   }
 > }
 > ```
+>
 > ```json
 > { "input": { "taskId": "task-123", "title": "Wash hands well", "categoryId": "cat-hygiene" } }
 > ```
@@ -642,20 +807,30 @@ categories via the optional `userId` — see below)
 >
 > ```graphql
 > mutation Reorder($input: ReorderTaskStepsInput!) {
->   reorderTaskSteps(input: $input) { stepId order text }
+>   reorderTaskSteps(input: $input) {
+>     stepId
+>     order
+>     text
+>   }
 > }
 > ```
+>
 > ```json
-> { "input": { "taskId": "task-123", "steps": [
->   { "stepId": "step-c", "order": 1 },
->   { "stepId": "step-a", "order": 2 },
->   { "stepId": "step-b", "order": 3 }
-> ] } }
+> {
+>   "input": {
+>     "taskId": "task-123",
+>     "steps": [
+>       { "stepId": "step-c", "order": 1 },
+>       { "stepId": "step-a", "order": 2 },
+>       { "stepId": "step-b", "order": 3 }
+>     ]
+>   }
+> }
 > ```
 
 > **`updateTaskOrder` atomically reorders all of the caller's tasks.** This sets the
 > per-owner `Task.order` across the owner's whole task list (the task-level analogue of
-> `reorderTaskSteps`, which orders steps *within* one task). The owner is taken from the
+> `reorderTaskSteps`, which orders steps _within_ one task). The owner is taken from the
 > Cognito identity — there is **no `ownerId` in the input**. Supply the **complete current
 > set** of your tasks as `[{ taskId, order }]` (not a partial patch):
 >
@@ -673,15 +848,25 @@ categories via the optional `userId` — see below)
 >
 > ```graphql
 > mutation UpdateTaskOrder($input: UpdateTaskOrderInput!) {
->   updateTaskOrder(input: $input) { taskId title order updatedAt }
+>   updateTaskOrder(input: $input) {
+>     taskId
+>     title
+>     order
+>     updatedAt
+>   }
 > }
 > ```
+>
 > ```json
-> { "input": { "tasks": [
->   { "taskId": "task-c", "order": 1 },
->   { "taskId": "task-a", "order": 2 },
->   { "taskId": "task-b", "order": 3 }
-> ] } }
+> {
+>   "input": {
+>     "tasks": [
+>       { "taskId": "task-c", "order": 1 },
+>       { "taskId": "task-a", "order": 2 },
+>       { "taskId": "task-b", "order": 3 }
+>     ]
+>   }
+> }
 > ```
 
 > **`createTaskStep` appends one step at the end.** The task must exist and be yours, and a
@@ -729,18 +914,34 @@ categories via the optional `userId` — see below)
 > ```graphql
 > mutation UpdateTaskStep($input: UpdateTaskStepInput!) {
 >   updateTaskStep(input: $input) {
->     stepId taskId order text description
->     mediaAssets { assetId type mimeType stepId }
+>     stepId
+>     taskId
+>     order
+>     text
+>     description
+>     mediaAssets {
+>       assetId
+>       type
+>       mimeType
+>       stepId
+>     }
 >     updatedAt
 >   }
 > }
 > ```
+>
 > ```json
-> { "input": { "taskId": "task-123", "stepId": "step-9", "media": [
->   { "type": "IMAGE", "assetId": "image-asset-7" },
->   { "type": "AUDIO", "assetId": "audio-asset-3" },
->   { "type": "VIDEO", "assetId": "video-asset-5" }
-> ] } }
+> {
+>   "input": {
+>     "taskId": "task-123",
+>     "stepId": "step-9",
+>     "media": [
+>       { "type": "IMAGE", "assetId": "image-asset-7" },
+>       { "type": "AUDIO", "assetId": "audio-asset-3" },
+>       { "type": "VIDEO", "assetId": "video-asset-5" }
+>     ]
+>   }
+> }
 > ```
 
 > **`deleteTaskStep` removes one step and every attached media asset.** Identify the step by
@@ -764,7 +965,12 @@ categories via the optional `userId` — see below)
 >
 > ```graphql
 > mutation DeleteTaskStep($input: DeleteTaskStepInput!) {
->   deleteTaskStep(input: $input) { stepId taskId order text }
+>   deleteTaskStep(input: $input) {
+>     stepId
+>     taskId
+>     order
+>     text
+>   }
 > }
 > ```
 
@@ -796,7 +1002,11 @@ categories via the optional `userId` — see below)
 >
 > ```graphql
 > mutation DeleteTask($taskId: ID!) {
->   deleteTask(taskId: $taskId) { taskId title categoryId }
+>   deleteTask(taskId: $taskId) {
+>     taskId
+>     title
+>     categoryId
+>   }
 > }
 > ```
 
@@ -810,8 +1020,9 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 
 > **Authorization (delegated).** Every operation below takes a `userId` and is allowed only
 > when the caller may **act for that user**: either it's the caller themselves, or the caller
-> is a `SUPPORT_PERSON` with an **ACTIVE** `SupportLink` to that user **and** they currently
-> share an `organizationId` (see the authorization model at the top). Additionally,
+> is a `SUPPORT_PERSON` with a **currently effective** SupportLink to that user (ACTIVE,
+> same current organization, and a selection snapshot matching both live membership sessions;
+> see the authorization model at the top). Additionally,
 > `createTaskAssignment` requires the caller to **own the referenced `Task` template** — a
 > SupportPerson schedules **their own** template for a selected primary user, and the
 > assignment **references the template by id** (it is never copied into the primary user's
@@ -821,23 +1032,23 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 > content, though their completion can still be changed until the instance is terminal.
 > `deleteTask` stays blocked while any active assignment references the template.
 
-| Operation | Input | Returns |
-|---|---|---|
-| `createTaskAssignment` | `input: { taskId!, userId!, assignedBy, scheduleType!, scheduledFor, scheduleRule, startDate, endDate, startTime, timezone! }` | `TaskAssignment!` · validates the `Task` exists and the schedule, then writes **one** row — **no** `TaskInstance`s. `ONE_TIME` requires `scheduledFor` + `timezone`; `RECURRING` requires `scheduleRule` (an RRULE) + `startDate` + `startTime` + `timezone` (`endDate` optional). The RRULE must carry a `FREQ` of `DAILY`/`WEEKLY`/`MONTHLY`/`YEARLY` — incomplete rules and `HOURLY`/`MINUTELY`/`SECONDLY` are rejected. An active assignment carries the sparse `activeTaskAssignmentTaskId` marker. |
-| `startTaskInstance` | `input: { userId!, assignmentId!, scheduledDate!, scheduledTime! }` | `TaskInstance!` · verifies the occurrence is valid for the assignment; if no instance exists, creates it (`IN_PROGRESS`, `startedAt` set) and snapshots the current `TaskStep`s into `TaskInstanceStep` rows **atomically**. **Idempotent** — an existing instance is returned untouched (steps are never re-snapshotted). |
-| `setTaskInstanceStepCompletion` | `input: { userId!, instanceId!, stepId!, completed! }` | `TaskInstanceStep!` · toggles one step. Sets/clears `completedAt`. Completing the step whose timer is **currently active** first closes it — accumulating its active seconds onto the step and the instance and clearing the active pointer. `completed: false` only clears `completedAt` (prior `activeDurationSeconds` is preserved, never subtracted). Rejected on a **terminal** (`COMPLETED`/`SKIPPED`/`CANCELLED`) instance; 404s if the instance or step doesn't exist. |
-| `startTaskInstanceStep` | `input: { userId!, instanceId!, stepId! }` | `TaskInstanceTimingResult!` · starts (or switches to) a step's timer using **server time only**. **Idempotent** when the step is already active. Switching from a different active step first closes it (`serverNow − activeStepStartedAt` added to that step and the instance). Sets the instance's `activeStepId`/`activeStepStartedAt` and the step's `firstStartedAt` (once) + `lastStartedAt`. Rejected on a **terminal** instance; 404s if the instance or step snapshot doesn't exist. |
-| `pauseTaskInstanceTimer` | `input: { userId!, instanceId! }` | `TaskInstanceTimingResult!` · pauses the active-step timer (app backgrounded, task page left, screen locked, or manual pause): closes the active step (accumulating its active seconds onto the step and instance) and clears `activeStepId`/`activeStepStartedAt`. **Idempotent** when nothing is active. Rejected on a **terminal** instance. |
-| `updateTaskInstanceStatus` | `input: { userId!, instanceId!, status! }` | `TaskInstance!` · `status` accepts `IN_PROGRESS`/`COMPLETED`/`SKIPPED` (`OVERDUE` is rejected — derived; `CANCELLED` uses `cancelTaskInstance`). `COMPLETED` is rejected while any step is incomplete (a zero-step instance may be completed); on completion it **closes any still-running step**, sets `completedAt`, records `elapsedSeconds` (wall-clock `startedAt → now`), and keeps the accumulated `activeDurationSeconds`. `SKIPPED` likewise **closes any running step** (accumulating its active seconds) and clears the active pointer, so a terminal instance never leaves a step timer looking active. To undo skip, set a `SKIPPED` instance back to `IN_PROGRESS`; `skippedAt` is cleared. `COMPLETED`/`CANCELLED` remain frozen. |
-| `cancelTaskInstance` | `input: { userId!, assignmentId!, scheduledDate!, scheduledTime! }` | `TaskInstance!` · creates or updates a real `TaskInstance` with status `CANCELLED` and `isException: true`, so the occurrence stops surfacing as an open virtual slot. Closes any running step first (accumulating its active seconds) and clears the active pointer. Rejected on a **terminal** (`COMPLETED`/`SKIPPED`/`CANCELLED`) instance — a finished occurrence can't be cancelled. |
-| `endTaskAssignment` | `input: { userId!, assignmentId!, effectiveDate! }` | `TaskAssignment!` · for a `RECURRING` assignment with days remaining, caps `endDate` to the day before `effectiveDate` — taking the **earlier** of that and any existing `endDate`, so it only ever shortens the window (stays active); otherwise fully ends it (`active: false`, `endedAt` set, marker removed). |
-| `deleteTaskAssignment` | `input: { userId!, assignmentId! }` | `TaskAssignment!` · **soft delete** — `active: false`, `endedAt` set, `activeTaskAssignmentTaskId` removed (unblocking `deleteTask`). 404s if missing. |
-| `listTaskAssignmentsForUser` | `userId!, limit, nextToken` | `TaskAssignmentConnection!` · a user's schedule rules (active + ended). |
-| `getTaskInstanceViews` | `userId!, startDate!, endDate!` | `TaskInstanceViewConnection!` · the calendar feed (both dates `YYYY-MM-DD`, **max 370-day** span). See below. |
-| `getTaskInstance` | `instanceId!` | `TaskInstance` · **self-scoped** — reads one of your **own** materialized instances; the owner is the Cognito identity (**no `userId` argument**). `null` when it doesn't exist for you. `status` is derived (`OVERDUE` surfaced). See below. |
-| `listTaskInstances` | `startDate!, endDate!, limit, nextToken` | `TaskInstanceConnection!` · **self-scoped** — your **own** real/materialized instances in `[startDate, endDate]` (`YYYY-MM-DD`, same **max 370-day** span). **Only real rows** — never virtual occurrences. Truly paginated. See below. |
-| `batchGetTaskInstances` | `instanceIds!` | `[TaskInstanceLookupResult!]!` · **self-scoped** — batch-reads up to **100** of your **own** instances by id; returns one entry per id **in request order**, with `item: null` for ids that don't exist for you. `status` derived. See below. |
-| `listTaskInstanceSteps` | `userId!, instanceId!, limit, nextToken` | `TaskInstanceStepConnection!` · one instance's step snapshots, sorted by `order`. |
+| Operation                       | Input                                                                                                                          | Returns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `createTaskAssignment`          | `input: { taskId!, userId!, assignedBy, scheduleType!, scheduledFor, scheduleRule, startDate, endDate, startTime, timezone! }` | `TaskAssignment!` · validates the `Task` exists and the schedule, then writes **one** row — **no** `TaskInstance`s. `ONE_TIME` requires `scheduledFor` + `timezone`; `RECURRING` requires `scheduleRule` (an RRULE) + `startDate` + `startTime` + `timezone` (`endDate` optional). The RRULE must carry a `FREQ` of `DAILY`/`WEEKLY`/`MONTHLY`/`YEARLY` — incomplete rules and `HOURLY`/`MINUTELY`/`SECONDLY` are rejected. An active assignment carries the sparse `activeTaskAssignmentTaskId` marker.                                                                                                                                                                                                                                         |
+| `startTaskInstance`             | `input: { userId!, assignmentId!, scheduledDate!, scheduledTime! }`                                                            | `TaskInstance!` · verifies the occurrence is valid for the assignment; if no instance exists, creates it (`IN_PROGRESS`, `startedAt` set) and snapshots the current `TaskStep`s into `TaskInstanceStep` rows **atomically**. **Idempotent** — an existing instance is returned untouched (steps are never re-snapshotted).                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `setTaskInstanceStepCompletion` | `input: { userId!, instanceId!, stepId!, completed! }`                                                                         | `TaskInstanceStep!` · toggles one step. Sets/clears `completedAt`. Completing the step whose timer is **currently active** first closes it — accumulating its active seconds onto the step and the instance and clearing the active pointer. `completed: false` only clears `completedAt` (prior `activeDurationSeconds` is preserved, never subtracted). Rejected on a **terminal** (`COMPLETED`/`SKIPPED`/`CANCELLED`) instance; 404s if the instance or step doesn't exist.                                                                                                                                                                                                                                                                   |
+| `startTaskInstanceStep`         | `input: { userId!, instanceId!, stepId! }`                                                                                     | `TaskInstanceTimingResult!` · starts (or switches to) a step's timer using **server time only**. **Idempotent** when the step is already active. Switching from a different active step first closes it (`serverNow − activeStepStartedAt` added to that step and the instance). Sets the instance's `activeStepId`/`activeStepStartedAt` and the step's `firstStartedAt` (once) + `lastStartedAt`. Rejected on a **terminal** instance; 404s if the instance or step snapshot doesn't exist.                                                                                                                                                                                                                                                    |
+| `pauseTaskInstanceTimer`        | `input: { userId!, instanceId! }`                                                                                              | `TaskInstanceTimingResult!` · pauses the active-step timer (app backgrounded, task page left, screen locked, or manual pause): closes the active step (accumulating its active seconds onto the step and instance) and clears `activeStepId`/`activeStepStartedAt`. **Idempotent** when nothing is active. Rejected on a **terminal** instance.                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `updateTaskInstanceStatus`      | `input: { userId!, instanceId!, status! }`                                                                                     | `TaskInstance!` · `status` accepts `IN_PROGRESS`/`COMPLETED`/`SKIPPED` (`OVERDUE` is rejected — derived; `CANCELLED` uses `cancelTaskInstance`). `COMPLETED` is rejected while any step is incomplete (a zero-step instance may be completed); on completion it **closes any still-running step**, sets `completedAt`, records `elapsedSeconds` (wall-clock `startedAt → now`), and keeps the accumulated `activeDurationSeconds`. `SKIPPED` likewise **closes any running step** (accumulating its active seconds) and clears the active pointer, so a terminal instance never leaves a step timer looking active. To undo skip, set a `SKIPPED` instance back to `IN_PROGRESS`; `skippedAt` is cleared. `COMPLETED`/`CANCELLED` remain frozen. |
+| `cancelTaskInstance`            | `input: { userId!, assignmentId!, scheduledDate!, scheduledTime! }`                                                            | `TaskInstance!` · creates or updates a real `TaskInstance` with status `CANCELLED` and `isException: true`, so the occurrence stops surfacing as an open virtual slot. Closes any running step first (accumulating its active seconds) and clears the active pointer. Rejected on a **terminal** (`COMPLETED`/`SKIPPED`/`CANCELLED`) instance — a finished occurrence can't be cancelled.                                                                                                                                                                                                                                                                                                                                                        |
+| `endTaskAssignment`             | `input: { userId!, assignmentId!, effectiveDate! }`                                                                            | `TaskAssignment!` · for a `RECURRING` assignment with days remaining, caps `endDate` to the day before `effectiveDate` — taking the **earlier** of that and any existing `endDate`, so it only ever shortens the window (stays active); otherwise fully ends it (`active: false`, `endedAt` set, marker removed).                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `deleteTaskAssignment`          | `input: { userId!, assignmentId! }`                                                                                            | `TaskAssignment!` · **soft delete** — `active: false`, `endedAt` set, `activeTaskAssignmentTaskId` removed (unblocking `deleteTask`). 404s if missing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `listTaskAssignmentsForUser`    | `userId!, limit, nextToken`                                                                                                    | `TaskAssignmentConnection!` · a user's schedule rules (active + ended).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `getTaskInstanceViews`          | `userId!, startDate!, endDate!`                                                                                                | `TaskInstanceViewConnection!` · the calendar feed (both dates `YYYY-MM-DD`, **max 370-day** span). See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `getTaskInstance`               | `instanceId!`                                                                                                                  | `TaskInstance` · **self-scoped** — reads one of your **own** materialized instances; the owner is the Cognito identity (**no `userId` argument**). `null` when it doesn't exist for you. `status` is derived (`OVERDUE` surfaced). See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `listTaskInstances`             | `startDate!, endDate!, limit, nextToken`                                                                                       | `TaskInstanceConnection!` · **self-scoped** — your **own** real/materialized instances in `[startDate, endDate]` (`YYYY-MM-DD`, same **max 370-day** span). **Only real rows** — never virtual occurrences. Truly paginated. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `batchGetTaskInstances`         | `instanceIds!`                                                                                                                 | `[TaskInstanceLookupResult!]!` · **self-scoped** — batch-reads up to **100** of your **own** instances by id; returns one entry per id **in request order**, with `item: null` for ids that don't exist for you. `status` derived. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `listTaskInstanceSteps`         | `userId!, instanceId!, limit, nextToken`                                                                                       | `TaskInstanceStepConnection!` · one instance's step snapshots, sorted by `order`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 > **`getTaskInstanceViews` is the calendar feed.** For `[startDate, endDate]` it (1) queries
 > the user's `TaskAssignment`s, (2) expands **active** assignments' virtual occurrences within
@@ -852,7 +1063,17 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 > ```graphql
 > query Calendar($userId: ID!, $startDate: String!, $endDate: String!) {
 >   getTaskInstanceViews(userId: $userId, startDate: $startDate, endDate: $endDate) {
->     items { instanceId assignmentId taskId title scheduledDate scheduledTime status isVirtual isException }
+>     items {
+>       instanceId
+>       assignmentId
+>       taskId
+>       title
+>       scheduledDate
+>       scheduledTime
+>       status
+>       isVirtual
+>       isException
+>     }
 >   }
 > }
 > ```
@@ -877,12 +1098,23 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 > ```graphql
 > query MyInstances($startDate: String!, $endDate: String!, $ids: [ID!]!) {
 >   listTaskInstances(startDate: $startDate, endDate: $endDate) {
->     items { instanceId assignmentId taskId scheduledDate scheduledTime status }
+>     items {
+>       instanceId
+>       assignmentId
+>       taskId
+>       scheduledDate
+>       scheduledTime
+>       status
+>     }
 >     nextToken
 >   }
 >   batchGetTaskInstances(instanceIds: $ids) {
 >     instanceId
->     item { instanceId status scheduledFor }
+>     item {
+>       instanceId
+>       status
+>       scheduledFor
+>     }
 >   }
 > }
 > ```
@@ -905,7 +1137,7 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 >   recently started.
 >
 > `startTaskInstanceStep` and `pauseTaskInstanceTimer` return `TaskInstanceTimingResult { instance,
-> activeStep, previousStep }`: the updated instance, the step now running (`null` after a pause), and
+activeStep, previousStep }`: the updated instance, the step now running (`null` after a pause), and
 > the step that was just closed with its duration accumulated (`null` when none was). Both are
 > **idempotent** (starting the already-active step, or pausing when nothing is active, is a no-op) and
 > **rejected on a terminal instance** (`COMPLETED`/`SKIPPED`/`CANCELLED`). Call `pauseTaskInstanceTimer`
@@ -936,9 +1168,22 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 > ```graphql
 > mutation StartStep($userId: ID!, $instanceId: ID!, $stepId: ID!) {
 >   startTaskInstanceStep(input: { userId: $userId, instanceId: $instanceId, stepId: $stepId }) {
->     instance { instanceId activeStepId activeStepStartedAt activeDurationSeconds }
->     activeStep { stepId firstStartedAt lastStartedAt activeDurationSeconds }
->     previousStep { stepId activeDurationSeconds }
+>     instance {
+>       instanceId
+>       activeStepId
+>       activeStepStartedAt
+>       activeDurationSeconds
+>     }
+>     activeStep {
+>       stepId
+>       firstStartedAt
+>       lastStartedAt
+>       activeDurationSeconds
+>     }
+>     previousStep {
+>       stepId
+>       activeDurationSeconds
+>     }
 >   }
 > }
 > ```
@@ -949,14 +1194,14 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 
 **Media**
 
-| Operation | Input | Returns |
-|---|---|---|
-| `createMediaUploadUrl` | `input: { taskId!, contentType!, fileName }` | `MediaUploadTarget` — see flow below |
-| `createTaskCoverImageUploadUrl` | `input: { contentType!, fileName }` | `MediaUploadTarget!` — temporary cover-image upload; see [cover images](#task-cover-images) |
-| `createMediaAsset` | `input: { taskId!, s3Key!, type!, mimeType!, ownerId (ignored), size }` | `MediaAsset` — initially unattached; asset owner is the task's owner; see flow below |
-| `deleteMediaAsset` | `input: { taskId!, assetId! }` | `MediaAsset` — deletes the binary + row + dangling refs; see below |
-| `getMediaDownloadUrl` | `taskId!, assetId!` | `MediaDownloadTarget` — see flow below; readable by the **owner, delegated SupportPerson, OR an assignee** (read-only) |
-| `listMediaForTask` | `taskId!, limit, nextToken` | `MediaAssetConnection!` — readable by the **owner, delegated SupportPerson, OR an assignee** |
+| Operation                       | Input                                                                   | Returns                                                                                                                |
+| ------------------------------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `createMediaUploadUrl`          | `input: { taskId!, contentType!, fileName }`                            | `MediaUploadTarget` — see flow below                                                                                   |
+| `createTaskCoverImageUploadUrl` | `input: { contentType!, fileName }`                                     | `MediaUploadTarget!` — temporary cover-image upload; see [cover images](#task-cover-images)                            |
+| `createMediaAsset`              | `input: { taskId!, s3Key!, type!, mimeType!, ownerId (ignored), size }` | `MediaAsset` — initially unattached; asset owner is the task's owner; see flow below                                   |
+| `deleteMediaAsset`              | `input: { taskId!, assetId! }`                                          | `MediaAsset` — deletes the binary + row + dangling refs; see below                                                     |
+| `getMediaDownloadUrl`           | `taskId!, assetId!`                                                     | `MediaDownloadTarget` — see flow below; readable by the **owner, delegated SupportPerson, OR an assignee** (read-only) |
+| `listMediaForTask`              | `taskId!, limit, nextToken`                                             | `MediaAssetConnection!` — readable by the **owner, delegated SupportPerson, OR an assignee**                           |
 
 > **Media authorization.** **Writes** — `createMediaUploadUrl`, `createMediaAsset`, and
 > `deleteMediaAsset` — authorize against the task's owner: the **owner OR a SupportPerson with
@@ -1024,14 +1269,14 @@ used, with a temporary key so it also works at **create** time (before a `taskId
 **Sequence (create or update):**
 
 1. **`createTaskCoverImageUploadUrl({ contentType, fileName? })`** → `{ uploadUrl, s3Key,
-   expiresIn }`. `contentType` must be `image/jpeg`, `image/png`, or `image/webp` (others
+expiresIn }`. `contentType` must be `image/jpeg`, `image/png`, or `image/webp` (others
    are rejected). `s3Key` is a server-owned **pending** key
    (`media/pending/task-cover/<uuid>.<ext>`).
 2. **`PUT` the image bytes to `uploadUrl`** with that same `Content-Type` (direct to S3).
 3. Pass the pending `s3Key` as **`coverImageS3Key`** to **`createTask`** or
    **`updateTask`**. The server then, server-side:
    - rejects any key not under the pending prefix (no arbitrary keys);
-   - **`HeadObject`** verifies the *real* object — it must exist, be an allowed image
+   - **`HeadObject`** verifies the _real_ object — it must exist, be an allowed image
      type, and be `0 < size ≤ 10 MB` (client-declared MIME/size are never trusted);
    - copies it to a task-owned key (`media/<taskId>/<assetId>.<ext>`), deletes the temp
      object, registers the `MediaAsset`, and sets `Task.coverImageAssetId`.
@@ -1040,7 +1285,11 @@ used, with a temporary key so it also works at **create** time (before a `taskId
 
 ```graphql
 mutation CoverUrl($input: CreateTaskCoverImageUploadUrlInput!) {
-  createTaskCoverImageUploadUrl(input: $input) { uploadUrl s3Key expiresIn }
+  createTaskCoverImageUploadUrl(input: $input) {
+    uploadUrl
+    s3Key
+    expiresIn
+  }
 }
 # then: PUT bytes to uploadUrl, then createTask/updateTask with coverImageS3Key: <s3Key>
 ```
@@ -1066,12 +1315,12 @@ mutation CoverUrl($input: CreateTaskCoverImageUploadUrlInput!) {
 `SystemAdmin` Cognito group** — both at the AppSync edge (`@aws_cognito_user_pools`)
 and re-checked in the resolver. A non-SystemAdmin caller gets an authorization error.
 
-| Operation | Returns |
-|---|---|
-| `listAllUsers(limit, nextToken)` | `UserProfileConnection` |
-| `listAllTasks(limit, nextToken)` | `TaskConnection` |
-| `listAllOrganizations(limit, nextToken)` | `OrganizationConnection` — every `Organization`, newest-first |
-| `adminGetUserData(userId!)` | `AdminUserData!` — full read-only snapshot of one user; see below |
+| Operation                                | Returns                                                           |
+| ---------------------------------------- | ----------------------------------------------------------------- |
+| `listAllUsers(limit, nextToken)`         | `UserProfileConnection`                                           |
+| `listAllTasks(limit, nextToken)`         | `TaskConnection`                                                  |
+| `listAllOrganizations(limit, nextToken)` | `OrganizationConnection` — every `Organization`, newest-first     |
+| `adminGetUserData(userId!)`              | `AdminUserData!` — full read-only snapshot of one user; see below |
 
 `listAllUsers`/`listAllTasks`/`listAllOrganizations` take an optional `limit` (page size) and `nextToken`, and
 return `{ items, nextToken }`. `nextToken` is an **opaque, base64-encoded** cursor — pass
@@ -1080,7 +1329,13 @@ the value you got back to fetch the next page; it's `null` on the last page.
 ```graphql
 query ListUsers($limit: Int, $nextToken: String) {
   listAllUsers(limit: $limit, nextToken: $nextToken) {
-    items { userId role displayName organizationId createdAt }
+    items {
+      userId
+      role
+      displayName
+      organizationId
+      createdAt
+    }
     nextToken
   }
 }
@@ -1105,14 +1360,14 @@ do {
 > through each list to completion. All reads are **PK queries + GSIs (no Scan)**, fired in
 > parallel:
 >
-> | Field | Type | Source |
-> |---|---|---|
-> | `userId` | `ID!` | echoes the (trimmed) input id |
-> | `profile` | `UserProfile` | the user's `#PROFILE` row · `null` if none exists |
-> | `tasks` | `[Task!]!` | the user's owned task templates via `taskOwnerIndex` — Task `#META` items only, **no nested `steps`** (same projection as `listAllTasks`) |
-> | `categories` | `[Category!]!` | every `CATEGORY#…` row in the user's partition (incl. their default) |
-> | `taskAssignments` | `[TaskAssignment!]!` | every `TASK_ASSIGNMENT#…` row in the user's partition (active + ended schedule rules) |
-> | `supportLinks` | `[SupportLink!]!` | links in **both** directions — where the user is the supporter and where they are the primary user — deduped by the `(supporterId, primaryUserId)` pair |
+> | Field             | Type                 | Source                                                                                                                                                  |
+> | ----------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+> | `userId`          | `ID!`                | echoes the (trimmed) input id                                                                                                                           |
+> | `profile`         | `UserProfile`        | the user's `#PROFILE` row · `null` if none exists                                                                                                       |
+> | `tasks`           | `[Task!]!`           | the user's owned task templates via `taskOwnerIndex` — Task `#META` items only, **no nested `steps`** (same projection as `listAllTasks`)               |
+> | `categories`      | `[Category!]!`       | every `CATEGORY#…` row in the user's partition (incl. their default)                                                                                    |
+> | `taskAssignments` | `[TaskAssignment!]!` | every `TASK_ASSIGNMENT#…` row in the user's partition (active + ended schedule rules)                                                                   |
+> | `supportLinks`    | `[SupportLink!]!`    | links in **both** directions — where the user is the supporter and where they are the primary user — deduped by the `(supporterId, primaryUserId)` pair |
 >
 > `userId` is the app-level id (= Cognito `sub`); a blank id is a `VALIDATION` error. Lists
 > come back **empty (`[]`), not `null`**, when the user owns nothing in that bucket. Like
@@ -1123,11 +1378,36 @@ do {
 > query AdminGetUserData($userId: ID!) {
 >   adminGetUserData(userId: $userId) {
 >     userId
->     profile { userId displayName email role }
->     tasks { taskId title categoryId order createdAt }
->     categories { categoryId name isDefault }
->     taskAssignments { assignmentId taskId scheduleType scheduledFor active }
->     supportLinks { supporterId primaryUserId status }
+>     profile {
+>       userId
+>       displayName
+>       email
+>       role
+>     }
+>     tasks {
+>       taskId
+>       title
+>       categoryId
+>       order
+>       createdAt
+>     }
+>     categories {
+>       categoryId
+>       name
+>       isDefault
+>     }
+>     taskAssignments {
+>       assignmentId
+>       taskId
+>       scheduleType
+>       scheduledFor
+>       active
+>     }
+>     supportLinks {
+>       supporterId
+>       primaryUserId
+>       status
+>     }
 >   }
 > }
 > ```
@@ -1154,14 +1434,14 @@ need the `Username`, which is not the `sub` for an email-alias pool).
 > so a user must **refresh their tokens or re-login** after an invite / `setUserBaseRole` /
 > `setSystemAdmin` before the change takes effect.
 
-| Operation | Returns | Effect |
-|---|---|---|
-| `inviteSupportPerson(input: InviteUserInput!)` | `AdminUserResult!` | `AdminCreateUser` (or adopt an existing user on `UsernameExistsException`) + add **only** `SupportPerson`. Never adds `PrimaryUser`. No `UserProfile` is created. |
-| `inviteOrganizationAdmin(input: InviteUserInput!)` | `AdminUserResult!` | Same, adding **only** `OrganizationAdmin`. |
-| `setUserBaseRole(input: SetUserBaseRoleInput!)` | `AdminUserResult!` | Remove all base groups, add the one target (`PRIMARY_USER`/`SUPPORT_PERSON`/`ORG_ADMIN`). Mirror onto an existing `UserProfile.role` (never creates one). `SystemAdmin` untouched. |
-| `setSystemAdmin(input: SetSystemAdminInput!)` | `AdminUserResult!` | `enabled:true` grants / `false` revokes the `SystemAdmin` group (base roles untouched). **Self-demotion rejected.** |
-| `adminDeleteTask(taskId: ID!)` | `Task` | Delete **any** task regardless of owner — same cascade as the owner `deleteTask` (steps, media rows + S3 binaries, category `taskCount`). Returns the deleted task, or `null` if already gone. |
-| `adminDeleteUser(input: AdminDeleteUserInput!)` | `AdminDeleteUserResult!` | Full user deletion (see below). **Self-deletion rejected.** |
+| Operation                                          | Returns                  | Effect                                                                                                                                                                                         |
+| -------------------------------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `inviteSupportPerson(input: InviteUserInput!)`     | `AdminUserResult!`       | `AdminCreateUser` (or adopt an existing user on `UsernameExistsException`) + add **only** `SupportPerson`. Never adds `PrimaryUser`. No `UserProfile` is created.                              |
+| `inviteOrganizationAdmin(input: InviteUserInput!)` | `AdminUserResult!`       | Same, adding **only** `OrganizationAdmin`.                                                                                                                                                     |
+| `setUserBaseRole(input: SetUserBaseRoleInput!)`    | `AdminUserResult!`       | Remove all base groups, add the one target (`PRIMARY_USER`/`SUPPORT_PERSON`/`ORG_ADMIN`). Mirror onto an existing `UserProfile.role` (never creates one). `SystemAdmin` untouched.             |
+| `setSystemAdmin(input: SetSystemAdminInput!)`      | `AdminUserResult!`       | `enabled:true` grants / `false` revokes the `SystemAdmin` group (base roles untouched). **Self-demotion rejected.**                                                                            |
+| `adminDeleteTask(taskId: ID!)`                     | `Task`                   | Delete **any** task regardless of owner — same cascade as the owner `deleteTask` (steps, media rows + S3 binaries, category `taskCount`). Returns the deleted task, or `null` if already gone. |
+| `adminDeleteUser(input: AdminDeleteUserInput!)`    | `AdminDeleteUserResult!` | Full user deletion (see below). **Self-deletion rejected.**                                                                                                                                    |
 
 **Inputs**
 
@@ -1197,16 +1477,31 @@ deletedCognitoUser }`.
 
 ```graphql
 mutation InviteSupport($input: InviteUserInput!) {
-  inviteSupportPerson(input: $input) { userId email groups profile { displayName role } }
+  inviteSupportPerson(input: $input) {
+    userId
+    email
+    groups
+    profile {
+      displayName
+      role
+    }
+  }
 }
 
 mutation PromoteToAdmin($input: SetSystemAdminInput!) {
-  setSystemAdmin(input: $input) { userId groups }   # userId = the target user's Cognito sub
+  setSystemAdmin(input: $input) {
+    userId
+    groups
+  } # userId = the target user's Cognito sub
 }
 
 mutation DeleteUser($input: AdminDeleteUserInput!) {
   adminDeleteUser(input: $input) {
-    userId deletedTasks deletedUserItems deletedSupportLinks deletedCognitoUser
+    userId
+    deletedTasks
+    deletedUserItems
+    deletedSupportLinks
+    deletedCognitoUser
   }
 }
 ```
@@ -1221,14 +1516,14 @@ SystemAdmin; a user joins one by setting their own `organizationId` to an existi
 (validated server-side — see `createUserProfile`/`updateMyUserProfile`). Like every admin API,
 these are gated to the `SystemAdmin` group at the AppSync edge **and** re-checked in the Lambda.
 
-| Operation | Returns | Effect |
-|---|---|---|
-| `listAllOrganizations(limit, nextToken)` | `OrganizationConnection!` | Every org, newest-first (`entityTypeIndex`; no Scan), paginated. |
-| `adminListOrganizationUsers(organizationId, limit, nextToken)` | `UserProfileConnection!` | The members of **one** org. Pages the `OrganizationMember` rows (`ORG#<id>` / `begins_with(SK, MEMBER#)`, `ConsistentRead` — no Scan) and loads each member's `UserProfile`; a row whose profile is missing is skipped. `nextToken` pages the membership rows. |
-| `adminCreateOrganization(input: CreateOrganizationInput!)` | `Organization!` | Create an org. `name` is required (trimmed, non-empty); `organizationId` is server-generated. |
-| `adminUpdateOrganization(input: UpdateOrganizationInput!)` | `Organization!` | Rename an org. `NOT_FOUND` if it doesn't exist; `VALIDATION` while it is being deleted. |
-| `adminDeleteOrganization(input: DeleteOrganizationInput!)` | `AdminDeleteOrganizationResult!` | Delete an org and **detach every member** (clears each member's `organizationId`). See below. |
-| `adminSetUserOrganization(input: AdminSetUserOrganizationInput!)` | `UserProfile!` | Set or clear **another** user's org membership (admin counterpart of the self-only `updateMyUserProfile`). See below. |
+| Operation                                                         | Returns                          | Effect                                                                                                                                                                                                                                                         |
+| ----------------------------------------------------------------- | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `listAllOrganizations(limit, nextToken)`                          | `OrganizationConnection!`        | Every org, newest-first (`entityTypeIndex`; no Scan), paginated.                                                                                                                                                                                               |
+| `adminListOrganizationUsers(organizationId, limit, nextToken)`    | `UserProfileConnection!`         | The members of **one** org. Pages the `OrganizationMember` rows (`ORG#<id>` / `begins_with(SK, MEMBER#)`, `ConsistentRead` — no Scan) and loads each member's `UserProfile`; a row whose profile is missing is skipped. `nextToken` pages the membership rows. |
+| `adminCreateOrganization(input: CreateOrganizationInput!)`        | `Organization!`                  | Create an org. `name` is required (trimmed, non-empty); `organizationId` is server-generated.                                                                                                                                                                  |
+| `adminUpdateOrganization(input: UpdateOrganizationInput!)`        | `Organization!`                  | Rename an org. `NOT_FOUND` if it doesn't exist; `VALIDATION` while it is being deleted.                                                                                                                                                                        |
+| `adminDeleteOrganization(input: DeleteOrganizationInput!)`        | `AdminDeleteOrganizationResult!` | Delete an org and **detach every member** (clears each member's `organizationId` and membership session, then revokes affected SupportLinks). See below.                                                                                                       |
+| `adminSetUserOrganization(input: AdminSetUserOrganizationInput!)` | `UserProfile!`                   | Set or clear **another** user's org membership (admin counterpart of the self-only `updateMyUserProfile`). See below.                                                                                                                                          |
 
 **Inputs:** `CreateOrganizationInput { name: String! }`, `UpdateOrganizationInput { organizationId: ID!, name: String! }`,
 `DeleteOrganizationInput { organizationId: ID! }`, `AdminSetUserOrganizationInput { userId: ID!, organizationId: ID }`.
@@ -1238,6 +1533,7 @@ marker is never exposed).
 **`adminSetUserOrganization`** reads the target `UserProfile` first (`NOT_FOUND` if the user has no
 profile) to learn its previous org, then keeps `UserProfile.organizationId` and the
 `OrganizationMember` rows in step **in one transaction**:
+
 - **joining** (`organizationId` non-null): the org is verified to exist and not be deleting
   (`NOT_FOUND` / `VALIDATION`, plus a same-transaction `ConditionCheck` closing the race), the
   profile's `organizationId` is set, the new `ORG#<newOrg>/MEMBER#<userId>` row is written, and the
@@ -1245,11 +1541,18 @@ profile) to learn its previous org, then keeps `UserProfile.organizationId` and 
 - **clearing** (`organizationId: null`): `organizationId` is removed and the old membership row
   deleted.
 
-Every profile write is **conditioned on the org seen at the pre-read** (`organizationId = :prevOrg`,
-or `attribute_not_exists(organizationId)` when it had none). If a concurrent request moves or clears
-the user in between, the write is aborted (a retryable `VALIDATION` "changed concurrently" error)
-rather than deleting a now-stale membership row and orphaning the one the user was concurrently moved
-to. Returns the updated `UserProfile`.
+The same write preserves the existing internal `organizationMembershipId` when the org is
+unchanged, creates a fresh id on a real join/move, and clears it on leave. After any real
+join/move/leave, the backend soft-revokes affected older ACTIVE SupportLinks touching the user
+in either direction. Re-setting
+the current org revokes nothing; later rejoining an org never restores old links.
+
+Every profile write is **conditioned on the exact membership seen at the pre-read**: both the
+`organizationId` and `organizationMembershipId`, or explicit absence when the user had none. If a
+concurrent request leaves, moves, or rejoins in between — including returning to the same org under a
+new session — the write is aborted (a retryable `VALIDATION` "changed concurrently" error) rather
+than deleting a now-stale membership row, orphaning a newer row, or mixing sessions. Returns the
+updated `UserProfile`.
 
 `organizationId` is **required**: pass an id to set it, or explicit `null` to clear it. A **blank**
 (non-null) string is rejected, and **omitting** the field entirely is rejected too — so a client that
@@ -1260,34 +1563,45 @@ clears).
 if missing); (2) mark it `deleting` so no new member can join mid-removal; (3) find every member
 via the **strongly-consistent `OrganizationMember` rows** under the org partition (`ORG#<id>` /
 `begins_with(SK, MEMBER#)`, `ConsistentRead: true`, paginated to completion) and detach each in its
-own transaction that **conditionally `REMOVE`s `organizationId` from the member `UserProfile`
-(only while it still equals this org) and deletes the membership row together**; (4) delete the org
-`#META` row **last**. Returns `AdminDeleteOrganizationResult { organization, removedUsers }` — the
+own transaction that **conditionally `REMOVE`s `organizationId` and
+`organizationMembershipId` from the member `UserProfile` (only while it still equals this org)
+and deletes the membership row together**; then soft-revoke the detached member's affected
+SupportLinks; (4) delete the org `#META` row **last**. Returns
+`AdminDeleteOrganizationResult { organization, removedUsers }` — the
 removed org plus how many member profiles were detached in this run. Safe to retry on partial
 failure (an already-`deleting` org resumes removal, and a member who has since moved orgs has only
 their stale membership row cleaned up — their new profile is left untouched).
 
-> **Why membership rows, not `orgIndex`:** `orgIndex` is a GSI and only *eventually* consistent, so
+> **Why membership rows, not `orgIndex`:** `orgIndex` is a GSI and only _eventually_ consistent, so
 > a member who joined moments before step 2 might not appear in it yet — deletion could miss them and
 > leave a `UserProfile.organizationId` pointing at a deleted org. The `OrganizationMember` rows are
 > written in the **same transaction** as every `organizationId` set (see `createUserProfile` /
 > `updateMyUserProfile`), and a `ConsistentRead` of the org partition is guaranteed to see them.
 >
-> **Migration / backfill (existing environments):** environments created before `OrganizationMember`
+> **Pre-existing OrganizationMember-row backfill:** environments created before `OrganizationMember`
 > rows existed may have `UserProfile.organizationId` values with **no matching membership row**.
 > Those members are invisible to `adminDeleteOrganization` (which reads only membership rows), so run
 > a **one-time backfill** that writes an `OrganizationMember` row (`ORG#<org>`/`MEMBER#<user>`) for
 > every profile with a non-null `organizationId` **before** deleting any pre-existing org. New
-> memberships created after this change need no backfill.
+> memberships created after this change need no backfill. This older storage repair is unrelated
+> to organization membership-session ids and SupportLink snapshots, which use lazy initialization
+> and deliberately have **no bulk migration**.
 
 ```graphql
 mutation CreateOrg($input: CreateOrganizationInput!) {
-  adminCreateOrganization(input: $input) { organizationId name createdAt }
+  adminCreateOrganization(input: $input) {
+    organizationId
+    name
+    createdAt
+  }
 }
 
 mutation DeleteOrg($input: DeleteOrganizationInput!) {
   adminDeleteOrganization(input: $input) {
-    organization { organizationId name }
+    organization {
+      organizationId
+      name
+    }
     removedUsers
   }
 }
@@ -1321,6 +1635,7 @@ nothing** — no `Task`, `TaskStep`, category count, or `MediaAsset` is written,
 later via [`createTask`](#createtask--mutation). Owner is derived from the Cognito identity.
 
 **Input — `CreateAiTaskInput`**:
+
 - `query: String!` — the free-text request; empty/whitespace is rejected with `VALIDATION`.
 - `groundingMode: AiTaskGroundingMode = GROUNDED_ONLY` — controls the fallback policy (below);
   chosen **per request**, not by the caller's role.
@@ -1345,8 +1660,9 @@ later via [`createTask`](#createtask--mutation). Owner is derived from the Cogni
 > **No-guidance behaviour (input-controlled).** When the query retrieves nothing that clears the
 > rerank relevance floor, `groundingMode` decides what happens — the caller's Cognito role is
 > **not** consulted:
+>
 > - **`GROUNDED_ONLY`** (default) → a **`NotFoundError`** (`message: "no relevant guidance found
->   for this task"`); `data.createAiTask` is null and the Bedrock Converse generation model is
+for this task"`); `data.createAiTask` is null and the Bedrock Converse generation model is
 >   **never called**. See [Error handling](#error-handling).
 > - **`ALLOW_UNGROUNDED_FALLBACK`** → the ungrounded fallback runs: steps are returned with
 >   `grounded: false`, `source: UNGROUNDED_AI`, and empty `citations`.
@@ -1361,7 +1677,12 @@ mutation CreateAiTask($input: CreateAiTaskInput!) {
     title
     steps {
       text
-      citations { chunkId title url snippet }
+      citations {
+        chunkId
+        title
+        url
+        snippet
+      }
     }
     grounded
     source
@@ -1389,13 +1710,13 @@ Every number is **computed in code** from the user's task data; the AI (Bedrock)
 **narrative** prose over those pre-computed stats — it is instructed not to invent numbers and
 not to give medical/clinical/behavioral advice.
 
-| Operation | Input | Returns |
-|---|---|---|
-| `generateReport` (mutation) | `input: { userId!, from!, to! }` | `GeneratedReport!` · **synchronous, non-persisting preview**: gathers the user's instances in `[from, to]`, computes the stats, and has the AI write the narrative — all in memory. Writes **nothing** to S3 or DynamoDB. Returns `{ draftToken, scope, dateRange, generatedAt, narrative, stats }`: the content to render, plus a server-signed `draftToken` to hand to `saveReport`. `from`/`to` are plain `YYYY-MM-DD` (inclusive); `from ≤ to` and the span is capped at **366 days** — violations are `VALIDATION` errors. Expect a few seconds of latency (one Bedrock call). |
-| `saveReport` (mutation) | `input: { draftToken!, scope!, dateRange!, generatedAt!, narrative!, stats! }` | `Report!` · persists a report previously produced by `generateReport`. Re-submit the **exact** content plus its `draftToken`; the server verifies the token against the content (below), then writes the full JSON to S3 (`reports/<userId>/<reportId>.json` in the private media bucket) plus a DynamoDB index row, sets `s3Key`, and stamps `createdBy` (the caller) + `createdAt` + a fresh `reportId`. **Recomputes no stats and calls no model.** A stale, expired, or tampered draft is rejected before any write. The result echoes `narrative`/`stats` inline so no follow-up download is needed. |
-| `listReports` (query) | `userId!, limit, nextToken` | `ReportConnection!` · the user's saved report metadata rows, **newest-first**, paginated like every other list. (Index rows carry no `narrative`/`stats` — those are null here.) |
-| `getReportDownloadUrl` (query) | `userId!, reportId!` | `MediaDownloadTarget!` · short-lived presigned **GET** for a saved report's JSON document (same `{ downloadUrl, s3Key, expiresIn }` shape and TTL as media downloads). Only signs reports that actually exist for that user — an unknown `reportId` is a not-found error, never an arbitrary-key signature. |
-| `deleteReport` (mutation) | `userId!, reportId!` | `Boolean!` · deletes a saved report — the DynamoDB index row first, then the S3 JSON object (so the index never points at a missing object). Returns `true`; an unknown `reportId` is a not-found error. |
+| Operation                      | Input                                                                          | Returns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------------------------------ | ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `generateReport` (mutation)    | `input: { userId!, from!, to! }`                                               | `GeneratedReport!` · **synchronous, non-persisting preview**: gathers the user's instances in `[from, to]`, computes the stats, and has the AI write the narrative — all in memory. Writes **nothing** to S3 or DynamoDB. Returns `{ draftToken, scope, dateRange, generatedAt, narrative, stats }`: the content to render, plus a server-signed `draftToken` to hand to `saveReport`. `from`/`to` are plain `YYYY-MM-DD` (inclusive); `from ≤ to` and the span is capped at **366 days** — violations are `VALIDATION` errors. Expect a few seconds of latency (one Bedrock call).                       |
+| `saveReport` (mutation)        | `input: { draftToken!, scope!, dateRange!, generatedAt!, narrative!, stats! }` | `Report!` · persists a report previously produced by `generateReport`. Re-submit the **exact** content plus its `draftToken`; the server verifies the token against the content (below), then writes the full JSON to S3 (`reports/<userId>/<reportId>.json` in the private media bucket) plus a DynamoDB index row, sets `s3Key`, and stamps `createdBy` (the caller) + `createdAt` + a fresh `reportId`. **Recomputes no stats and calls no model.** A stale, expired, or tampered draft is rejected before any write. The result echoes `narrative`/`stats` inline so no follow-up download is needed. |
+| `listReports` (query)          | `userId!, limit, nextToken`                                                    | `ReportConnection!` · the user's saved report metadata rows, **newest-first**, paginated like every other list. (Index rows carry no `narrative`/`stats` — those are null here.)                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `getReportDownloadUrl` (query) | `userId!, reportId!`                                                           | `MediaDownloadTarget!` · short-lived presigned **GET** for a saved report's JSON document (same `{ downloadUrl, s3Key, expiresIn }` shape and TTL as media downloads). Only signs reports that actually exist for that user — an unknown `reportId` is a not-found error, never an arbitrary-key signature.                                                                                                                                                                                                                                                                                               |
+| `deleteReport` (mutation)      | `userId!, reportId!`                                                           | `Boolean!` · deletes a saved report — the DynamoDB index row first, then the S3 JSON object (so the index never points at a missing object). Returns `true`; an unknown `reportId` is a not-found error.                                                                                                                                                                                                                                                                                                                                                                                                  |
 
 > **`draftToken` — anti-tamper contract.** `generateReport` signs an HMAC-SHA256 token
 > (backend-only secret, `REPORT_DRAFT_SIGNING_SECRET`) that binds a **canonical hash** of the
@@ -1411,28 +1732,29 @@ not to give medical/clinical/behavioral advice.
 
 > **Authorization — SupportPerson only.** Every report operation (`generateReport`, `saveReport`,
 > `listReports`, `getReportDownloadUrl`, `deleteReport`) requires the caller to be a
-> `SUPPORT_PERSON` with an **ACTIVE** `SupportLink` to the target `PRIMARY_USER`, both currently in
-> the **same organization** — the identical delegation rule enforced everywhere else (see the
+> `SUPPORT_PERSON` with a **currently effective** `SupportLink` to the target `PRIMARY_USER` —
+> ACTIVE, both currently in the same organization, and the link's selection snapshot matching
+> both live membership sessions. This is the identical delegation rule enforced everywhere else (see the
 > **Authorization model** section at the top). A **primary user may not access their own reports** (self-access
-> is denied): reports are produced *for* a supporter. Anyone else — unauthenticated, non-supporter,
+> is denied): reports are produced _for_ a supporter. Anyone else — unauthenticated, non-supporter,
 > revoked/absent link, non-primary target, or cross-org — gets `NOT_AUTHORIZED`. For `saveReport`
 > the target user is taken from the **signed** draft token, so the caller cannot redirect a save to
 > a different user.
 
 > **`GeneratedReport` (generateReport output).** `{ draftToken, scope, dateRange, generatedAt,
-> narrative, stats }`. `scope`, `dateRange`, and `stats` are `AWSJSON`, so they arrive as JSON
+narrative, stats }`. `scope`, `dateRange`, and `stats` are `AWSJSON`, so they arrive as JSON
 > **strings** (see [the `AWSJSON` foot-gun](#awsjson-fields--encoding-foot-gun)):
 > `JSON.parse(scope)` → `{ userId }`, `JSON.parse(dateRange)` → `{ from, to }`,
 > `JSON.parse(stats)` → the object below. `generatedAt` and `narrative` are plain strings.
 
 > **`SaveReportInput` (saveReport input).** `{ draftToken, scope, dateRange, generatedAt,
-> narrative, stats }` — the same shape you received from `generateReport`. `scope`, `dateRange`,
+narrative, stats }` — the same shape you received from `generateReport`. `scope`, `dateRange`,
 > and `stats` are `AWSJSON` **inputs**: in GraphQL variables, send JSON strings. You may pass back
 > the exact `scope`/`dateRange`/`stats` strings returned by `generateReport`; if you parsed them,
 > re-stringify the objects before calling `saveReport`.
 
 > **`Report` (GraphQL) — a saved report.** `{ reportId, scope, dateRange, s3Key, createdBy,
-> createdAt, narrative, stats }`. Only `saveReport` produces one, so `s3Key` is always set. The
+createdAt, narrative, stats }`. Only `saveReport` produces one, so `s3Key` is always set. The
 > `saveReport` response echoes `narrative`/`stats` inline (the content you just saved); `listReports`
 > rows leave both null (fetch the saved JSON via `getReportDownloadUrl`). `scope`, `dateRange`, and
 > `stats` are `AWSJSON` output strings, same as above.
@@ -1447,8 +1769,10 @@ not to give medical/clinical/behavioral advice.
 >   "dateRange": { "from": "2026-06-01", "to": "2026-06-30" },
 >   "createdBy": "<caller's sub>",
 >   "createdAt": "2026-07-03T…Z",
->   "stats": { /* see below */ },
->   "narrative": "2–4 short paragraphs of plain-language AI summary"
+>   "stats": {
+>     /* see below */
+>   },
+>   "narrative": "2–4 short paragraphs of plain-language AI summary",
 > }
 > ```
 
@@ -1494,12 +1818,12 @@ not to give medical/clinical/behavioral advice.
 mutation GenerateReport($input: GenerateReportInput!) {
   # input: { userId: "<primary user's sub>", from: "2026-06-01", to: "2026-06-30" }
   generateReport(input: $input) {
-    draftToken   # opaque signed token — pass back to saveReport unchanged
-    scope        # AWSJSON string — JSON.parse → { userId }
-    dateRange    # AWSJSON string — JSON.parse → { from, to }
-    generatedAt  # echo back to saveReport unchanged
-    narrative    # inline AI summary to render in the preview
-    stats        # AWSJSON string — JSON.parse → the stats object
+    draftToken # opaque signed token — pass back to saveReport unchanged
+    scope # AWSJSON string — JSON.parse → { userId }
+    dateRange # AWSJSON string — JSON.parse → { from, to }
+    generatedAt # echo back to saveReport unchanged
+    narrative # inline AI summary to render in the preview
+    stats # AWSJSON string — JSON.parse → the stats object
   }
 }
 
@@ -1518,27 +1842,31 @@ mutation SaveReport($input: SaveReportInput!) {
   # }
   saveReport(input: $input) {
     reportId
-    s3Key        # always set — the report is now saved
+    s3Key # always set — the report is now saved
     createdBy
     createdAt
-    narrative    # echoed back (the content you saved)
-    stats        # AWSJSON string
+    narrative # echoed back (the content you saved)
+    stats # AWSJSON string
   }
 }
 
 query ReadReports($userId: ID!, $reportId: ID!) {
   listReports(userId: $userId) {
-    items { reportId dateRange createdAt }
+    items {
+      reportId
+      dateRange
+      createdAt
+    }
     nextToken
   }
   getReportDownloadUrl(userId: $userId, reportId: $reportId) {
-    downloadUrl   # GET this URL → the full JSON document (stats + narrative)
+    downloadUrl # GET this URL → the full JSON document (stats + narrative)
     expiresIn
   }
 }
 
 mutation DeleteReport($userId: ID!, $reportId: ID!) {
-  deleteReport(userId: $userId, reportId: $reportId)   # → true
+  deleteReport(userId: $userId, reportId: $reportId) # → true
 }
 ```
 
@@ -1556,14 +1884,14 @@ stable contract and may be reworded at any time.
 
 ### `errorType` codes
 
-| `errorType` | HTTP | Meaning | Client should |
-|---|---|---|---|
-| `UnauthorizedException` | 401 | Missing/invalid/expired token at the AppSync edge — never reached a resolver | Re-authenticate (refresh the Cognito session) |
-| `NOT_AUTHORIZED` | 200 | Authenticated, but not allowed to act on this id/resource | Handle as a normal denial — **see caveat below** |
-| `VALIDATION` | 200 | Bad input (missing/empty required field, invalid schedule, etc.) | Fix the input; surface to the user |
-| `NOT_FOUND` | 200 | The referenced id doesn't exist (e.g. `updateTask` on an unknown `taskId`, signing a download URL for an unregistered asset) | Treat as "gone"; distinct from a successful `null` on `get*` |
-| `INTERNAL` | 200 | Resolver failure (Bedrock/KB error, downstream AWS error, unexpected bug) | Retry/backoff; report if persistent |
-| (parse/validation) | 200/400 | Malformed query or unknown field — a client bug, not runtime data | Fix the query |
+| `errorType`             | HTTP    | Meaning                                                                                                                      | Client should                                                |
+| ----------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `UnauthorizedException` | 401     | Missing/invalid/expired token at the AppSync edge — never reached a resolver                                                 | Re-authenticate (refresh the Cognito session)                |
+| `NOT_AUTHORIZED`        | 200     | Authenticated, but not allowed to act on this id/resource                                                                    | Handle as a normal denial — **see caveat below**             |
+| `VALIDATION`            | 200     | Bad input (missing/empty required field, invalid schedule, etc.)                                                             | Fix the input; surface to the user                           |
+| `NOT_FOUND`             | 200     | The referenced id doesn't exist (e.g. `updateTask` on an unknown `taskId`, signing a download URL for an unregistered asset) | Treat as "gone"; distinct from a successful `null` on `get*` |
+| `INTERNAL`              | 200     | Resolver failure (Bedrock/KB error, downstream AWS error, unexpected bug)                                                    | Retry/backoff; report if persistent                          |
+| (parse/validation)      | 200/400 | Malformed query or unknown field — a client bug, not runtime data                                                            | Fix the query                                                |
 
 > ⚠️ **Stability caveat — current vs. intended.** The codes above are the **intended,
 > stable contract**; build your client to branch on them. But in **this phase**, only
@@ -1638,7 +1966,7 @@ ordering changed. **This is a breaking API change.**
 - `TaskStep` storage moved from order-based sort keys (`STEP#001`) to stable
   `STEP#<stepId>` keys; `order` is a plain attribute. List/read paths sort by `order`.
 - **Task & TaskStep operations are owner-scoped with SupportPerson delegation** (the caller
-  must be the task's `ownerId`, or a SupportPerson with an ACTIVE link to that owner);
+  must be the task's `ownerId`, or a SupportPerson with an effective link to that owner);
   `createTaskStep` is **append-only** (next position; max 99 steps).
 
 **Added**

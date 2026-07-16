@@ -71,7 +71,8 @@ const MAX_STEPS_PER_TASK = 99;
  *
  * Authorization: Task and TaskStep operations are scoped to the task's owner via
  * `assertCanActForUser(identity, task.ownerId)` — the owner themselves, OR a SupportPerson with
- * an ACTIVE SupportLink to that owner (a PRIMARY_USER in the same organization). Reads
+ * an effective SupportLink to that owner (ACTIVE with a current organization/membership
+ * snapshot). Reads
  * (getTask/listTaskSteps) additionally allow a user holding an active assignment referencing
  * the task (read-only). List APIs resolve the target owner the same delegated way.
  */
@@ -189,7 +190,10 @@ async function listTaskSteps(
   const slice = all.slice(offset, offset + limit);
   const nextOffset = offset + slice.length;
   const nextToken = nextOffset < all.length ? encodeNextToken({ offset: nextOffset }) : null;
-  return { items: slice.map((step) => withStepMedia(step, mediaForStep(allMedia, step.stepId))), nextToken };
+  return {
+    items: slice.map((step) => withStepMedia(step, mediaForStep(allMedia, step.stepId))),
+    nextToken,
+  };
 }
 
 /** Decode the opaque app-level offset cursor (0 when absent). */
@@ -535,7 +539,8 @@ async function createTaskStep(
   const mediaWrites: Array<Record<string, unknown>> = [];
   for (const change of initialMedia) {
     const asset = await getMediaAsset(taskId, change.assetId!);
-    if (!asset) throw new NotFoundError(`media asset ${change.assetId} not found under task ${taskId}`);
+    if (!asset)
+      throw new NotFoundError(`media asset ${change.assetId} not found under task ${taskId}`);
     if (asset.type !== change.type) {
       throw new ValidationError(
         `media asset ${change.assetId} has type ${asset.type}; expected ${change.type}`,
@@ -556,7 +561,11 @@ async function createTaskStep(
         ConditionExpression:
           'attribute_exists(PK) AND attribute_not_exists(stepId) AND #type = :mediaType',
         ExpressionAttributeNames: { '#type': 'type' },
-        ExpressionAttributeValues: { ':stepId': step.stepId, ':now': now, ':mediaType': change.type },
+        ExpressionAttributeValues: {
+          ':stepId': step.stepId,
+          ':now': now,
+          ':mediaType': change.type,
+        },
       },
     });
   }
@@ -716,7 +725,8 @@ async function updateTaskStep(
     }
 
     const asset = await getMediaAsset(taskId, change.assetId);
-    if (!asset) throw new NotFoundError(`media asset ${change.assetId} not found under task ${taskId}`);
+    if (!asset)
+      throw new NotFoundError(`media asset ${change.assetId} not found under task ${taskId}`);
     if (asset.type !== change.type) {
       throw new ValidationError(
         `media asset ${change.assetId} has type ${asset.type}; expected ${change.type}`,
@@ -759,7 +769,10 @@ async function updateTaskStep(
   try {
     await dynamo.send(
       new TransactWriteCommand({
-        TransactItems: [...attachmentUpdates, { Update: { TableName: TABLE_NAME, Key: stepKey, ...stepUpdate } }],
+        TransactItems: [
+          ...attachmentUpdates,
+          { Update: { TableName: TABLE_NAME, Key: stepKey, ...stepUpdate } },
+        ],
       }),
     );
   } catch (err) {
@@ -779,7 +792,13 @@ async function updateTaskStep(
 
   const resultMedia = existingMedia
     .filter((asset) => !oldAssetsToPurge.has(asset.assetId))
-    .concat([...replacementAssets.values()].filter((asset) => !existingByType.has(asset.type) || existingByType.get(asset.type)?.assetId !== asset.assetId));
+    .concat(
+      [...replacementAssets.values()].filter(
+        (asset) =>
+          !existingByType.has(asset.type) ||
+          existingByType.get(asset.type)?.assetId !== asset.assetId,
+      ),
+    );
   const out = applyFieldsToStep(step, { trimmedText, descProvided, descClear, trimmedDesc, now });
   out.mediaVersion = mediaVersion + 1;
   return withStepMedia(out, mediaForStep(resultMedia, stepId));
@@ -788,7 +807,9 @@ async function updateTaskStep(
 const MEDIA_TYPE_ORDER: Record<MediaType, number> = { IMAGE: 0, AUDIO: 1, VIDEO: 2 };
 
 /** Validate and normalize type-specific media changes; each type is set at most once. */
-function normalizeStepMediaUpdates(value: StepMediaUpdateInput[] | undefined): StepMediaUpdateInput[] {
+function normalizeStepMediaUpdates(
+  value: StepMediaUpdateInput[] | undefined,
+): StepMediaUpdateInput[] {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.length === 0) {
     throw new ValidationError('media must be a non-empty list when supplied');
@@ -803,7 +824,8 @@ function normalizeStepMediaUpdates(value: StepMediaUpdateInput[] | undefined): S
     }
     seen.add(change.type);
     const assetId = change.assetId == null ? null : change.assetId.trim();
-    if (assetId === '') throw new ValidationError(`media assetId for ${change.type} cannot be empty`);
+    if (assetId === '')
+      throw new ValidationError(`media assetId for ${change.type} cannot be empty`);
     return { type: change.type, assetId };
   });
 }
@@ -818,7 +840,9 @@ function mediaForStep(allMedia: MediaAsset[], stepId: string): MediaAsset[] {
     )
       continue;
     if (byType.has(asset.type)) {
-      throw new ValidationError(`step ${stepId} has multiple ${asset.type} media assets; repair the data`);
+      throw new ValidationError(
+        `step ${stepId} has multiple ${asset.type} media assets; repair the data`,
+      );
     }
     byType.set(asset.type, asset);
   }
@@ -1108,7 +1132,13 @@ async function deleteTaskStep(
     await dynamo.send(
       new TransactWriteCommand({
         TransactItems: [
-          { Delete: { TableName: TABLE_NAME, Key: stepKey, ConditionExpression: 'attribute_exists(PK)' } },
+          {
+            Delete: {
+              TableName: TABLE_NAME,
+              Key: stepKey,
+              ConditionExpression: 'attribute_exists(PK)',
+            },
+          },
           {
             Update: {
               TableName: TABLE_NAME,
@@ -1116,7 +1146,11 @@ async function deleteTaskStep(
               UpdateExpression:
                 'SET stepCount = stepCount - :one, stepVersion = if_not_exists(stepVersion, :zero) + :one, updatedAt = :now',
               ConditionExpression: 'attribute_exists(PK) AND stepCount > :zero',
-              ExpressionAttributeValues: { ':one': 1, ':zero': 0, ':now': new Date().toISOString() },
+              ExpressionAttributeValues: {
+                ':one': 1,
+                ':zero': 0,
+                ':now': new Date().toISOString(),
+              },
             },
           },
         ],
@@ -1124,7 +1158,11 @@ async function deleteTaskStep(
     );
   } else {
     await dynamo.send(
-      new DeleteCommand({ TableName: TABLE_NAME, Key: stepKey, ConditionExpression: 'attribute_exists(PK)' }),
+      new DeleteCommand({
+        TableName: TABLE_NAME,
+        Key: stepKey,
+        ConditionExpression: 'attribute_exists(PK)',
+      }),
     );
   }
 
@@ -1163,7 +1201,8 @@ async function updateTaskOrder(
     if (!Number.isInteger(t.order) || t.order < 1) {
       throw new ValidationError(`order for task ${id} must be a positive integer`);
     }
-    if (seenOrders.has(t.order)) throw new ValidationError(`order ${t.order} appears more than once`);
+    if (seenOrders.has(t.order))
+      throw new ValidationError(`order ${t.order} appears more than once`);
     orderByTaskId.set(id, t.order);
     seenOrders.add(t.order);
   }
@@ -1223,10 +1262,7 @@ async function updateTaskOrder(
  * path the SystemAdmin `adminDeleteTask` uses without an access check). Rejected while an active
  * TaskAssignment references the task; existing TaskInstance/TaskInstanceStep rows are never deleted.
  */
-async function deleteTask(
-  identity: AppSyncIdentity | undefined,
-  taskId: string,
-): Promise<Task> {
+async function deleteTask(identity: AppSyncIdentity | undefined, taskId: string): Promise<Task> {
   const id = taskId?.trim();
   if (!id) throw new ValidationError('taskId is required and cannot be empty');
 

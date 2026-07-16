@@ -38,6 +38,7 @@ import {
   ENTITY,
   ENTITY_TYPE_INDEX,
   type EntityType,
+  INCOMING_SUPPORT_LINK_PREFIX,
   META_SK,
   ORG_MEMBER_PREFIX,
   organizationMemberSk,
@@ -48,6 +49,7 @@ import {
   TASK_ASSIGNMENT_PREFIX,
   TASK_OWNER_INDEX,
   USER_LINK_PREFIX,
+  userLinkSk,
   userPk,
 } from '../../shared/keys';
 import {
@@ -59,6 +61,10 @@ import {
   organizationMemberPut,
   stripOrganization,
 } from '../../shared/organization';
+import {
+  planMembershipTransition,
+  revokeSupportLinksForOrganizationChange,
+} from '../../shared/organizationMembership';
 import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
 import { NotFoundError, ValidationError } from '../../shared/response';
 import { deleteTaskCascade } from '../../shared/taskCascade';
@@ -306,7 +312,9 @@ async function adminUpdateOrganization(input: UpdateOrganizationInput): Promise<
  * gone); (2) mark it `deleting` so no new membership can join mid-removal; (3) detach every member
  * found via the STRONGLY-CONSISTENT OrganizationMember rows under the org partition (a consistent
  * Query, paginated, never a Scan) — each member is its own transaction that clears the profile's
- * organizationId and deletes the membership row together; (4) delete the org #META row LAST.
+ * organizationId + organizationMembershipId and deletes the membership row together, then
+ * soft-revokes the member's ACTIVE SupportLinks (a detached member has left their org, so the
+ * standard SupportLink lifecycle applies); (4) delete the org #META row LAST.
  *
  * Membership rows (not the eventually-consistent orgIndex) are the source of truth here: a user
  * who joined moments before step 2 is guaranteed visible to a consistent read of the org
@@ -382,14 +390,17 @@ async function detachOrganizationMembers(organizationId: string): Promise<number
 }
 
 /**
- * Detach ONE member in a single transaction: conditionally REMOVE organizationId from their
- * UserProfile (only while it still equals this org) AND delete the OrganizationMember row, so
- * profile and membership cleanup stay together. Returns true when the profile was detached.
+ * Detach ONE member in a single transaction: conditionally REMOVE organizationId AND the
+ * internal organizationMembershipId from their UserProfile (only while it still equals this
+ * org) AND delete the OrganizationMember row, so profile and membership cleanup stay together.
+ * The detached member has LEFT their organization, so every ACTIVE SupportLink touching them
+ * (either direction) is then soft-revoked — the same lifecycle rule as every other
+ * org-membership change. Returns true when the profile was detached.
  *
  * If the member had already moved to a different org, the conditional profile update fails and
  * cancels the transaction; the membership row is now stale, so delete it on its own (leaving the
- * moved profile untouched) and return false — this keeps org deletion able to complete and remain
- * idempotent on retry.
+ * moved profile untouched — that concurrent move already handled its own revocation) and return
+ * false — this keeps org deletion able to complete and remain idempotent on retry.
  */
 async function detachOrganizationMember(organizationId: string, userId: string): Promise<boolean> {
   try {
@@ -400,15 +411,22 @@ async function detachOrganizationMember(organizationId: string, userId: string):
             Update: {
               TableName: TABLE_NAME,
               Key: { PK: userPk(userId), SK: PROFILE_SK },
-              UpdateExpression: 'SET updatedAt = :now REMOVE organizationId',
+              UpdateExpression:
+                'SET updatedAt = :now REMOVE organizationId, organizationMembershipId',
               ConditionExpression: 'organizationId = :org',
-              ExpressionAttributeValues: { ':org': organizationId, ':now': new Date().toISOString() },
+              ExpressionAttributeValues: {
+                ':org': organizationId,
+                ':now': new Date().toISOString(),
+              },
             },
           },
           organizationMemberDelete(organizationId, userId),
         ],
       }),
     );
+    // The member left their org: soft-revoke every ACTIVE SupportLink in either direction
+    // (idempotent — a retry after a crash simply finds nothing left to revoke).
+    await revokeSupportLinksForOrganizationChange(userId, {});
     return true;
   } catch (err) {
     // ONLY transact-item 0 (the profile update's `organizationId = :org` guard) failing means the
@@ -468,6 +486,12 @@ async function adminListOrganizationUsers(
  *    row, and delete the old org's row when moving;
  *  - clearing (null): remove organizationId and delete the old membership row.
  * TransactWrite returns no attributes, so the updated profile is read back and returned.
+ *
+ * The write also drives the SupportLink lifecycle exactly like the self-service paths: a real
+ * join/move rotates the internal organizationMembershipId and soft-revokes every affected ACTIVE
+ * SupportLink (both directions); clearing removes the id and revokes; re-setting the user's
+ * CURRENT org keeps the existing membership session (lazily initializing a legacy profile's
+ * missing id) and revokes nothing. Rejoining later never restores revoked links.
  */
 async function adminSetUserOrganization(
   input: AdminSetUserOrganizationInput,
@@ -493,26 +517,46 @@ async function adminSetUserOrganization(
   const existing = await readProfile(userId);
   if (!existing) throw new NotFoundError(`user ${userId} not found`);
   const previousOrg = existing.organizationId?.trim() || undefined;
+  const transition = planMembershipTransition(
+    previousOrg,
+    existing.organizationMembershipId,
+    newOrg,
+  );
 
   const now = new Date().toISOString();
   const profileKey = { PK: userPk(userId), SK: PROFILE_SK };
   // Bind the profile write to the org state seen at pre-read (item 0 of every path below). If a
   // concurrent request moves/clears the user's org in between, this condition fails and cancels the
   // write instead of deleting a now-stale membership row (which would orphan the row for the org the
-  // profile was concurrently moved to).
-  const guard = profileOrgGuard(previousOrg);
+  // profile was concurrently moved to) or mixing two membership sessions.
+  const guard = profileOrgGuard(previousOrg, existing.organizationMembershipId);
 
   if (newOrg) {
     // Clear pre-read error (NotFound / being-deleted), then the same check rides the transaction.
     await assertUsableOrganization(newOrg);
+    // Membership session: an unchanged org keeps the stored id (if_not_exists lazily initializes
+    // a legacy profile, converging concurrent initializers on one id); a join/move rotates it.
+    const membershipExpression =
+      transition.kind === 'keep'
+        ? 'organizationMembershipId = if_not_exists(organizationMembershipId, :membershipId)'
+        : 'organizationMembershipId = :membershipId';
+    const membershipId =
+      transition.kind === 'keep' || transition.kind === 'rotate'
+        ? transition.membershipId
+        : undefined;
     const transactItems: Array<Record<string, unknown>> = [
       {
         Update: {
           TableName: TABLE_NAME,
           Key: profileKey,
-          UpdateExpression: 'SET organizationId = :org, updatedAt = :now',
+          UpdateExpression: `SET organizationId = :org, ${membershipExpression}, updatedAt = :now`,
           ConditionExpression: guard.ConditionExpression,
-          ExpressionAttributeValues: { ':org': newOrg, ':now': now, ...guard.values },
+          ExpressionAttributeValues: {
+            ':org': newOrg,
+            ':membershipId': membershipId,
+            ':now': now,
+            ...guard.values,
+          },
         },
       },
       organizationConditionCheck(newOrg),
@@ -534,11 +578,22 @@ async function adminSetUserOrganization(
       if (isTransactConditionCheckFailure(err, 0)) throw profileOrgConflictError(userId);
       throw err;
     }
+    // A real join/move ended the previous membership session: soft-revoke the ACTIVE
+    // SupportLinks it invalidated (links selected under the NEW session are left alone).
+    // Re-setting the same org changed nothing and revokes nothing.
+    if (transition.organizationChanged) {
+      await revokeSupportLinksForOrganizationChange(userId, {
+        organizationId: newOrg,
+        organizationMembershipId:
+          transition.kind === 'rotate' ? transition.membershipId : undefined,
+      });
+    }
     return readBackProfile(userId);
   }
 
-  // Clearing with a current org: remove organizationId and drop that membership row in one
-  // transaction, guarded so a concurrent move can't leave the new org's membership row orphaned.
+  // Clearing with a current org: remove organizationId + the membership session and drop that
+  // membership row in one transaction, guarded so a concurrent move can't leave the new org's
+  // membership row orphaned.
   if (previousOrg) {
     try {
       await dynamo.send(
@@ -548,7 +603,8 @@ async function adminSetUserOrganization(
               Update: {
                 TableName: TABLE_NAME,
                 Key: profileKey,
-                UpdateExpression: 'SET updatedAt = :now REMOVE organizationId',
+                UpdateExpression:
+                  'SET updatedAt = :now REMOVE organizationId, organizationMembershipId',
                 ConditionExpression: guard.ConditionExpression,
                 ExpressionAttributeValues: { ':now': now, ...guard.values },
               },
@@ -561,17 +617,21 @@ async function adminSetUserOrganization(
       if (isTransactConditionCheckFailure(err, 0)) throw profileOrgConflictError(userId);
       throw err;
     }
+    // Leaving ends the membership session: every ACTIVE SupportLink in either direction is
+    // stale now — soft-revoke them all.
+    await revokeSupportLinksForOrganizationChange(userId, {});
     return readBackProfile(userId);
   }
 
   // Clearing when the profile had no org: a plain conditional REMOVE, guarded so a concurrent add
   // (which would have created a membership row) can't be silently wiped without dropping that row.
+  // No org change happened, so no membership session ends and no links are revoked.
   try {
     await dynamo.send(
       new UpdateCommand({
         TableName: TABLE_NAME,
         Key: profileKey,
-        UpdateExpression: 'SET updatedAt = :now REMOVE organizationId',
+        UpdateExpression: 'SET updatedAt = :now REMOVE organizationId, organizationMembershipId',
         ConditionExpression: guard.ConditionExpression,
         ExpressionAttributeValues: { ':now': now, ...guard.values },
       }),
@@ -586,20 +646,33 @@ async function adminSetUserOrganization(
 }
 
 /**
- * A conditional guard binding a UserProfile write to the org it had at pre-read: it had a specific
- * org (`organizationId = :prevOrg`) or none (`attribute_not_exists(organizationId)`). Included on
- * every adminSetUserOrganization write so a concurrent org change cancels the write rather than
- * letting it delete a stale membership row and orphan the concurrently-set org's row.
+ * A conditional guard binding a UserProfile write to the exact organization membership it had at
+ * pre-read: organization id PLUS membership-session id (or explicit absence). Included on every
+ * adminSetUserOrganization write so a concurrent leave/move/rejoin — including an ABA return to
+ * the same org under a fresh session — cancels the write rather than deleting a stale membership
+ * row or mixing membership sessions.
  */
-function profileOrgGuard(previousOrg: string | undefined): {
+function profileOrgGuard(
+  previousOrg: string | undefined,
+  previousMembershipId: string | undefined,
+): {
   ConditionExpression: string;
   values: Record<string, unknown>;
 } {
   return previousOrg
-    ? {
-        ConditionExpression: 'attribute_exists(PK) AND organizationId = :prevOrg',
-        values: { ':prevOrg': previousOrg },
-      }
+    ? previousMembershipId
+      ? {
+          ConditionExpression:
+            'attribute_exists(PK) AND organizationId = :prevOrg ' +
+            'AND organizationMembershipId = :prevMembershipId',
+          values: { ':prevOrg': previousOrg, ':prevMembershipId': previousMembershipId },
+        }
+      : {
+          ConditionExpression:
+            'attribute_exists(PK) AND organizationId = :prevOrg ' +
+            'AND attribute_not_exists(organizationMembershipId)',
+          values: { ':prevOrg': previousOrg },
+        }
     : {
         ConditionExpression: 'attribute_exists(PK) AND attribute_not_exists(organizationId)',
         values: {},
@@ -822,16 +895,34 @@ async function adminDeleteUser(
     await deleteProfileAndMembership(userId, memberOrgId);
   }
 
+  // The USER# partition also carries durable incoming SupportLink pointers. Resolve them before
+  // deleting that partition so a just-selected target-side link is found consistently even if
+  // primaryUserSupportLinkIndex has not caught up yet.
+  const pointerLinkKeys = userRows
+    .filter((row) => row.SK.startsWith(INCOMING_SUPPORT_LINK_PREFIX))
+    .map((row) => row.SK.slice(INCOMING_SUPPORT_LINK_PREFIX.length))
+    .filter(Boolean)
+    .map((supporterId) => ({ PK: supporterPk(supporterId), SK: userLinkSk(userId) }));
+
   // 3) Delete the remaining USER# partition rows (Category, TaskAssignment, TaskInstance,
-  //    TaskInstanceStep, …). The profile was handled transactionally above.
+  //    TaskInstanceStep, incoming SupportLink pointers, …). The profile was handled atomically.
   const remainingUserRows = userRows.filter((row) => row.SK !== PROFILE_SK);
   await batchDelete(remainingUserRows);
 
   // 4) SupportLinks where the user is the SUPPORTER (PK = SUPPORTER#<userId>) and …
   const supporterRows = await queryAllKeys(supporterPk(userId));
-  // 5) … where the user is the PRIMARY user (primaryUserSupportLinkIndex, userId = target).
-  const primaryLinkKeys = await queryPrimaryUserSupportLinkKeys(userId);
-  await batchDelete([...supporterRows, ...primaryLinkKeys]);
+  // 5) … where the user is the PRIMARY user. Reverse pointers cover every newly selected link;
+  // the GSI remains a compatibility fallback for older rows. De-duplicate the canonical keys.
+  const indexedPrimaryLinkKeys = await queryPrimaryUserSupportLinkKeys(userId);
+  const supportLinkKeys = [
+    ...new Map(
+      [...supporterRows, ...pointerLinkKeys, ...indexedPrimaryLinkKeys].map((key) => [
+        `${key.PK}\0${key.SK}`,
+        key,
+      ]),
+    ).values(),
+  ];
+  await batchDelete(supportLinkKeys);
 
   // 6) Cognito user LAST — only after all data cleanup above succeeded.
   let deletedCognitoUser = false;
@@ -849,7 +940,7 @@ async function adminDeleteUser(
     userId,
     deletedTasks: ownedTasks.length,
     deletedUserItems: userRows.length,
-    deletedSupportLinks: supporterRows.length + primaryLinkKeys.length,
+    deletedSupportLinks: supportLinkKeys.length,
     deletedCognitoUser,
   };
 }

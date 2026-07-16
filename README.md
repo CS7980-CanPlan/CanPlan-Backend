@@ -14,19 +14,19 @@ for every entity — UserProfile, SupportLink, Organization, OrganizationMember,
 Task, TaskStep, TaskAssignment, TaskInstance, TaskInstanceStep, MediaAsset, Report. The
 item-key conventions live in [src/shared/keys.ts](src/shared/keys.ts).
 
-| Operation(s) | Type | Backing service |
-| --------- | ---- | --------------- |
-| `healthCheck` | Query | AppSync none data source |
-| `createTask` | Mutation | `canplan-createTask-<env>` Lambda (writes Task + steps atomically) |
-| `createUserProfile`, `updateMyUserProfile`, `getUserProfile`, `listMyOrganizationUsers`, `selectPrimaryUser`, `unselectPrimaryUser`, `listMySupportList` | Query/Mutation | `canplan-users-<env>` Lambda + DynamoDB (createUserProfile also creates the user's default category atomically) |
-| `createCategory`, `updateCategory`, `deleteCategory`, `listMyCategories` | Query/Mutation | `canplan-categories-<env>` Lambda + DynamoDB (self by default; optional `userId` lets a SupportPerson manage a selected primary user's categories via delegated access; deleteCategory reparents tasks to the target user's default category) |
-| `getTask`, `listTaskSteps`, `listTasksByOwner`, `listTasksByCategory`, `updateTask`, `createTaskStep`, `updateTaskStep`, `deleteTaskStep`, `reorderTaskSteps`, `deleteTask` | Query/Mutation | `canplan-tasks-<env>` Lambda + DynamoDB + S3 (media cleanup) |
-| `createTaskAssignment`, `startTaskInstance`, `setTaskInstanceStepCompletion`, `updateTaskInstanceStatus`, `cancelTaskInstance`, `endTaskAssignment`, `deleteTaskAssignment`, `listTaskAssignmentsForUser`, `getTaskInstanceViews`, `getTaskInstance`, `listTaskInstances`, `batchGetTaskInstances`, `listTaskInstanceSteps` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB (TaskAssignment schedule rules; lazily-materialized TaskInstances; calendar feed; self-scoped instance reads) |
-| `createMediaUploadUrl`, `createTaskCoverImageUploadUrl`, `createMediaAsset`, `deleteMediaAsset`, `getMediaDownloadUrl`, `listMediaForTask` | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB + S3 media bucket (presigned upload/download, cover images, cascade delete) |
-| `listAllUsers`, `listAllTasks`, `listAllOrganizations`, `adminListOrganizationUsers`, `adminGetUserData` | Query | `canplan-admin-<env>` Lambda + DynamoDB `entityTypeIndex`/GSIs (SystemAdmin only, paginated; no Scan) |
-| `inviteSupportPerson`, `inviteOrganizationAdmin`, `setUserBaseRole`, `setSystemAdmin`, `adminDeleteTask`, `adminDeleteUser`, `adminCreateOrganization`, `adminUpdateOrganization`, `adminDeleteOrganization`, `adminSetUserOrganization` | Mutation | `canplan-admin-<env>` Lambda + Cognito + DynamoDB + S3 (SystemAdmin only — manage Cognito roles, organizations & membership, delete any task, full user deletion) |
-| `generateTaskSteps` | Mutation | `canplan-generateTaskSteps-<env>` Lambda + Bedrock KB RAG |
-| `createAiTask` | Mutation | `canplan-createAiTask-<env>` Lambda + Bedrock KB RAG (generate a title + steps preview; persists nothing) |
+| Operation(s)                                                                                                                                                                                                                                                                                                                | Type           | Backing service                                                                                                                                                                                                                                                                                                                                           |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `healthCheck`                                                                                                                                                                                                                                                                                                               | Query          | AppSync none data source                                                                                                                                                                                                                                                                                                                                  |
+| `createTask`                                                                                                                                                                                                                                                                                                                | Mutation       | `canplan-createTask-<env>` Lambda (writes Task + steps atomically)                                                                                                                                                                                                                                                                                        |
+| `createUserProfile`, `updateMyUserProfile`, `getUserProfile`, `listMyOrganizationUsers`, `listAvailableOrganizations`, `getOrganization`, `selectPrimaryUser`, `unselectPrimaryUser`, `listMySupportList`, `listMySupportLinkHistory`                                                                                       | Query/Mutation | `canplan-users-<env>` Lambda + DynamoDB (createUserProfile also creates the user's default category atomically; `listAvailableOrganizations`/`getOrganization` are the PrimaryUser/SupportPerson read-only organization directory; `listMySupportList` returns only currently effective relationships, `listMySupportLinkHistory` the unfiltered history) |
+| `createCategory`, `updateCategory`, `deleteCategory`, `listMyCategories`                                                                                                                                                                                                                                                    | Query/Mutation | `canplan-categories-<env>` Lambda + DynamoDB (self by default; optional `userId` lets a SupportPerson manage a selected primary user's categories via delegated access; deleteCategory reparents tasks to the target user's default category)                                                                                                             |
+| `getTask`, `listTaskSteps`, `listTasksByOwner`, `listTasksByCategory`, `updateTask`, `createTaskStep`, `updateTaskStep`, `deleteTaskStep`, `reorderTaskSteps`, `deleteTask`                                                                                                                                                 | Query/Mutation | `canplan-tasks-<env>` Lambda + DynamoDB + S3 (media cleanup)                                                                                                                                                                                                                                                                                              |
+| `createTaskAssignment`, `startTaskInstance`, `setTaskInstanceStepCompletion`, `updateTaskInstanceStatus`, `cancelTaskInstance`, `endTaskAssignment`, `deleteTaskAssignment`, `listTaskAssignmentsForUser`, `getTaskInstanceViews`, `getTaskInstance`, `listTaskInstances`, `batchGetTaskInstances`, `listTaskInstanceSteps` | Query/Mutation | `canplan-assignments-<env>` Lambda + DynamoDB (TaskAssignment schedule rules; lazily-materialized TaskInstances; calendar feed; self-scoped instance reads)                                                                                                                                                                                               |
+| `createMediaUploadUrl`, `createTaskCoverImageUploadUrl`, `createMediaAsset`, `deleteMediaAsset`, `getMediaDownloadUrl`, `listMediaForTask`                                                                                                                                                                                  | Query/Mutation | `canplan-media-<env>` Lambda + DynamoDB + S3 media bucket (presigned upload/download, cover images, cascade delete)                                                                                                                                                                                                                                       |
+| `listAllUsers`, `listAllTasks`, `listAllOrganizations`, `adminListOrganizationUsers`, `adminGetUserData`                                                                                                                                                                                                                    | Query          | `canplan-admin-<env>` Lambda + DynamoDB `entityTypeIndex`/GSIs (SystemAdmin only, paginated; no Scan)                                                                                                                                                                                                                                                     |
+| `inviteSupportPerson`, `inviteOrganizationAdmin`, `setUserBaseRole`, `setSystemAdmin`, `adminDeleteTask`, `adminDeleteUser`, `adminCreateOrganization`, `adminUpdateOrganization`, `adminDeleteOrganization`, `adminSetUserOrganization`                                                                                    | Mutation       | `canplan-admin-<env>` Lambda + Cognito + DynamoDB + S3 (SystemAdmin only — manage Cognito roles, organizations & membership, delete any task, full user deletion)                                                                                                                                                                                         |
+| `generateTaskSteps`                                                                                                                                                                                                                                                                                                         | Mutation       | `canplan-generateTaskSteps-<env>` Lambda + Bedrock KB RAG                                                                                                                                                                                                                                                                                                 |
+| `createAiTask`                                                                                                                                                                                                                                                                                                              | Mutation       | `canplan-createAiTask-<env>` Lambda + Bedrock KB RAG (generate a title + steps preview; persists nothing)                                                                                                                                                                                                                                                 |
 
 Domain Lambdas back several fields each, routing on the resolved GraphQL field
 (`event.info.fieldName`). AI usage is through two mutations. `generateTaskSteps`
@@ -59,25 +59,32 @@ configured as a secondary mode, but it only works on fields that explicitly opt 
 
 The only fields with auth directives:
 
-| Field | Auth |
-| ----- | ---- |
-| `healthCheck` | `@aws_api_key @aws_cognito_user_pools` — the API key **or** any signed-in user |
-| `listAllUsers`, `listAllTasks`, `listAllOrganizations`, `adminListOrganizationUsers`, `adminGetUserData` | `@aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])` — SystemAdmin group only |
-| `inviteSupportPerson`, `inviteOrganizationAdmin`, `setUserBaseRole`, `setSystemAdmin`, `adminDeleteTask`, `adminDeleteUser`, `adminCreateOrganization`, `adminUpdateOrganization`, `adminDeleteOrganization`, `adminSetUserOrganization` | `@aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])` — SystemAdmin group only (re-checked in the Lambda) |
-| everything else | default Cognito User Pool (any signed-in user) |
+| Field                                                                                                                                                                                                                                    | Auth                                                                                                                                                                                                                                                                                          |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `healthCheck`                                                                                                                                                                                                                            | `@aws_api_key @aws_cognito_user_pools` — the API key **or** any signed-in user                                                                                                                                                                                                                |
+| `listAvailableOrganizations`, `getOrganization`                                                                                                                                                                                          | `@aws_cognito_user_pools(cognito_groups: ["PrimaryUser", "SupportPerson"])` — the read-only organization directory; re-checked in the Lambda. OrganizationAdmin, API-key, and unauthenticated callers are rejected; a SystemAdmin may use it only if they also hold one of the two base roles |
+| `listMySupportList`, `listMySupportLinkHistory`                                                                                                                                                                                          | `@aws_cognito_user_pools(cognito_groups: ["SupportPerson"])` — current effective relationships and unfiltered selection history; re-checked in the Lambda                                                                                                                                     |
+| `listAllUsers`, `listAllTasks`, `listAllOrganizations`, `adminListOrganizationUsers`, `adminGetUserData`                                                                                                                                 | `@aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])` — SystemAdmin group only                                                                                                                                                                                                           |
+| `inviteSupportPerson`, `inviteOrganizationAdmin`, `setUserBaseRole`, `setSystemAdmin`, `adminDeleteTask`, `adminDeleteUser`, `adminCreateOrganization`, `adminUpdateOrganization`, `adminDeleteOrganization`, `adminSetUserOrganization` | `@aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])` — SystemAdmin group only (re-checked in the Lambda)                                                                                                                                                                                |
+| everything else                                                                                                                                                                                                                          | default Cognito User Pool (any signed-in user)                                                                                                                                                                                                                                                |
 
 The frontend needs the `UserPoolId` and `UserPoolClientId` deploy outputs to run the
 Cognito sign-in flow. **Most user-facing data is self-owned or delegated explicitly.**
 Category, task, task-step, and media **writes** are authorized against the target owner via
-`assertCanActForUser`: the owner themselves, or a `SupportPerson` with an ACTIVE selected
-primary user in the same organization may manage that primary user's categories and task
-templates (create/update/delete tasks and steps, reorder, and manage task media). `createTask`
-and `updateTaskOrder` take an optional `userId` (omitted ⇒ the caller); the `taskId`-scoped
-mutations authorize against the loaded task's `ownerId`. Task/media **reads** allow the owner,
-a delegated SupportPerson, or a user holding an active TaskAssignment referencing the task
-(read-only — assignment-based read access never becomes write access). Assignment and
-task-instance operations require the caller to act on their own schedule, or to be a
-`SupportPerson` with an ACTIVE selected primary user in the same organization (see
+`assertCanActForUser`: the owner themselves, or a `SupportPerson` whose SupportLink to that
+primary user is **currently effective** — ACTIVE, target still a `PRIMARY_USER`, both parties
+in the same organization, **and** the link's selection snapshot (organization + both parties'
+internal organization-membership session ids) still matching both live profiles. A link
+selected before either party left or changed organizations is stale and grants nothing — even
+after both rejoin the same organization — until the SupportPerson explicitly calls
+`selectPrimaryUser` again (organization changes also soft-revoke affected links; see the
+SupportLink lifecycle in [docs/API.md](docs/API.md#supportlink-lifecycle--organization-membership-sessions)).
+`createTask` and `updateTaskOrder` take an optional `userId` (omitted ⇒ the caller); the
+`taskId`-scoped mutations authorize against the loaded task's `ownerId`. Task/media **reads**
+allow the owner, a delegated SupportPerson, or a user holding an active TaskAssignment
+referencing the task (read-only — assignment-based read access never becomes write access).
+Assignment and task-instance operations require the caller to act on their own schedule, or to
+be a `SupportPerson` with effective delegation to the target primary user (see
 [src/shared/delegation.ts](src/shared/delegation.ts)).
 The **self-scoped TaskInstance reads** (`getTaskInstance`, `listTaskInstances`,
 `batchGetTaskInstances`) take no `userId`, derive the owner from the caller's `sub`, and reject
@@ -99,6 +106,33 @@ are taken from the authenticated session — clients send only `displayName`,
 `organizationId`, and `accessibilitySettings` (`CreateMyUserProfileInput`); `displayName`
 is required.
 
+### Organization directory and SupportLink lifecycle
+
+`PrimaryUser` and `SupportPerson` can browse joinable organizations through the read-only
+`listAvailableOrganizations` and `getOrganization` queries. Both fields are group-gated at the
+AppSync edge and checked again in the users Lambda. The directory itself exposes only the public
+`Organization` fields and excludes organizations being deleted; it exposes no member data. A
+signed-in user can separately read their own org's lightweight roster through
+`listMyOrganizationUsers`, while cross-org member listings and management remain SystemAdmin-only.
+
+Support delegation is bound to an organization **membership session**, not merely an org id.
+Every real join or move creates a fresh internal `UserProfile.organizationMembershipId`, and a
+leave clears it. `selectPrimaryUser` snapshots the organization and both parties' current
+membership ids onto the link. If either party's organization membership actually changes (join,
+move, or leave), every affected ACTIVE link is immediately ineffective and is soft-revoked;
+returning to the same organization does not restore it. The SupportPerson must explicitly call
+`selectPrimaryUser` again. Re-setting the current org keeps the session and invalidates no current
+relationship.
+
+There is **no bulk migration or backfill for these membership-session fields**. An older in-org
+profile initializes its missing membership id lazily through a conditional write. A legacy
+SupportLink without a complete membership snapshot fails closed and stays out of
+`listMySupportList` until the SupportPerson explicitly re-selects that user. Unfiltered history
+remains available through `listMySupportLinkHistory`. See the full
+[organization directory](docs/API.md#organization-directory-primaryuser--supportperson) and
+[SupportLink lifecycle](docs/API.md#supportlink-lifecycle--organization-membership-sessions)
+contracts.
+
 ### SystemAdmin APIs
 
 SystemAdmin-only operations (in the `canplan-admin-<env>` Lambda) cover read-only listings
@@ -110,26 +144,29 @@ authorization source of truth. `adminListOrganizationUsers(organizationId, limit
 returns one org's members by paging its `OrganizationMember` rows and loading each `UserProfile`
 (rows with a missing profile are skipped):
 
-| Mutation | Effect |
-| -------- | ------ |
-| `inviteSupportPerson(input)` | Create/adopt a Cognito user and add **only** the `SupportPerson` group (never `PrimaryUser`). Idempotent if the user already exists. |
-| `inviteOrganizationAdmin(input)` | Same, adding **only** the `OrganizationAdmin` group. |
-| `setUserBaseRole(input)` | Remove the user from all base groups, then add the one target (`PRIMARY_USER`/`SUPPORT_PERSON`/`ORG_ADMIN`). Mirrors the role onto an existing `UserProfile` (never creates one). `SystemAdmin` is untouched. |
-| `setSystemAdmin(input)` | Grant/revoke the elevated `SystemAdmin` group (base roles untouched). **Self-demotion is rejected** — another admin must do it. |
-| `adminDeleteTask(taskId)` | Delete **any** task regardless of owner, via the same cascade as the owner `deleteTask` (steps, media rows, S3 binaries, category `taskCount`). Idempotent. |
-| `adminDeleteUser(input)` | Fully delete a user: all owned tasks (cascade), every `USER#<id>` partition row, all `SupportLink`s where they are supporter **or** primary user, and finally the Cognito login. Uses PK queries + GSIs (no Scan); the Cognito delete runs **last** so a data-cleanup failure leaves it safely retryable. **Self-deletion is rejected.** |
-| `adminCreateOrganization(input)` | Create an `Organization` row (`ORG#<id>`/`#META`) with a generated id and trimmed name. |
-| `adminUpdateOrganization(input)` | Rename an organization. `NOT_FOUND` if missing; rejected while it is being deleted. |
-| `adminDeleteOrganization(input)` | Mark the org `deleting`, then detach every member found via the **strongly-consistent `OrganizationMember` rows** under the org partition (`ConsistentRead` Query, paginated — no Scan; **not** the eventually-consistent `orgIndex`), each in a transaction that conditionally clears the member's `organizationId` and deletes the membership row, then delete the org row **last**. Idempotent/retryable; returns the org + `removedUsers` count. |
-| `adminSetUserOrganization(input)` | Set or clear **another** user's org membership (admin counterpart of the self-only `updateMyUserProfile`). Reads the target profile first (`NOT_FOUND` if none); joining verifies the org exists/isn't deleting, sets `organizationId`, writes the new `MEMBER#` row and deletes the old one on a move; clearing (`organizationId: null`) removes `organizationId` and the old row — all in one transaction. Returns the updated `UserProfile`. |
+| Mutation                          | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `inviteSupportPerson(input)`      | Create/adopt a Cognito user and add **only** the `SupportPerson` group (never `PrimaryUser`). Idempotent if the user already exists.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `inviteOrganizationAdmin(input)`  | Same, adding **only** the `OrganizationAdmin` group.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `setUserBaseRole(input)`          | Remove the user from all base groups, then add the one target (`PRIMARY_USER`/`SUPPORT_PERSON`/`ORG_ADMIN`). Mirrors the role onto an existing `UserProfile` (never creates one). `SystemAdmin` is untouched.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `setSystemAdmin(input)`           | Grant/revoke the elevated `SystemAdmin` group (base roles untouched). **Self-demotion is rejected** — another admin must do it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `adminDeleteTask(taskId)`         | Delete **any** task regardless of owner, via the same cascade as the owner `deleteTask` (steps, media rows, S3 binaries, category `taskCount`). Idempotent.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `adminDeleteUser(input)`          | Fully delete a user: all owned tasks (cascade), every `USER#<id>` partition row, all `SupportLink`s where they are supporter **or** primary user, and finally the Cognito login. Uses PK queries + GSIs (no Scan); the Cognito delete runs **last** so a data-cleanup failure leaves it safely retryable. **Self-deletion is rejected.**                                                                                                                                                                                                                                                                                                                                             |
+| `adminCreateOrganization(input)`  | Create an `Organization` row (`ORG#<id>`/`#META`) with a generated id and trimmed name.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `adminUpdateOrganization(input)`  | Rename an organization. `NOT_FOUND` if missing; rejected while it is being deleted.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `adminDeleteOrganization(input)`  | Mark the org `deleting`, then detach every member found via the transactionally maintained `OrganizationMember` rows under the org partition (a **strongly consistent** paginated Query — no Scan; **not** the eventually-consistent `orgIndex`), each in a transaction that conditionally clears the member's `organizationId` + membership session and deletes the membership row, then **soft-revokes the member's ACTIVE SupportLinks** (a detach is an org leave), then delete the org row **last**. Idempotent/retryable; returns the org + `removedUsers` count.                                                                                                              |
+| `adminSetUserOrganization(input)` | Set or clear **another** user's org membership (admin counterpart of the self-only `updateMyUserProfile`). Reads the target profile first (`NOT_FOUND` if none); joining verifies the org exists/isn't deleting, sets `organizationId`, writes the new `MEMBER#` row and deletes the old one on a move; clearing (`organizationId: null`) removes `organizationId` and the old row — all in one transaction. Drives the same SupportLink lifecycle as the self-service paths: a real join/move/leave rotates or clears the internal membership session and soft-revokes affected ACTIVE SupportLinks; re-setting the current org changes nothing. Returns the updated `UserProfile`. |
 
-> **Membership rows & backfill:** every non-null `organizationId` write (`createUserProfile` /
+> **OrganizationMember rows in older deployments:** every non-null `organizationId` write
+> (`createUserProfile` /
 > `updateMyUserProfile`) transactionally maintains an `OrganizationMember` row
 > (`ORG#<org>`/`MEMBER#<user>`) so `adminDeleteOrganization` can detach members from a
 > strongly-consistent source rather than the eventually-consistent `orgIndex`. **Existing
 > environments must run a one-time backfill** writing a membership row for every `UserProfile`
 > with a non-null `organizationId` **before** deleting any pre-existing org — see
-> [docs/API.md](docs/API.md#admin-organizations--queries--mutations-systemadmin-only).
+> [docs/API.md](docs/API.md#admin-organizations--queries--mutations-systemadmin-only). This is a
+> pre-existing `OrganizationMember` storage requirement; it is unrelated to the new
+> organization-membership session id, for which there is deliberately no migration.
 
 User ids in these inputs are the app-level `userId` (the Cognito `sub`); the Lambda resolves
 the Cognito `Username` via a `ListUsers` `sub = "…"` filter. `inviteSupportPerson`/
@@ -158,7 +195,8 @@ cannot be renamed or deleted. **Categories are owned by a user's `USER#<ownerId>
 `createCategory`, `updateCategory`, `deleteCategory`, and `listMyCategories` operate on the
 authenticated caller's own categories by default; each also accepts an optional `userId` that
 lets a **SupportPerson** manage a selected primary user's categories through delegated access
-(an ACTIVE SupportLink to that PRIMARY_USER in the same organization — see `assertCanActForUser`).
+(a currently **effective** SupportLink to that PRIMARY_USER — ACTIVE, same organization, and a
+membership snapshot matching both profiles; see `assertCanActForUser`).
 Omitting `userId` (or passing your own) is unchanged self-access; a non-self `userId` keys and
 reparents rows under the **target user's** partition, never the SupportPerson's. Likewise `createTask` and
 `createAiTask` derive the task owner from the identity. Before using a profile's default category, runtime code
@@ -193,10 +231,10 @@ still references the template. See [docs/API.md](docs/API.md) for the full contr
 
 The app deploys two CDK stacks with `--all`.
 
-| Region | Stack | Main resources |
-| ------ | ----- | -------------- |
-| `CANPLAN_BACKEND_REGION` default `ca-central-1` | `canplan-backend-<env>` | AppSync, Cognito, single-table DynamoDB `CanPlanTasks-<env>`, media S3 bucket, `createTask` + domain Lambdas (`users`/`categories`/`tasks`/`assignments`/`media`/`admin`) + `generateTaskSteps` + `createAiTask` Lambdas, `postConfirmation` Cognito trigger Lambda, CloudWatch logs |
-| `CANPLAN_KNOWLEDGE_BASE_REGION` default `us-east-1` | `canplan-knowledge-base-<env>` | Bedrock Knowledge Base, S3 corpus bucket, Bedrock S3 data source, S3 Vectors vector bucket/index |
+| Region                                              | Stack                          | Main resources                                                                                                                                                                                                                                                                       |
+| --------------------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `CANPLAN_BACKEND_REGION` default `ca-central-1`     | `canplan-backend-<env>`        | AppSync, Cognito, single-table DynamoDB `CanPlanTasks-<env>`, media S3 bucket, `createTask` + domain Lambdas (`users`/`categories`/`tasks`/`assignments`/`media`/`admin`) + `generateTaskSteps` + `createAiTask` Lambdas, `postConfirmation` Cognito trigger Lambda, CloudWatch logs |
+| `CANPLAN_KNOWLEDGE_BASE_REGION` default `us-east-1` | `canplan-knowledge-base-<env>` | Bedrock Knowledge Base, S3 corpus bucket, Bedrock S3 data source, S3 Vectors vector bucket/index                                                                                                                                                                                     |
 
 `generateTaskSteps` and `createAiTask` run in `ca-central-1` by default, but call
 Bedrock Agent Runtime and Bedrock Runtime in the Knowledge Base region. CDK passes the KB id
@@ -206,10 +244,10 @@ custom resources.
 The Lambda console will show different functions depending on the selected
 region:
 
-| Region | Lambda functions you should expect |
-| ------ | ---------------------------------- |
-| Backend region | `canplan-createTask-<env>`, `canplan-users-<env>`, `canplan-categories-<env>`, `canplan-tasks-<env>`, `canplan-assignments-<env>`, `canplan-media-<env>`, `canplan-admin-<env>`, `canplan-generateTaskSteps-<env>`, `canplan-createAiTask-<env>`, CDK cross-region reader, destroyable-env S3 auto-delete helper |
-| Knowledge Base region | bucket deployment helper, CDK cross-region writer, destroyable-env S3 auto-delete helper |
+| Region                | Lambda functions you should expect                                                                                                                                                                                                                                                                               |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Backend region        | `canplan-createTask-<env>`, `canplan-users-<env>`, `canplan-categories-<env>`, `canplan-tasks-<env>`, `canplan-assignments-<env>`, `canplan-media-<env>`, `canplan-admin-<env>`, `canplan-generateTaskSteps-<env>`, `canplan-createAiTask-<env>`, CDK cross-region reader, destroyable-env S3 auto-delete helper |
+| Knowledge Base region | bucket deployment helper, CDK cross-region writer, destroyable-env S3 auto-delete helper                                                                                                                                                                                                                         |
 
 ## Prerequisites
 
@@ -355,20 +393,20 @@ aws bedrock-agent start-ingestion-job \
 
 ## Commands
 
-| Command | Purpose |
-| ------- | ------- |
-| `npm run build` | TypeScript build |
-| `npm test` | Jest tests |
-| `npm run lint` | ESLint |
-| `npm run format` | Prettier write |
-| `npm run cdk:synth` | CDK synth; requires `data/corpus/dist` and Docker |
-| `npm run cdk:deploy:me` | Deploy both personal stacks using `CDK_OWNER` from `.env` |
-| `npm run cdk:destroy:me` | Destroy both personal stacks using `CDK_OWNER` from `.env` |
-| `npm run cdk:deploy:sandbox` | Deploy both sandbox stacks |
-| `npm run cdk:destroy:sandbox` | Destroy both sandbox stacks |
-| `npm run cdk:deploy:dev` | Deploy both dev stacks |
-| `npm run cdk:destroy:dev` | Destroy dev stacks, retaining protected data resources |
-| `npm run cdk:deploy:prod` | Deploy both prod stacks |
+| Command                       | Purpose                                                    |
+| ----------------------------- | ---------------------------------------------------------- |
+| `npm run build`               | TypeScript build                                           |
+| `npm test`                    | Jest tests                                                 |
+| `npm run lint`                | ESLint                                                     |
+| `npm run format`              | Prettier write                                             |
+| `npm run cdk:synth`           | CDK synth; requires `data/corpus/dist` and Docker          |
+| `npm run cdk:deploy:me`       | Deploy both personal stacks using `CDK_OWNER` from `.env`  |
+| `npm run cdk:destroy:me`      | Destroy both personal stacks using `CDK_OWNER` from `.env` |
+| `npm run cdk:deploy:sandbox`  | Deploy both sandbox stacks                                 |
+| `npm run cdk:destroy:sandbox` | Destroy both sandbox stacks                                |
+| `npm run cdk:deploy:dev`      | Deploy both dev stacks                                     |
+| `npm run cdk:destroy:dev`     | Destroy dev stacks, retaining protected data resources     |
+| `npm run cdk:deploy:prod`     | Deploy both prod stacks                                    |
 
 There is intentionally no `cdk:destroy:prod` script.
 
@@ -410,14 +448,14 @@ resources. `sandbox` and personal deployments are destroyable. The personal
 scripts also pass `--context personal=true --context owner=<CDK_OWNER>`; unknown
 environment names without that personal flag are rejected.
 
-| Resource | Sandbox/personal destroy | Dev/prod destroy |
-| -------- | ------------------------ | ---------------- |
-| DynamoDB table (single-table) | Deleted | Retained |
-| Media S3 bucket | Emptied and deleted | Retained |
-| Cognito User Pool | Deleted | Retained |
-| KB corpus S3 bucket | Emptied and deleted | Retained |
-| S3 Vectors bucket + index | Deleted | Retained |
-| AppSync, Lambdas, IAM, log groups | Deleted | Deleted |
+| Resource                          | Sandbox/personal destroy | Dev/prod destroy |
+| --------------------------------- | ------------------------ | ---------------- |
+| DynamoDB table (single-table)     | Deleted                  | Retained         |
+| Media S3 bucket                   | Emptied and deleted      | Retained         |
+| Cognito User Pool                 | Deleted                  | Retained         |
+| KB corpus S3 bucket               | Emptied and deleted      | Retained         |
+| S3 Vectors bucket + index         | Deleted                  | Retained         |
+| AppSync, Lambdas, IAM, log groups | Deleted                  | Deleted          |
 
 Dev/prod `cdk destroy` still destroys the stacks and non-retained infrastructure.
 The KB corpus bucket is retained, so the vector index can be rebuilt by deploying
@@ -427,25 +465,25 @@ and re-running ingestion if needed.
 
 Region resolution in [infrastructure/bin/app.ts](infrastructure/bin/app.ts):
 
-| Setting | Resolution order | Default |
-| ------- | ---------------- | ------- |
-| Backend stack region | `--context backendRegion=...`, `CANPLAN_BACKEND_REGION` | `ca-central-1` |
-| Knowledge Base / Bedrock region | `--context knowledgeBaseRegion=...`, legacy `--context bedrockRegion=...`, `CANPLAN_KNOWLEDGE_BASE_REGION`, legacy `BEDROCK_REGION` | `us-east-1` |
+| Setting                         | Resolution order                                                                                                                    | Default        |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | -------------- |
+| Backend stack region            | `--context backendRegion=...`, `CANPLAN_BACKEND_REGION`                                                                             | `ca-central-1` |
+| Knowledge Base / Bedrock region | `--context knowledgeBaseRegion=...`, legacy `--context bedrockRegion=...`, `CANPLAN_KNOWLEDGE_BASE_REGION`, legacy `BEDROCK_REGION` | `us-east-1`    |
 
 Runtime settings on the AI Lambdas (`generateTaskSteps` + `createAiTask`), set by the CDK
 Functions construct and overridable per env:
 
-| Env var | Default | Meaning |
-| ------- | ------- | ------- |
-| `BEDROCK_REGION` | KB region | Region for KB Retrieve, Cohere Rerank, and Converse |
-| `BEDROCK_MODEL_ID` | `us.anthropic.claude-sonnet-4-6` | Generation model / inference profile |
-| `BEDROCK_MAX_TOKENS` | `1024` | Generation cap |
-| `RERANK_COARSE_K` | `25` | Stage-1 vector candidates handed to the reranker |
-| `RERANK_MODEL_ID` | `cohere.rerank-v3-5:0` | Cohere reranker (IAM ARN is coupled to this) |
-| `RERANK_SCORE_FLOOR` | `0.3` | Absolute relevance floor (0–1); rejects low-quality matches |
-| `RERANK_REL_RATIO` | `0.5` | Relative cutoff = topScore × ratio |
-| `RERANK_MIN_RESULTS` | `2` | Min passages kept (only among floor-passing) |
-| `RERANK_MAX_RESULTS` | `5` | Max passages kept (caps prompt length) |
+| Env var              | Default                          | Meaning                                                     |
+| -------------------- | -------------------------------- | ----------------------------------------------------------- |
+| `BEDROCK_REGION`     | KB region                        | Region for KB Retrieve, Cohere Rerank, and Converse         |
+| `BEDROCK_MODEL_ID`   | `us.anthropic.claude-sonnet-4-6` | Generation model / inference profile                        |
+| `BEDROCK_MAX_TOKENS` | `1024`                           | Generation cap                                              |
+| `RERANK_COARSE_K`    | `25`                             | Stage-1 vector candidates handed to the reranker            |
+| `RERANK_MODEL_ID`    | `cohere.rerank-v3-5:0`           | Cohere reranker (IAM ARN is coupled to this)                |
+| `RERANK_SCORE_FLOOR` | `0.3`                            | Absolute relevance floor (0–1); rejects low-quality matches |
+| `RERANK_REL_RATIO`   | `0.5`                            | Relative cutoff = topScore × ratio                          |
+| `RERANK_MIN_RESULTS` | `2`                              | Min passages kept (only among floor-passing)                |
+| `RERANK_MAX_RESULTS` | `5`                              | Max passages kept (caps prompt length)                      |
 
 Retrieval is a two-stage pipeline — coarse KB vector recall (`RERANK_COARSE_K`) then a
 Cohere rerank pass (`src/shared/kb.ts` / `src/shared/rerank.ts`); see
@@ -455,8 +493,8 @@ The **reports** Lambda also needs one secret — the HMAC key that signs the dra
 two-step report flow (`generateReport` → `saveReport`) uses to prove a saved report is exactly
 what the server generated:
 
-| Env var | Default | Meaning |
-| ------- | ------- | ------- |
+| Env var                       | Default                          | Meaning                                                                             |
+| ----------------------------- | -------------------------------- | ----------------------------------------------------------------------------------- |
 | `REPORT_DRAFT_SIGNING_SECRET` | none (required for `dev`/`prod`) | Backend-only HMAC-SHA256 key signing report draft tokens. Never exposed to clients. |
 
 Set it before deploying a shared env (the synth **fails** if it is missing for `dev`/`prod`):

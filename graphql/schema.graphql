@@ -78,7 +78,13 @@ type UserProfile {
   email: String
   # The id of an existing Organization this user belongs to (or null if none). No longer
   # free-form: setting it via createUserProfile/updateMyUserProfile validates the org exists
-  # and is not being deleted. SystemAdmin manages organizations (see listAllOrganizations).
+  # and is not being deleted. PrimaryUser and SupportPerson browse joinable organizations via
+  # listAvailableOrganizations/getOrganization; SystemAdmin manages them (adminCreate/Update/
+  # DeleteOrganization, listAllOrganizations). Any real membership change (join/move/leave)
+  # soft-revokes every affected ACTIVE SupportLink; rejoining does NOT restore them (the
+  # SupportPerson must call selectPrimaryUser again). The profile also keeps an INTERNAL
+  # organization membership session id (rotated on every real join/move, cleared on leave) that
+  # is deliberately not exposed here.
   organizationId: ID
   accessibilitySettings: AWSJSON
   # Id of this user's mandatory default Category (a real Category row with isDefault:true),
@@ -90,8 +96,14 @@ type UserProfile {
   updatedAt: String
 }
 
-# A supporter↔primary-user delegation link. An ACTIVE link (plus a shared organization and a
-# PRIMARY_USER target) grants a SupportPerson delegated access.
+# A supporter↔primary-user delegation link. Lifecycle: selectPrimaryUser writes/restores it
+# ACTIVE (snapshotting, internally, the organization and both parties' membership sessions);
+# unselectPrimaryUser soft-revokes it; and any real organization-membership change by EITHER
+# party (join/move/leave) soft-revokes affected older links automatically. An ACTIVE status alone
+# grants nothing — delegated access also
+# requires the internal selection snapshot to still match both parties' current organization
+# membership, so a link from before an org change stays dead even if both users later rejoin
+# the same organization. Only an explicit re-selection makes it effective again.
 type SupportLink {
   supporterId: ID!
   primaryUserId: ID!
@@ -102,9 +114,11 @@ type SupportLink {
   updatedAt: String
 }
 
-# An organization a UserProfile.organizationId references. Created/managed only by SystemAdmin
-# admin APIs; a user joins one by setting organizationId to an existing org's id (validated
-# server-side). The internal `deleting` marker is never exposed here.
+# An organization a UserProfile.organizationId references. Created/renamed/deleted only by
+# SystemAdmin admin APIs; PrimaryUser and SupportPerson can READ the directory of joinable
+# organizations via listAvailableOrganizations/getOrganization, and a user joins one by setting
+# organizationId to an existing org's id (validated server-side). Internal storage/operational
+# fields (keys, entityType, the `deleting` marker) are never exposed here.
 type Organization {
   organizationId: ID!
   name: String!
@@ -423,6 +437,9 @@ type GeneratedAiTask {
 # role are derived server-side from the Cognito session — never client-supplied —
 # so this input carries only user-editable fields. Cognito group membership is the
 # source of truth for role; UserProfile.role is a server-derived projection of it.
+# This mutation is a full replacement of editable profile fields on a repeated call: omitting
+# organizationId then means leave the current organization, not keep it. Use updateMyUserProfile
+# for partial edits.
 input CreateMyUserProfileInput {
   displayName: String!
   organizationId: ID
@@ -436,7 +453,10 @@ input CreateMyUserProfileInput {
 # unchanged; explicit null ⇒ cleared; a value ⇒ FULL replacement of the stored settings
 # (never merged). organizationId (MVP self-service org membership): omitted ⇒ unchanged; a
 # non-empty string sets it; explicit null clears it. Any signed-in user may change their own
-# organizationId for this MVP (no org-admin gating yet).
+# organizationId for this MVP (no org-admin gating yet). A real JOIN, LEAVE, or MOVE soft-revokes
+# every affected ACTIVE SupportLink touching the caller (both directions);
+# rejoining later does NOT restore them — the SupportPerson must selectPrimaryUser again.
+# Re-supplying the CURRENT organizationId changes nothing and revokes nothing.
 input UpdateMyUserProfileInput {
   displayName: String
   accessibilitySettings: AWSJSON
@@ -444,23 +464,27 @@ input UpdateMyUserProfileInput {
 }
 
 # A SupportPerson selects a PRIMARY_USER in their OWN current organization to support. The
-# supporter is the authenticated caller (never client-supplied). Writes or restores the
-# SupportLink as ACTIVE. Only a SupportPerson may select; the target must be a PRIMARY_USER
-# currently in the caller's organization.
+# supporter is the authenticated caller (never client-supplied). Writes — or explicitly
+# restores a previously REVOKED link — as ACTIVE, snapshotting (internally) the organization
+# and both parties' current membership sessions; this explicit selection is the ONLY way a
+# revoked or stale link becomes effective again. Only a SupportPerson may select; the target
+# must be a PRIMARY_USER currently in the caller's organization, verified atomically against
+# both profiles so a concurrent organization change fails the selection instead of activating
+# a stale relationship.
 input SelectPrimaryUserInput {
   primaryUserId: ID!
 }
 
 # A SupportPerson un-selects a previously selected PRIMARY_USER. The supporter is the
 # authenticated caller. Soft-revokes the SupportLink (status REVOKED) — it is never hard
-# deleted, so re-selecting restores the original row.
+# deleted, so an explicit selectPrimaryUser can restore the original row later.
 input UnselectPrimaryUserInput {
   primaryUserId: ID!
 }
 
 # Create a category. `userId` is optional: omitted/null ⇒ the caller's own categories;
-# a non-self `userId` targets that primary user's categories and requires SupportPerson
-# delegated access (an ACTIVE SupportLink to that primary user in the same organization).
+# a non-self `userId` targets that primary user's categories and requires effective
+# SupportPerson delegation (ACTIVE with a current organization/membership snapshot).
 # The created category is always owned by the target user. `name` may not be the reserved
 # "No Category".
 input CreateCategoryInput {
@@ -495,8 +519,8 @@ input DeleteCategoryInput {
 }
 
 # The target owner is resolved server-side: omitted/null `userId` ⇒ the caller; a non-self
-# `userId` targets that primary user and requires SupportPerson delegated access (an ACTIVE
-# SupportLink to a PRIMARY_USER in the same organization). No arbitrary ownerId is honored. A
+# `userId` targets that primary user and requires effective SupportPerson delegation (ACTIVE
+# with a current organization/membership snapshot). No arbitrary ownerId is honored. A
 # Task is a reusable template only: it carries no schedule (scheduling lives on TaskAssignment).
 input CreateTaskInput {
   # Omitted/null ⇒ the caller. A non-self value requires SupportPerson delegated access.
@@ -516,7 +540,7 @@ input CreateTaskInput {
 # ordered steps and returns them directly. Nothing is persisted. Owner is derived from the
 # Cognito identity.
 input CreateAiTaskInput {
-  query: String!          # the user's request, e.g. "wash my hair"; drives generation + title
+  query: String! # the user's request, e.g. "wash my hair"; drives generation + title
   # Fallback policy (default GROUNDED_ONLY). GROUNDED_ONLY fails with NOT_FOUND when no
   # corpus passage is relevant; ALLOW_UNGROUNDED_FALLBACK generates ungrounded AI steps instead.
   groundingMode: AiTaskGroundingMode = GROUNDED_ONLY
@@ -627,7 +651,7 @@ input DeleteTaskStepInput {
 # scheduleRule + startDate + startTime + timezone (endDate optional). The RRULE's FREQ must be
 # DAILY/WEEKLY/MONTHLY/YEARLY — a missing FREQ or HOURLY/MINUTELY/SECONDLY is rejected.
 # Authorization: the caller must own the referenced Task template, and may only target a userId
-# that is themselves OR a primary user they have actively selected (SupportPerson delegation).
+# that is themselves OR a primary user for whom they hold effective SupportPerson delegation.
 input CreateTaskAssignmentInput {
   taskId: ID!
   userId: ID!
@@ -934,13 +958,45 @@ type Query {
   # org. A SupportPerson uses this to find PRIMARY_USERs they may select. Errors with
   # VALIDATION if the caller has no current organization.
   listMyOrganizationUsers(limit: Int, nextToken: String): UserProfileConnection!
-  # The AUTHENTICATED caller's OWN support list — every primary user they have selected
-  # (supporterIndex, keyed on the caller's sub). Includes ACTIVE and REVOKED links.
+
+  # The read-only ORGANIZATION DIRECTORY: every organization a PrimaryUser or SupportPerson may
+  # join (they join by setting their own organizationId). Newest-first via entityTypeIndex —
+  # the same deterministic ordering as the SystemAdmin listAllOrganizations — never a Scan.
+  # Organizations that are mid-deletion are excluded, and only organizationId/name/createdAt/
+  # updatedAt are exposed (no internal storage fields, no member lists). Restricted to the
+  # PrimaryUser and SupportPerson Cognito groups at the AppSync edge AND re-checked in the
+  # Lambda; OrganizationAdmin, API-key, and unauthenticated callers are not allowed (SystemAdmin
+  # keeps its separate admin APIs). Because the deleting-filter runs after DynamoDB reads a
+  # page, a page may hold fewer than `limit` items while nextToken is non-null — keep paging
+  # until nextToken is null.
+  listAvailableOrganizations(limit: Int, nextToken: String): OrganizationConnection!
+    @aws_cognito_user_pools(cognito_groups: ["PrimaryUser", "SupportPerson"])
+  # Read ONE organization from the directory by id (same PrimaryUser/SupportPerson access and
+  # field exposure as listAvailableOrganizations). Returns null when the organization does not
+  # exist — and likewise when it is currently being deleted (not available to join).
+  getOrganization(organizationId: ID!): Organization
+    @aws_cognito_user_pools(cognito_groups: ["PrimaryUser", "SupportPerson"])
+
+  # The SupportPerson caller's CURRENTLY EFFECTIVE support list: only links that would grant
+  # delegated access right now — ACTIVE, selected in the caller's current organization under
+  # both parties' current membership sessions, target still a PRIMARY_USER in that org. REVOKED
+  # links, links invalidated by either party's organization change, and legacy links without a
+  # selection snapshot are NOT returned (see listMySupportLinkHistory for unfiltered history).
+  # Filtering happens after DynamoDB reads a page, so a page may hold fewer than `limit` items
+  # while nextToken is non-null — keep paging until nextToken is null.
   listMySupportList(limit: Int, nextToken: String): SupportLinkConnection!
+    @aws_cognito_user_pools(cognito_groups: ["SupportPerson"])
+  # History/debug view for a SupportPerson: every primary user they have ever selected, across
+  # all stored statuses (including stale/legacy entries), read consistently from the caller's
+  # natural SUPPORTER# partition.
+  # Presence here says NOTHING about current delegated access; use listMySupportList for the
+  # currently effective relationships.
+  listMySupportLinkHistory(limit: Int, nextToken: String): SupportLinkConnection!
+    @aws_cognito_user_pools(cognito_groups: ["SupportPerson"])
 
   # Categories for a user. `userId` is optional: omitted/null ⇒ the authenticated caller's own
-  # categories; a non-self `userId` lists that primary user's categories and requires SupportPerson
-  # delegated access (an ACTIVE SupportLink to that primary user in the same organization).
+  # categories; a non-self `userId` lists that primary user's categories and requires effective
+  # SupportPerson delegation (ACTIVE with a current organization/membership snapshot).
   listMyCategories(userId: ID, limit: Int, nextToken: String): CategoryConnection!
 
   # Read a task template. The owner may read; a SupportPerson with delegated access to the
@@ -960,7 +1016,11 @@ type Query {
   listTaskAssignmentsForUser(userId: ID!, limit: Int, nextToken: String): TaskAssignmentConnection!
   # The calendar feed over [startDate, endDate] (both YYYY-MM-DD, max 370-day span): active
   # assignments' virtual occurrences overlaid with any real TaskInstance rows.
-  getTaskInstanceViews(userId: ID!, startDate: String!, endDate: String!): TaskInstanceViewConnection!
+  getTaskInstanceViews(
+    userId: ID!
+    startDate: String!
+    endDate: String!
+  ): TaskInstanceViewConnection!
 
   # Read ONE of the caller's own materialized TaskInstances by instanceId. The owner is derived
   # from the Cognito identity — there is no userId argument — so a caller can only ever read their
@@ -972,7 +1032,12 @@ type Query {
   # derived from the Cognito identity — there is no userId argument. This returns ONLY real rows;
   # it never synthesizes virtual occurrences (use getTaskInstanceViews for the virtual+real
   # calendar feed). Paginated by a DynamoDB nextToken. `status` is derived (OVERDUE surfaced).
-  listTaskInstances(startDate: String!, endDate: String!, limit: Int, nextToken: String): TaskInstanceConnection!
+  listTaskInstances(
+    startDate: String!
+    endDate: String!
+    limit: Int
+    nextToken: String
+  ): TaskInstanceConnection!
   # Batch-read up to 100 of the caller's own materialized TaskInstances by id. The owner is
   # derived from the Cognito identity — there is no userId argument. Returns one result per
   # requested id, in the SAME order, with `item: null` for ids that don't exist for the caller.
@@ -980,7 +1045,12 @@ type Query {
   batchGetTaskInstances(instanceIds: [ID!]!): [TaskInstanceLookupResult!]!
 
   # One instance's step snapshots, sorted by `order`.
-  listTaskInstanceSteps(userId: ID!, instanceId: ID!, limit: Int, nextToken: String): TaskInstanceStepConnection!
+  listTaskInstanceSteps(
+    userId: ID!
+    instanceId: ID!
+    limit: Int
+    nextToken: String
+  ): TaskInstanceStepConnection!
   getMediaDownloadUrl(taskId: ID!, assetId: ID!): MediaDownloadTarget
   listMediaForTask(taskId: ID!, limit: Int, nextToken: String): MediaAssetConnection!
 
@@ -1001,32 +1071,42 @@ type Query {
   # The members of ONE organization: pages the strongly-consistent OrganizationMember rows under
   # the org partition (PK = ORG#<id>, SK begins_with MEMBER#; no Scan) and returns their
   # UserProfiles. A membership row whose profile is missing is skipped. Paginated by nextToken.
-  adminListOrganizationUsers(organizationId: ID!, limit: Int, nextToken: String): UserProfileConnection!
-    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  adminListOrganizationUsers(
+    organizationId: ID!
+    limit: Int
+    nextToken: String
+  ): UserProfileConnection! @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 
-  # AI progress reports for a cared-for user. Restricted to a SupportPerson with an ACTIVE
-  # SupportLink to the target PRIMARY_USER in the same organization (a user cannot read their
-  # own reports); see assertCanAccessUserReports.
+  # AI progress reports for a cared-for user. Restricted to a SupportPerson with an effective
+  # SupportLink to the target PRIMARY_USER (ACTIVE with a current organization/membership
+  # snapshot; a user cannot read their own reports); see assertCanAccessUserReports.
   listReports(userId: ID!, limit: Int, nextToken: String): ReportConnection!
   getReportDownloadUrl(userId: ID!, reportId: ID!): MediaDownloadTarget!
 }
 
 type Mutation {
   # Create the signed-in caller's own profile. userId, email, and role are taken
-  # from the Cognito session (role derived from group membership), not the input.
+  # from the Cognito session (role derived from group membership), not the input. Repeated calls
+  # fully replace editable fields; omitted organizationId therefore leaves the current org.
   createUserProfile(input: CreateMyUserProfileInput!): UserProfile
   # Partial update of the caller's OWN profile (owner derived from the Cognito identity).
   # displayName, accessibilitySettings, and organizationId are editable (accessibilitySettings
   # is a full replacement, not a merge; organizationId: omitted ⇒ unchanged, value ⇒ set, null
   # ⇒ clear). Errors (NotFound) if the profile doesn't exist — it never creates one. role,
-  # email, defaultCategoryId, and timestamps cannot be changed here.
+  # email, defaultCategoryId, and timestamps cannot be changed here. A real join/move/leave
+  # soft-revokes every affected ACTIVE SupportLink touching the caller; re-setting the
+  # current organization changes nothing; rejoining never restores revoked links.
   updateMyUserProfile(input: UpdateMyUserProfileInput!): UserProfile!
-  # A SupportPerson selects a PRIMARY_USER in their own organization (writes/restores the
-  # SupportLink as ACTIVE). Supporter = the authenticated caller. Only a SupportPerson may
-  # call this; the target must be a PRIMARY_USER currently in the caller's organization.
+  # A SupportPerson explicitly selects a PRIMARY_USER in their own organization — the ONLY
+  # operation that creates a SupportLink as ACTIVE or restores a REVOKED one to ACTIVE.
+  # Supporter = the authenticated caller (the Cognito SupportPerson group is the authorization
+  # source of truth). The target must be a PRIMARY_USER currently in the caller's organization,
+  # enforced atomically against both live profiles so a concurrent organization change fails
+  # the selection instead of activating a stale relationship.
   selectPrimaryUser(input: SelectPrimaryUserInput!): SupportLink!
   # A SupportPerson un-selects a previously selected primary user — soft-revokes the
   # SupportLink (status REVOKED), never a hard delete. Supporter = the authenticated caller.
+  # Only an explicit selectPrimaryUser restores the link.
   unselectPrimaryUser(input: UnselectPrimaryUserInput!): SupportLink!
 
   # Create a task category. By default the caller's own; a non-self `input.userId` creates it
@@ -1161,8 +1241,7 @@ type Mutation {
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
   # Delete ANY task regardless of owner (same cascade as the owner deleteTask). Returns the
   # deleted Task, or null if it was already gone.
-  adminDeleteTask(taskId: ID!): Task
-    @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
+  adminDeleteTask(taskId: ID!): Task @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
   # Fully delete a user: owned tasks, their USER# partition rows, SupportLinks (both sides),
   # and the Cognito login (last). Deleting yourself is rejected.
   adminDeleteUser(input: AdminDeleteUserInput!): AdminDeleteUserResult!
@@ -1178,14 +1257,17 @@ type Mutation {
   # Delete an Organization: mark it deleting, then detach every member found via the
   # strongly-consistent OrganizationMember rows under the org partition (ConsistentRead query,
   # paginated — no Scan; NOT the eventually-consistent orgIndex), clearing each member's
-  # organizationId and deleting the membership row together, then delete the org row last.
-  # Idempotent/retryable.
+  # organizationId + internal membership session and deleting the membership row together,
+  # then soft-revoking affected SupportLinks, and finally deleting the org row last.
+  # Idempotent/retryable; rejoining later does not restore revoked links.
   adminDeleteOrganization(input: DeleteOrganizationInput!): AdminDeleteOrganizationResult!
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
   # Set or clear ANOTHER user's organization membership (SystemAdmin-only; updateMyUserProfile is
   # self-only). A non-null organizationId joins that org (verified to exist and not be deleting) and
   # writes the new OrganizationMember row (deleting the old one on a move); null clears membership
-  # and deletes the old row. Both happen in one transaction. Returns the updated UserProfile.
+  # and deletes the old row. Both happen in one transaction. A real join/move/leave rotates or
+  # clears the internal membership session and soft-revokes affected SupportLinks; re-setting the
+  # current org preserves the session and revokes nothing. Returns the updated UserProfile.
   adminSetUserOrganization(input: AdminSetUserOrganizationInput!): UserProfile!
     @aws_cognito_user_pools(cognito_groups: ["SystemAdmin"])
 }
