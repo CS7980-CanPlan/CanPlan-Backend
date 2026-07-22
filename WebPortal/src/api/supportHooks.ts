@@ -15,6 +15,7 @@ import {
   deleteTaskAssignment,
   deleteTaskStep,
   endTaskAssignment,
+  getTaskInstanceViews,
   getTask,
   getUserProfile,
   listAllMyOrganizationUsers,
@@ -49,6 +50,7 @@ import type {
 const LIST_PAGE_SIZE = 100;
 /** Owned-template pages are small so "Load more" is visible well before the 50-task cap. */
 const OWNED_TASKS_PAGE_SIZE = 25;
+const SUPPORT_CALENDAR_KEY = ['support', 'calendar'] as const;
 
 /** Centralized query keys so hooks and invalidation can't drift apart. */
 export const supportKeys = {
@@ -58,6 +60,8 @@ export const supportKeys = {
   tasks: (ownerId: string) => ['support', 'tasks', ownerId] as const,
   categories: (userId: string) => ['support', 'categories', userId] as const,
   assignments: (userId: string) => ['support', 'assignments', userId] as const,
+  calendars: SUPPORT_CALENDAR_KEY,
+  calendar: (userId: string) => [...SUPPORT_CALENDAR_KEY, userId] as const,
   ownedTasks: (ownerId: string) => ['support', 'ownedTasks', ownerId] as const,
   task: (taskId: string) => ['support', 'task', taskId] as const,
   taskSteps: (taskId: string) => ['support', 'taskSteps', taskId] as const,
@@ -65,7 +69,7 @@ export const supportKeys = {
 
 // ── Queries ──────────────────────────────────────────────────────────────────────
 /**
- * The caller's COMPLETE support list (ACTIVE + REVOKED), all pages drained. Kept in the
+ * The caller's COMPLETE currently-effective support list, all pages drained. Kept in the
  * connection shape ({ items, nextToken: null }) so existing consumers reading `data.items`
  * see the full list without changes.
  */
@@ -121,6 +125,22 @@ export function useUserAssignments(userId: string | undefined) {
 }
 
 /**
+ * A supported user's virtual + materialized calendar for one inclusive date window.
+ * The backend returns the whole window, so there is no pagination to drain here.
+ */
+export function useUserCalendar(
+  userId: string | undefined,
+  startDate: string,
+  endDate: string,
+) {
+  return useQuery({
+    queryKey: [...supportKeys.calendar(userId ?? ''), startDate, endDate] as const,
+    queryFn: () => getTaskInstanceViews(userId as string, startDate, endDate),
+    enabled: Boolean(userId && startDate && endDate),
+  });
+}
+
+/**
  * ALL of one user's assignments, every page drained. The Tasks module filters these by
  * taskId client-side (there is no by-task query), so partial pages would wrongly hide
  * assignments that live beyond the first cursor. Its key extends
@@ -148,6 +168,7 @@ export function useUpdateMyUserProfile(userId: string | undefined) {
       if (userId) qc.invalidateQueries({ queryKey: supportKeys.profile(userId) });
       qc.invalidateQueries({ queryKey: supportKeys.orgUsers });
       qc.invalidateQueries({ queryKey: supportKeys.supportList });
+      qc.invalidateQueries({ queryKey: supportKeys.calendars });
     },
   });
 }
@@ -164,7 +185,10 @@ export function useUnselectPrimaryUser() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: UnselectPrimaryUserInput) => unselectPrimaryUser(input),
-    onSuccess: () => qc.invalidateQueries({ queryKey: supportKeys.supportList }),
+    onSuccess: (link) => {
+      qc.invalidateQueries({ queryKey: supportKeys.supportList });
+      qc.removeQueries({ queryKey: supportKeys.calendar(link.primaryUserId) });
+    },
   });
 }
 
@@ -238,6 +262,8 @@ export function useUpdateTask(ownerId: string | undefined) {
     onSuccess: (task) => {
       invalidateTaskDetail(qc, task.taskId);
       invalidateOwnerTaskLists(qc, ownerId);
+      // Calendar titles are resolved live from task metadata.
+      qc.invalidateQueries({ queryKey: supportKeys.calendars });
     },
   });
 }
@@ -251,6 +277,7 @@ export function useDeleteTask(ownerId: string | undefined) {
       qc.removeQueries({ queryKey: supportKeys.task(deleted.taskId) });
       qc.removeQueries({ queryKey: supportKeys.taskSteps(deleted.taskId) });
       invalidateOwnerTaskLists(qc, ownerId);
+      qc.invalidateQueries({ queryKey: supportKeys.calendars });
     },
   });
 }
@@ -293,8 +320,10 @@ export function useCreateTaskAssignment() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: CreateTaskAssignmentInput) => createTaskAssignment(input),
-    onSuccess: (assignment) =>
-      qc.invalidateQueries({ queryKey: supportKeys.assignments(assignment.userId) }),
+    onSuccess: (assignment) => {
+      qc.invalidateQueries({ queryKey: supportKeys.assignments(assignment.userId) });
+      qc.invalidateQueries({ queryKey: supportKeys.calendar(assignment.userId) });
+    },
   });
 }
 
@@ -302,8 +331,10 @@ export function useEndTaskAssignment() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: EndTaskAssignmentInput) => endTaskAssignment(input),
-    onSuccess: (assignment) =>
-      qc.invalidateQueries({ queryKey: supportKeys.assignments(assignment.userId) }),
+    onSuccess: (assignment) => {
+      qc.invalidateQueries({ queryKey: supportKeys.assignments(assignment.userId) });
+      qc.invalidateQueries({ queryKey: supportKeys.calendar(assignment.userId) });
+    },
   });
 }
 
@@ -311,7 +342,9 @@ export function useDeleteTaskAssignment() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: DeleteTaskAssignmentInput) => deleteTaskAssignment(input),
-    onSuccess: (assignment) =>
-      qc.invalidateQueries({ queryKey: supportKeys.assignments(assignment.userId) }),
+    onSuccess: (assignment) => {
+      qc.invalidateQueries({ queryKey: supportKeys.assignments(assignment.userId) });
+      qc.invalidateQueries({ queryKey: supportKeys.calendar(assignment.userId) });
+    },
   });
 }

@@ -1,6 +1,6 @@
-import { type ReactNode } from 'react';
+import { useEffect, type ReactNode } from 'react';
 import { ArrowLeft, ClipboardList, FolderTree, ListChecks, RefreshCw } from 'lucide-react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useLocation, useParams } from 'react-router-dom';
 import {
   useUserAssignments,
   useUserCategories,
@@ -15,6 +15,7 @@ import { Spinner } from '../../components/ui/Spinner';
 import { MetricStrip } from '../admin/components/MetricStrip';
 import { Panel } from '../admin/components/Panel';
 import { formatDate, IdCell, RoleBadge, StatusBadge } from '../admin/components/display';
+import { SupportedUserCalendar } from './calendar/SupportedUserCalendar';
 import styles from '../admin/admin.module.css';
 
 /**
@@ -25,6 +26,7 @@ import styles from '../admin/admin.module.css';
  */
 export default function SupportUserDetailPage() {
   const { userId = '' } = useParams<{ userId: string }>();
+  const location = useLocation();
 
   const profileQuery = useUserProfile(userId);
   const tasksQuery = useTasksByOwner(userId);
@@ -42,6 +44,12 @@ export default function SupportUserDetailPage() {
     tasksQuery.isFetching ||
     categoriesQuery.isFetching ||
     assignmentsQuery.isFetching;
+
+  useEffect(() => {
+    if (location.hash === '#calendar') {
+      document.getElementById('calendar')?.scrollIntoView({ block: 'start' });
+    }
+  }, [location.hash]);
 
   function refetchAll() {
     profileQuery.refetch();
@@ -73,7 +81,7 @@ export default function SupportUserDetailPage() {
             onClick={refetchAll}
             disabled={anyFetching}
           >
-            Refresh
+            Refresh details
           </Button>
         </div>
       </div>
@@ -111,6 +119,8 @@ export default function SupportUserDetailPage() {
           <Alert variant="warning">This user does not have a profile record yet.</Alert>
         )}
       </Panel>
+
+      <SupportedUserCalendar userId={userId} displayName={displayName} />
 
       <Section icon={<ListChecks size={17} />} title="Tasks" count={tasks.length}>
         <ListBody

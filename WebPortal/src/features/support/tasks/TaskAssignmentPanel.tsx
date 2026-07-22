@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { CalendarClock, CalendarOff, OctagonX, Send, Users } from 'lucide-react';
 import {
@@ -52,7 +52,13 @@ const FREQUENCY_OPTIONS: SelectOption[] = [
  * "review" user selector. There is also no update mutation — changing a schedule means
  * ending/stopping the old assignment and creating a new one.
  */
-export function TaskAssignmentPanel({ taskId }: { taskId: string }) {
+export function TaskAssignmentPanel({
+  taskId,
+  initialTargetUserId,
+}: {
+  taskId: string;
+  initialTargetUserId?: string;
+}) {
   const supportListQuery = useMySupportList();
   const orgUsersQuery = useMyOrganizationUsers();
 
@@ -85,6 +91,27 @@ export function TaskAssignmentPanel({ taskId }: { taskId: string }) {
     () => (supportListQuery.data?.items ?? []).filter((link) => link.status === 'ACTIVE'),
     [supportListQuery.data],
   );
+  const appliedInitialTarget = useRef<string | null>(null);
+
+  useEffect(() => {
+    const nextTarget = initialTargetUserId?.trim();
+    if (!nextTarget) {
+      appliedInitialTarget.current = null;
+      return;
+    }
+    if (
+      supportListQuery.isLoading ||
+      supportListQuery.isError ||
+      appliedInitialTarget.current === nextTarget
+    ) {
+      return;
+    }
+    if (activeLinks.some((link) => link.primaryUserId === nextTarget)) {
+      appliedInitialTarget.current = nextTarget;
+      setTargetUserId(nextTarget);
+      setReviewUserId(nextTarget);
+    }
+  }, [activeLinks, initialTargetUserId, supportListQuery.isError, supportListQuery.isLoading]);
 
   /** userId → display name, resolved from the caller's organization roster. */
   const rosterNames = useMemo(() => {
@@ -115,7 +142,9 @@ export function TaskAssignmentPanel({ taskId }: { taskId: string }) {
 
     const errors: Record<string, string> = {};
     const tz = timezone.trim();
-    if (!targetUserId) errors.target = 'Choose who this task is assigned to.';
+    if (!targetUserId || !activeLinks.some((link) => link.primaryUserId === targetUserId)) {
+      errors.target = 'Choose a person you actively support.';
+    }
     if (!tz) errors.timezone = 'A timezone is required.';
     if (scheduleType === 'ONE_TIME') {
       if (!oneTimeAt) errors.oneTimeAt = 'Pick the date and time.';
@@ -187,6 +216,12 @@ export function TaskAssignmentPanel({ taskId }: { taskId: string }) {
   }
 
   const supportListReady = !supportListQuery.isLoading && !supportListQuery.isError;
+  const normalizedInitialTarget = initialTargetUserId?.trim() ?? '';
+  const initialTargetIsActive = activeLinks.some(
+    (link) => link.primaryUserId === normalizedInitialTarget,
+  );
+  const initialTargetIsSelected =
+    initialTargetIsActive && targetUserId === normalizedInitialTarget;
 
   return (
     <Panel
@@ -217,6 +252,21 @@ export function TaskAssignmentPanel({ taskId }: { taskId: string }) {
 
       {supportListReady && activeLinks.length > 0 && (
         <>
+          {normalizedInitialTarget && initialTargetIsSelected && (
+            <div style={{ marginBottom: '0.85rem' }}>
+              <Alert variant="info" title="Supported user preselected">
+                The assignment form is ready for {nameOf(normalizedInitialTarget)}.
+              </Alert>
+            </div>
+          )}
+          {normalizedInitialTarget && !initialTargetIsActive && (
+            <div style={{ marginBottom: '0.85rem' }}>
+              <Alert variant="warning" title="That user is no longer available">
+                Choose someone from your current support list before assigning this task.
+              </Alert>
+            </div>
+          )}
+
           {/* ── Create an assignment ────────────────────────────────────────── */}
           <form className={adminStyles.panelForm} onSubmit={handleCreate} noValidate>
             <div className={adminStyles.formRow}>
@@ -341,7 +391,10 @@ export function TaskAssignmentPanel({ taskId }: { taskId: string }) {
             )}
             {lastCreated && !createMutation.isError && (
               <Alert variant="success" title="Assignment created">
-                {nameOf(lastCreated.userId)} — {describeSchedule(lastCreated)}
+                {nameOf(lastCreated.userId)} — {describeSchedule(lastCreated)}.{' '}
+                <Link to={`/support/users/${encodeURIComponent(lastCreated.userId)}#calendar`}>
+                  View calendar
+                </Link>
               </Alert>
             )}
 

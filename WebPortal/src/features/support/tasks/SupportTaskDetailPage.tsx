@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { ArrowLeft, ClipboardList, Save, ShieldAlert, Trash2 } from 'lucide-react';
 import { useAuth } from '../../../auth/useAuth';
 import {
@@ -37,6 +37,9 @@ export default function SupportTaskDetailPage() {
   const { user } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const [searchParams] = useSearchParams();
+  const assignTo = searchParams.get('assignTo')?.trim() ?? '';
+  const assignQuery = assignTo ? `?assignTo=${encodeURIComponent(assignTo)}` : '';
 
   const taskQuery = useTask(taskId);
   const task = taskQuery.data;
@@ -51,7 +54,7 @@ export default function SupportTaskDetailPage() {
 
   return (
     <div>
-      <Link to="/support/tasks" className={adminStyles.backLink}>
+      <Link to={`/support/tasks${assignQuery}`} className={adminStyles.backLink}>
         <ArrowLeft size={15} /> Back to my task templates
       </Link>
 
@@ -74,7 +77,12 @@ export default function SupportTaskDetailPage() {
           people you support are visible read-only from their page under “People I support”.
         </Alert>
       ) : (
-        <OwnedTaskDetail task={task} ownerId={user!.userId} onDeleted={() => navigate('/support/tasks')} />
+        <OwnedTaskDetail
+          task={task}
+          ownerId={user!.userId}
+          initialTargetUserId={assignTo || undefined}
+          onDeleted={() => navigate(`/support/tasks${assignQuery}`)}
+        />
       )}
     </div>
   );
@@ -84,10 +92,12 @@ export default function SupportTaskDetailPage() {
 function OwnedTaskDetail({
   task,
   ownerId,
+  initialTargetUserId,
   onDeleted,
 }: {
   task: Task;
   ownerId: string;
+  initialTargetUserId?: string;
   onDeleted: () => void;
 }) {
   return (
@@ -107,7 +117,10 @@ function OwnedTaskDetail({
       <TaskStepsPanel taskId={task.taskId} />
       <div style={{ height: '1.25rem' }} />
       <div id="assignments">
-        <TaskAssignmentPanel taskId={task.taskId} />
+        <TaskAssignmentPanel
+          taskId={task.taskId}
+          initialTargetUserId={initialTargetUserId}
+        />
       </div>
       <div style={{ height: '1.25rem' }} />
       <DeleteTaskSection taskId={task.taskId} ownerId={ownerId} onDeleted={onDeleted} />

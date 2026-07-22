@@ -80,6 +80,33 @@ export interface TaskAssignment {
   updatedAt?: string | null;
 }
 
+export type TaskInstanceStatus =
+  | 'TO_DO'
+  | 'IN_PROGRESS'
+  | 'OVERDUE'
+  | 'COMPLETED'
+  | 'SKIPPED'
+  | 'CANCELLED';
+
+/**
+ * One calendar occurrence returned by getTaskInstanceViews. A virtual occurrence comes from
+ * an active schedule rule and has no persisted TaskInstance yet (`instanceId: null`).
+ */
+export interface TaskInstanceView {
+  instanceId: string | null;
+  assignmentId: string;
+  taskId: string;
+  userId: string;
+  title: string;
+  scheduledDate: string;
+  scheduledTime: string;
+  scheduledFor: string;
+  timezone: string;
+  status: TaskInstanceStatus;
+  isVirtual: boolean;
+  isException: boolean;
+}
+
 export type SupportLinkStatus = 'PENDING' | 'ACTIVE' | 'REVOKED';
 
 export interface SupportLink {
@@ -136,6 +163,12 @@ export interface CategoryConnection {
 
 export interface TaskAssignmentConnection {
   items: TaskAssignment[];
+  nextToken: string | null;
+}
+
+/** getTaskInstanceViews always returns the complete requested window (`nextToken: null`). */
+export interface TaskInstanceViewConnection {
+  items: TaskInstanceView[];
   nextToken: string | null;
 }
 

@@ -78,6 +78,21 @@ const TASK_ASSIGNMENT_FIELDS = `
   updatedAt
 `;
 
+const TASK_INSTANCE_VIEW_FIELDS = `
+  instanceId
+  assignmentId
+  taskId
+  userId
+  title
+  scheduledDate
+  scheduledTime
+  scheduledFor
+  timezone
+  status
+  isVirtual
+  isException
+`;
+
 // ── Queries ──────────────────────────────────────────────────────────────────────
 export const GET_USER_PROFILE = /* GraphQL */ `
   query GetUserProfile($userId: ID!) {
@@ -87,7 +102,7 @@ export const GET_USER_PROFILE = /* GraphQL */ `
   }
 `;
 
-/** The caller's OWN support list (every primary user they selected — ACTIVE + REVOKED). */
+/** The caller's currently effective support relationships (ACTIVE, current membership). */
 export const LIST_MY_SUPPORT_LIST = /* GraphQL */ `
   query ListMySupportList($limit: Int, $nextToken: String) {
     listMySupportList(limit: $limit, nextToken: $nextToken) {
@@ -161,6 +176,18 @@ export const LIST_TASK_ASSIGNMENTS_FOR_USER = /* GraphQL */ `
     listTaskAssignmentsForUser(userId: $userId, limit: $limit, nextToken: $nextToken) {
       items {
         ${TASK_ASSIGNMENT_FIELDS}
+      }
+      nextToken
+    }
+  }
+`;
+
+/** Virtual schedule occurrences overlaid with any real TaskInstance rows in the date window. */
+export const GET_TASK_INSTANCE_VIEWS = /* GraphQL */ `
+  query GetTaskInstanceViews($userId: ID!, $startDate: String!, $endDate: String!) {
+    getTaskInstanceViews(userId: $userId, startDate: $startDate, endDate: $endDate) {
+      items {
+        ${TASK_INSTANCE_VIEW_FIELDS}
       }
       nextToken
     }

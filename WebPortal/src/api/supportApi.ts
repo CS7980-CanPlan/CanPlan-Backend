@@ -19,6 +19,7 @@ import type {
   TaskAssignment,
   TaskAssignmentConnection,
   TaskConnection,
+  TaskInstanceViewConnection,
   TaskStep,
   TaskStepConnection,
   UnselectPrimaryUserInput,
@@ -37,6 +38,7 @@ import {
   DELETE_TASK_ASSIGNMENT,
   DELETE_TASK_STEP,
   END_TASK_ASSIGNMENT,
+  GET_TASK_INSTANCE_VIEWS,
   GET_TASK,
   GET_USER_PROFILE,
   LIST_MY_CATEGORIES,
@@ -70,9 +72,8 @@ export async function listMySupportList(args: PageArgs = {}): Promise<SupportLin
 }
 
 /**
- * Drain EVERY page of the caller's support list. Consumers filter it (e.g. to ACTIVE links
- * for the assignment target selector), so a single truncated page could hide selectable
- * users — or misreport "no one to support" when page one happens to be all REVOKED.
+ * Drain EVERY page of the caller's effective support list. The backend filters stale links
+ * after each DynamoDB page, so a sparse early page can still be followed by effective users.
  */
 export async function listAllMySupportList(): Promise<SupportLink[]> {
   const links: SupportLink[] = [];
@@ -140,6 +141,22 @@ export async function listTaskAssignmentsForUser(
     { userId, limit: args.limit, nextToken: args.nextToken ?? null },
   );
   return data.listTaskAssignmentsForUser;
+}
+
+/**
+ * Read one supported user's calendar. The backend returns virtual schedule occurrences and
+ * overlays real TaskInstances for the inclusive date window; it always returns one full page.
+ */
+export async function getTaskInstanceViews(
+  userId: string,
+  startDate: string,
+  endDate: string,
+): Promise<TaskInstanceViewConnection> {
+  const data = await gqlRequest<{ getTaskInstanceViews: TaskInstanceViewConnection }>(
+    GET_TASK_INSTANCE_VIEWS,
+    { userId, startDate, endDate },
+  );
+  return data.getTaskInstanceViews;
 }
 
 /**

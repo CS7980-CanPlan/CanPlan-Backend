@@ -1,5 +1,5 @@
 import { useMemo, useState, type FormEvent } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowLeft, ClipboardPlus, ListOrdered } from 'lucide-react';
 import { useAuth } from '../../../auth/useAuth';
 import { useCreateTask, useUserCategories } from '../../../api/supportHooks';
@@ -25,6 +25,9 @@ const DEFAULT_CATEGORY_VALUE = '';
 export default function SupportTaskCreatePage() {
   const { user } = useAuth();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const assignTo = searchParams.get('assignTo')?.trim() ?? '';
+  const assignQuery = assignTo ? `?assignTo=${encodeURIComponent(assignTo)}` : '';
 
   const categoriesQuery = useUserCategories(user?.userId);
   const createMutation = useCreateTask(user?.userId);
@@ -76,13 +79,16 @@ export default function SupportTaskCreatePage() {
     }
 
     createMutation.mutate(input, {
-      onSuccess: (task) => navigate(`/support/tasks/${encodeURIComponent(task.taskId)}`),
+      onSuccess: (task) =>
+        navigate(
+          `/support/tasks/${encodeURIComponent(task.taskId)}${assignQuery}${assignTo ? '#assignments' : ''}`,
+        ),
     });
   }
 
   return (
     <div>
-      <Link to="/support/tasks" className={adminStyles.backLink}>
+      <Link to={`/support/tasks${assignQuery}`} className={adminStyles.backLink}>
         <ArrowLeft size={15} /> Back to my task templates
       </Link>
 
@@ -175,7 +181,7 @@ export default function SupportTaskCreatePage() {
           <Button
             variant="ghost"
             disabled={createMutation.isPending}
-            onClick={() => navigate('/support/tasks')}
+            onClick={() => navigate(`/support/tasks${assignQuery}`)}
           >
             Cancel
           </Button>

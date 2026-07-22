@@ -1,8 +1,13 @@
 import { useMemo, useState, type FormEvent } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { CalendarClock, ListChecks, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { useAuth } from '../../../auth/useAuth';
-import { useDeleteTask, useOwnedTasks, useUserCategories } from '../../../api/supportHooks';
+import {
+  useDeleteTask,
+  useMySupportList,
+  useOwnedTasks,
+  useUserCategories,
+} from '../../../api/supportHooks';
 import { gqlErrorMessage } from '../../../api/graphqlError';
 import type { Task } from '../../../api/apiTypes';
 import { Alert } from '../../../components/ui/Alert';
@@ -15,7 +20,7 @@ import {
   ConfirmDangerAction,
   confirmationMatches,
 } from '../../admin/components/ConfirmDangerAction';
-import { formatDate } from '../../admin/components/display';
+import { formatDate, IdCell } from '../../admin/components/display';
 import adminStyles from '../../admin/admin.module.css';
 import styles from './tasks.module.css';
 
@@ -27,11 +32,22 @@ import styles from './tasks.module.css';
 export default function SupportTasksPage() {
   const { user } = useAuth();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const ownerId = user?.userId;
+  const assignTo = searchParams.get('assignTo')?.trim() ?? '';
+  const assignQuery = assignTo ? `?assignTo=${encodeURIComponent(assignTo)}` : '';
 
   const tasksQuery = useOwnedTasks(ownerId);
   const categoriesQuery = useUserCategories(ownerId);
+  const supportListQuery = useMySupportList();
   const deleteMutation = useDeleteTask(ownerId);
+
+  const assignTargetIsActive = Boolean(
+    assignTo &&
+      supportListQuery.data?.items.some(
+        (link) => link.status === 'ACTIVE' && link.primaryUserId === assignTo,
+      ),
+  );
 
   const [pendingDelete, setPendingDelete] = useState<Task | null>(null);
   const [confirmText, setConfirmText] = useState('');
@@ -77,6 +93,43 @@ export default function SupportTasksPage() {
         </p>
       </div>
 
+      {assignTo && supportListQuery.isLoading && (
+        <div style={{ marginBottom: '1rem' }}>
+          <Alert variant="info" title="Checking the selected user">
+            Confirming that this person is still in your active support list…
+          </Alert>
+        </div>
+      )}
+
+      {assignTo && supportListQuery.isError && (
+        <div style={{ marginBottom: '1rem' }}>
+          <Alert variant="warning" title="Could not confirm the selected user">
+            You can still open a template, but you will need to choose a person from your active
+            support list before assigning it.
+          </Alert>
+        </div>
+      )}
+
+      {assignTo && supportListQuery.isSuccess && assignTargetIsActive && (
+        <div style={{ marginBottom: '1rem' }}>
+          <Alert variant="info" title="Choose a template to assign">
+            The Assign button will preselect the supported user <IdCell id={assignTo} />.{' '}
+            <Link to={`/support/users/${encodeURIComponent(assignTo)}#calendar`}>
+              Back to their calendar
+            </Link>
+          </Alert>
+        </div>
+      )}
+
+      {assignTo && supportListQuery.isSuccess && !assignTargetIsActive && (
+        <div style={{ marginBottom: '1rem' }}>
+          <Alert variant="warning" title="That user is no longer available">
+            This person is not in your active support list. Open a template and choose another
+            supported user before assigning it.
+          </Alert>
+        </div>
+      )}
+
       <div className={adminStyles.toolbar}>
         <span className={adminStyles.toolbarMeta}>
           {tasksQuery.isSuccess ? `${tasks.length} template(s) loaded` : ' '}
@@ -95,7 +148,7 @@ export default function SupportTasksPage() {
           <Button
             size="sm"
             icon={<Plus size={14} />}
-            onClick={() => navigate('/support/tasks/new')}
+            onClick={() => navigate(`/support/tasks/new${assignQuery}`)}
           >
             New task
           </Button>
@@ -160,7 +213,10 @@ export default function SupportTasksPage() {
             description="Create your first reusable task, then assign it to the people you support."
           />
           <div style={{ display: 'grid', placeItems: 'center', paddingBottom: '1.5rem' }}>
-            <Button icon={<Plus size={15} />} onClick={() => navigate('/support/tasks/new')}>
+            <Button
+              icon={<Plus size={15} />}
+              onClick={() => navigate(`/support/tasks/new${assignQuery}`)}
+            >
               Create a task
             </Button>
           </div>
@@ -198,7 +254,9 @@ export default function SupportTasksPage() {
                     variant="secondary"
                     icon={<CalendarClock size={14} />}
                     onClick={() =>
-                      navigate(`/support/tasks/${encodeURIComponent(task.taskId)}#assignments`)
+                      navigate(
+                        `/support/tasks/${encodeURIComponent(task.taskId)}${assignQuery}#assignments`,
+                      )
                     }
                   >
                     Assign

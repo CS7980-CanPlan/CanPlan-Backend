@@ -7,7 +7,9 @@ common landing page:
   admins, change base roles, grant or revoke SystemAdmin), organizations and membership, and
   destructive data actions (delete any task, fully delete a user).
 - **Support portal** (`/support`, `SupportPerson`), tabbed into: **People I support** (open a
-  supported user to review their tasks, categories, and schedule via delegated access);
+  supported user to review their tasks, categories, assignments, and month calendar via
+  delegated access; the calendar distinguishes virtual schedule occurrences from materialized
+  task instances);
   **Manage people** (add/remove primary users from your own organization —
   `selectPrimaryUser` / `unselectPrimaryUser`; users in other orgs are never visible);
   **Tasks** (create and manage your OWN task templates and assign them to supported users —
@@ -110,6 +112,7 @@ src/
     landing/      Public portal landing (links to each sign-in)
     login/        Shared login card, admin sign-in, forced-new-password form
     support/      Support-person portal: sign-in, shell/layout, home, manage, profile, user detail
+      calendar/   Delegated month calendar: virtual schedules + real TaskInstance overlays
       tasks/      Tasks module: template list/create/detail, step editor, assignment panel
     forbidden/    Forbidden screen (authenticated users lacking the area's group)
     admin/        Admin shell, overview, users, tasks, organizations, dangerous actions
@@ -140,6 +143,13 @@ templates **they own** and schedules them for supported users.
 | `/support/tasks/:taskId` | Template detail: metadata editing, step editing/reordering/appending, the assignment workflow, and deletion |
 
 All three live inside the existing `RequireSupportPerson` / `SupportLayout` guard.
+
+The supported-user detail route (`/support/users/:userId`) also contains a six-week calendar
+powered by `getTaskInstanceViews`. It groups the returned `scheduledDate`/`scheduledTime` in
+each assignment's schedule timezone, labels virtual occurrences as **Scheduled**, and labels
+materialized rows as **Task instance**. Its **Assign a task** action carries
+`?assignTo=<userId>` into the task-template flow, where the assignment panel verifies that the
+user is still actively supported before preselecting them.
 
 ### Owned templates vs. a supported user's own tasks
 
