@@ -4,12 +4,14 @@
  */
 import type {
   CategoryConnection,
+  CreateAiTaskInput,
   CreateTaskAssignmentInput,
   CreateTaskInput,
   CreateTaskStepInput,
   DeleteTaskAssignmentInput,
   DeleteTaskStepInput,
   EndTaskAssignmentInput,
+  GeneratedAiTask,
   PageArgs,
   ReorderTaskStepsInput,
   SelectPrimaryUserInput,
@@ -31,6 +33,7 @@ import type {
 } from './apiTypes';
 import { gqlRequest } from './graphqlClient';
 import {
+  CREATE_AI_TASK,
   CREATE_TASK,
   CREATE_TASK_ASSIGNMENT,
   CREATE_TASK_STEP,
@@ -64,10 +67,13 @@ export async function getUserProfile(userId: string): Promise<UserProfile | null
 }
 
 export async function listMySupportList(args: PageArgs = {}): Promise<SupportLinkConnection> {
-  const data = await gqlRequest<{ listMySupportList: SupportLinkConnection }>(LIST_MY_SUPPORT_LIST, {
-    limit: args.limit,
-    nextToken: args.nextToken ?? null,
-  });
+  const data = await gqlRequest<{ listMySupportList: SupportLinkConnection }>(
+    LIST_MY_SUPPORT_LIST,
+    {
+      limit: args.limit,
+      nextToken: args.nextToken ?? null,
+    },
+  );
   return data.listMySupportList;
 }
 
@@ -86,9 +92,7 @@ export async function listAllMySupportList(): Promise<SupportLink[]> {
   return links;
 }
 
-export async function listMyOrganizationUsers(
-  args: PageArgs = {},
-): Promise<UserProfileConnection> {
+export async function listMyOrganizationUsers(args: PageArgs = {}): Promise<UserProfileConnection> {
   const data = await gqlRequest<{ listMyOrganizationUsers: UserProfileConnection }>(
     LIST_MY_ORGANIZATION_USERS,
     { limit: args.limit, nextToken: args.nextToken ?? null },
@@ -160,10 +164,8 @@ export async function getTaskInstanceViews(
 }
 
 /**
- * Drain EVERY page of one user's assignments. The Tasks module filters assignments by
- * taskId CLIENT-side (there is no by-task query), so it must see the complete set — a
- * partially-loaded list would wrongly report "no assignments of this task" whenever the
- * matching rows live on a later page.
+ * Drain EVERY page of one user's assignments. User-centered schedule management must include
+ * active and ended rules beyond the first DynamoDB/AppSync page.
  */
 export async function listAllTaskAssignmentsForUser(userId: string): Promise<TaskAssignment[]> {
   const assignments: TaskAssignment[] = [];
@@ -214,9 +216,7 @@ export async function listAllTaskSteps(taskId: string): Promise<TaskStep[]> {
 
 // ── Mutations ────────────────────────────────────────────────────────────────────
 /** Update the caller's own profile (displayName / organizationId / accessibilitySettings). */
-export async function updateMyUserProfile(
-  input: UpdateMyUserProfileInput,
-): Promise<UserProfile> {
+export async function updateMyUserProfile(input: UpdateMyUserProfileInput): Promise<UserProfile> {
   const data = await gqlRequest<{ updateMyUserProfile: UserProfile }>(UPDATE_MY_USER_PROFILE, {
     input,
   });
@@ -236,6 +236,12 @@ export async function unselectPrimaryUser(input: UnselectPrimaryUserInput): Prom
 }
 
 // ── Task-template mutations ──────────────────────────────────────────────────────
+/** Generate a task preview only; the backend does not persist the returned title or steps. */
+export async function createAiTask(input: CreateAiTaskInput): Promise<GeneratedAiTask> {
+  const data = await gqlRequest<{ createAiTask: GeneratedAiTask }>(CREATE_AI_TASK, { input });
+  return data.createAiTask;
+}
+
 /** Create a task template owned by the CALLER (the input carries no userId by design). */
 export async function createTask(input: CreateTaskInput): Promise<Task> {
   const data = await gqlRequest<{ createTask: Task }>(CREATE_TASK, { input });

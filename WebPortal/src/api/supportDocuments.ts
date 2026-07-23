@@ -221,6 +221,28 @@ export const UNSELECT_PRIMARY_USER = /* GraphQL */ `
 `;
 
 // ── Task-template mutations (SupportPerson-owned templates) ──────────────────────
+/** Generate a source-aware task preview. This mutation does not persist a task or its steps. */
+export const CREATE_AI_TASK = /* GraphQL */ `
+  mutation CreateAiTask($input: CreateAiTaskInput!) {
+    createAiTask(input: $input) {
+      title
+      steps {
+        text
+        citations {
+          chunkId
+          title
+          url
+          snippet
+        }
+      }
+      grounded
+      source
+      inputTokens
+      outputTokens
+    }
+  }
+`;
+
 /**
  * Create a task template owned by the CALLER. The portal never sends `input.userId`, so
  * the returned ownerId is always the authenticated SupportPerson's sub. The response echoes

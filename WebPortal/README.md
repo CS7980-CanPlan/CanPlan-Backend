@@ -139,8 +139,8 @@ templates **they own** and schedules them for supported users.
 | Route | Purpose |
 | ----- | ------- |
 | `/support/tasks` | "My task templates" — the caller's own templates (`listTasksByOwner` on the caller's Cognito `sub`), with create / open / assign / delete actions and cursor-based "Load more" pagination |
-| `/support/tasks/new` | Create a template: title, optional description, one of the caller's own categories, and an ordered text-step editor (add / remove / reorder before creation) |
-| `/support/tasks/:taskId` | Template detail: metadata editing, step editing/reordering/appending, the assignment workflow, and deletion |
+| `/support/tasks/new` | Create a template manually or generate a reviewable AI preview, then edit its title, category, description, and ordered text steps before saving |
+| `/support/tasks/:taskId` | Template detail: metadata editing, step editing/reordering/appending, creating a new assignment, and deletion |
 
 All three live inside the existing `RequireSupportPerson` / `SupportLayout` guard.
 
@@ -149,7 +149,20 @@ powered by `getTaskInstanceViews`. It groups the returned `scheduledDate`/`sched
 each assignment's schedule timezone, labels virtual occurrences as **Scheduled**, and labels
 materialized rows as **Task instance**. Its **Assign a task** action carries
 `?assignTo=<userId>` into the task-template flow, where the assignment panel verifies that the
-user is still actively supported before preselecting them.
+user is still actively supported before preselecting them. A user-centric **Existing
+assignments** panel directly below the calendar drains every assignment page and provides
+schedule replacement, future cutoff, and immediate soft-stop actions. It defaults to active
+schedules and can switch to ended/stopped history or all schedules; the backend does not expose
+whether an inactive row was ended versus soft-stopped, so those states are grouped together.
+
+### AI-assisted task drafts
+
+The create-template page calls `createAiTask` with every input the backend exposes: required
+`query`, `groundingMode` (`GROUNDED_ONLY` by default or
+`ALLOW_UNGROUNDED_FALLBACK`), and an optional exact `stepCount` from 1 through 20. The mutation
+persists nothing. It returns a title, ordered steps, grounding/source status, citations, and token
+usage for review. The supporter must explicitly apply the preview to the ordinary editable form
+and then save with `createTask`; citations are review-only because `TaskStep` has no citation field.
 
 ### Owned templates vs. a supported user's own tasks
 
@@ -179,16 +192,18 @@ the task and its steps.
   DAILY/WEEKLY/MONTHLY/YEARLY frequencies), `startDate` (`YYYY-MM-DD`), `startTime`
   (`HH:mm`), optional `endDate` (not before `startDate`), and `timezone`. Fields of the
   other schedule type are never mixed in.
-- Assignments are stored **per target user** (`listTaskAssignmentsForUser`), so the review
-  section has its own supported-user selector and filters the result to the current task —
-  after draining **every** `nextToken` page, so matches beyond the first page are never
-  missed. The support list and org roster reads drain all pages for the same reason (a
-  truncated page must not hide assignable people). Active and ended rows are shown
-  distinctly with human-readable schedules.
-- There is **no update-assignment mutation**: to change a schedule, stop
-  (`deleteTaskAssignment`, immediate soft-delete) or end (`endTaskAssignment` from a chosen
-  `effectiveDate`) the old assignment and create a new one. Both actions require an inline
-  confirmation, and the target user's assignment cache is invalidated afterwards.
+- Assignments are stored **per target user** (`listTaskAssignmentsForUser`) and managed from
+  that user's detail page after draining **every** `nextToken` page. The support list and org
+  roster reads drain all pages for the same reason (a truncated page must not hide assignable
+  people). Active, historically capped, stopped, and ended rows are shown with task and
+  assignment provenance.
+- There is **no update-assignment mutation**. **Edit schedule** creates a replacement first,
+  then calls `endTaskAssignment` with the replacement's local start date so the old recurring
+  rule retains earlier occurrences but cannot overlap the replacement. These two backend calls
+  are not atomic; if ending fails after creation, the UI keeps both rows visible and retries
+  only the ending step. `deleteTaskAssignment` remains the immediate soft-stop action. Existing
+  materialized TaskInstances are never deleted by either operation, and assignment/calendar
+  caches are invalidated after every successful mutation.
 
 ### Task deletion
 

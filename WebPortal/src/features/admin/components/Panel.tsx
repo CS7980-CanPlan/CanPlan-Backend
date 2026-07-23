@@ -13,9 +13,13 @@ export function Panel({ title, description, icon, children }: PanelProps) {
   return (
     <section className={styles.panel}>
       <div className={styles.panelHead}>
-        {icon && <span className={styles.panelIcon} aria-hidden="true">{icon}</span>}
+        {icon && (
+          <span className={styles.panelIcon} aria-hidden="true">
+            {icon}
+          </span>
+        )}
         <div>
-          <div className={styles.panelTitle}>{title}</div>
+          <h2 className={styles.panelTitle}>{title}</h2>
           {description && <div className={styles.panelDesc}>{description}</div>}
         </div>
       </div>

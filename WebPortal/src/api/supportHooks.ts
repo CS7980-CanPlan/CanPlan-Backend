@@ -8,6 +8,7 @@
  */
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
+  createAiTask,
   createTask,
   createTaskAssignment,
   createTaskStep,
@@ -33,6 +34,7 @@ import {
   updateTaskStep,
 } from './supportApi';
 import type {
+  CreateAiTaskInput,
   CreateTaskAssignmentInput,
   CreateTaskInput,
   CreateTaskStepInput,
@@ -128,11 +130,7 @@ export function useUserAssignments(userId: string | undefined) {
  * A supported user's virtual + materialized calendar for one inclusive date window.
  * The backend returns the whole window, so there is no pagination to drain here.
  */
-export function useUserCalendar(
-  userId: string | undefined,
-  startDate: string,
-  endDate: string,
-) {
+export function useUserCalendar(userId: string | undefined, startDate: string, endDate: string) {
   return useQuery({
     queryKey: [...supportKeys.calendar(userId ?? ''), startDate, endDate] as const,
     queryFn: () => getTaskInstanceViews(userId as string, startDate, endDate),
@@ -141,9 +139,8 @@ export function useUserCalendar(
 }
 
 /**
- * ALL of one user's assignments, every page drained. The Tasks module filters these by
- * taskId client-side (there is no by-task query), so partial pages would wrongly hide
- * assignments that live beyond the first cursor. Its key extends
+ * ALL of one user's assignments, every page drained for the user-centered management panel.
+ * Its key extends
  * `supportKeys.assignments(userId)`, so the assignment-mutation hooks' prefix invalidation
  * refreshes this and the single-page variant together.
  */
@@ -246,12 +243,22 @@ function invalidateOwnerTaskLists(qc: ReturnType<typeof useQueryClient>, ownerId
   qc.invalidateQueries({ queryKey: supportKeys.tasks(ownerId) });
 }
 
+/** Generate a non-persisted AI task preview; no query cache changes until createTask is used. */
+export function useCreateAiTask() {
+  return useMutation({
+    mutationFn: (input: CreateAiTaskInput) => createAiTask(input),
+  });
+}
+
 /** Create an OWNED task template. Invalidates the owner's template list. */
 export function useCreateTask(ownerId: string | undefined) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: CreateTaskInput) => createTask(input),
     onSuccess: () => invalidateOwnerTaskLists(qc, ownerId),
+    // A transport failure can hide a successful non-idempotent create; mark lists stale so
+    // reviewing them before retrying reveals any task that did reach the backend.
+    onError: () => invalidateOwnerTaskLists(qc, ownerId),
   });
 }
 
@@ -323,6 +330,12 @@ export function useCreateTaskAssignment() {
     onSuccess: (assignment) => {
       qc.invalidateQueries({ queryKey: supportKeys.assignments(assignment.userId) });
       qc.invalidateQueries({ queryKey: supportKeys.calendar(assignment.userId) });
+    },
+    // createTaskAssignment allocates a new id, so an ambiguous response must be reconciled
+    // against the target user's refreshed list before the caller retries.
+    onError: (_error, input) => {
+      qc.invalidateQueries({ queryKey: supportKeys.assignments(input.userId) });
+      qc.invalidateQueries({ queryKey: supportKeys.calendar(input.userId) });
     },
   });
 }

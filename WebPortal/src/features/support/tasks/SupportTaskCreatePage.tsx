@@ -3,13 +3,14 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowLeft, ClipboardPlus, ListOrdered } from 'lucide-react';
 import { useAuth } from '../../../auth/useAuth';
 import { useCreateTask, useUserCategories } from '../../../api/supportHooks';
-import { gqlErrorMessage } from '../../../api/graphqlError';
+import { gqlErrorMessage, hasGraphqlErrorResponse } from '../../../api/graphqlError';
 import type { CreateTaskInput } from '../../../api/apiTypes';
 import { Alert } from '../../../components/ui/Alert';
 import { Button } from '../../../components/ui/Button';
 import { Select } from '../../../components/ui/Select';
 import { TextField } from '../../../components/ui/TextField';
 import { Panel } from '../../admin/components/Panel';
+import { AiTaskGenerator } from './AiTaskGenerator';
 import { TextAreaField } from './TextAreaField';
 import { StepDraftEditor, newStepDraft, type StepDraft } from './StepDraftEditor';
 import adminStyles from '../../admin/admin.module.css';
@@ -38,6 +39,8 @@ export default function SupportTaskCreatePage() {
   const [steps, setSteps] = useState<StepDraft[]>(() => [newStepDraft()]);
   const [titleError, setTitleError] = useState<string | undefined>();
   const [stepErrors, setStepErrors] = useState<Record<string, string>>({});
+  const [createOutcomeUnknown, setCreateOutcomeUnknown] = useState(false);
+  const formLocked = createMutation.isPending || createOutcomeUnknown;
 
   /** "Default / No Category" (omit categoryId) plus the caller's real non-default categories. */
   const categoryOptions = useMemo(() => {
@@ -52,7 +55,7 @@ export default function SupportTaskCreatePage() {
 
   function handleSubmit(event: FormEvent) {
     event.preventDefault();
-    if (createMutation.isPending) return;
+    if (formLocked) return;
 
     const trimmedTitle = title.trim();
     const nextTitleError = trimmedTitle ? undefined : 'Title is required.';
@@ -78,11 +81,19 @@ export default function SupportTaskCreatePage() {
       });
     }
 
+    setCreateOutcomeUnknown(false);
     createMutation.mutate(input, {
       onSuccess: (task) =>
         navigate(
           `/support/tasks/${encodeURIComponent(task.taskId)}${assignQuery}${assignTo ? '#assignments' : ''}`,
         ),
+      onError: (error) => {
+        if (hasGraphqlErrorResponse(error)) return;
+        setCreateOutcomeUnknown(true);
+        window.requestAnimationFrame(() => {
+          document.getElementById('review-created-task-outcome')?.focus();
+        });
+      },
     });
   }
 
@@ -95,10 +106,30 @@ export default function SupportTaskCreatePage() {
       <div className={adminStyles.pageHead}>
         <h1 className={adminStyles.pageTitle}>Create a task template</h1>
         <p className={adminStyles.pageSubtitle}>
-          The template will be owned by you. You can assign it to people you support from its
-          detail page afterwards.
+          The template will be owned by you. You can assign it to people you support from its detail
+          page afterwards.
         </p>
       </div>
+
+      <AiTaskGenerator
+        disabled={formLocked}
+        hasExistingDraft={Boolean(
+          title.trim() || steps.some((step) => step.text.trim() || step.description.trim()),
+        )}
+        onApply={(preview) => {
+          setTitle(preview.title);
+          setSteps(
+            preview.steps.map((step) => ({
+              ...newStepDraft(),
+              text: step.text,
+            })),
+          );
+          setTitleError(undefined);
+          setStepErrors({});
+        }}
+      />
+
+      <div style={{ height: '1.25rem' }} />
 
       <form onSubmit={handleSubmit} noValidate>
         <Panel
@@ -108,11 +139,12 @@ export default function SupportTaskCreatePage() {
         >
           <div className={adminStyles.panelForm}>
             <TextField
+              id="task-title"
               label="Title"
               required
               value={title}
               error={titleError}
-              disabled={createMutation.isPending}
+              disabled={formLocked}
               onChange={(e) => {
                 setTitle(e.target.value);
                 if (titleError) setTitleError(undefined);
@@ -122,14 +154,14 @@ export default function SupportTaskCreatePage() {
             <TextAreaField
               label="Description (optional)"
               value={description}
-              disabled={createMutation.isPending}
+              disabled={formLocked}
               onChange={(e) => setDescription(e.target.value)}
             />
             <Select
               label="Category"
               options={categoryOptions}
               value={categoryId}
-              disabled={createMutation.isPending || categoriesQuery.isLoading}
+              disabled={formLocked || categoriesQuery.isLoading}
               hint={
                 categoriesQuery.isLoading
                   ? 'Loading your categories…'
@@ -139,8 +171,8 @@ export default function SupportTaskCreatePage() {
             />
             {categoriesQuery.isError && (
               <Alert variant="warning" title="Could not load your categories">
-                {gqlErrorMessage(categoriesQuery.error)} You can still create the task — it will
-                be filed under your default category.
+                {gqlErrorMessage(categoriesQuery.error)} You can still create the task — it will be
+                filed under your default category.
               </Alert>
             )}
           </div>
@@ -160,7 +192,7 @@ export default function SupportTaskCreatePage() {
               setStepErrors({});
             }}
             errors={stepErrors}
-            disabled={createMutation.isPending}
+            disabled={formLocked}
           />
         </Panel>
 
@@ -168,14 +200,35 @@ export default function SupportTaskCreatePage() {
 
         {createMutation.isError && (
           <div style={{ marginBottom: '1rem' }}>
-            <Alert variant="error" title="Could not create the task">
-              {gqlErrorMessage(createMutation.error)}
+            <Alert
+              variant="error"
+              title={
+                createOutcomeUnknown
+                  ? 'Could not confirm whether the task was created'
+                  : 'Could not create the task'
+              }
+            >
+              {gqlErrorMessage(createMutation.error)}{' '}
+              {createOutcomeUnknown && (
+                <>
+                  The request may have reached the backend.{' '}
+                  <Link id="review-created-task-outcome" to={`/support/tasks${assignQuery}`}>
+                    Review my task templates
+                  </Link>{' '}
+                  before trying again so you do not create a duplicate.
+                </>
+              )}
             </Alert>
           </div>
         )}
 
         <div className={adminStyles.formActions}>
-          <Button type="submit" loading={createMutation.isPending} icon={<ClipboardPlus size={15} />}>
+          <Button
+            type="submit"
+            loading={createMutation.isPending}
+            disabled={createOutcomeUnknown}
+            icon={<ClipboardPlus size={15} />}
+          >
             Create task
           </Button>
           <Button

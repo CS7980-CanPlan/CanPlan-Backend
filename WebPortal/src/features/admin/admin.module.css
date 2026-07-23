@@ -170,6 +170,7 @@
   flex-shrink: 0;
 }
 .panelTitle {
+  margin: 0;
   font-size: 0.975rem;
   font-weight: 700;
 }

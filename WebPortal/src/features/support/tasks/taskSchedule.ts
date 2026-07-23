@@ -1,7 +1,8 @@
 /**
  * Schedule helpers for the Tasks module: build the RRULE the backend expects and render a
- * stored TaskAssignment schedule as a human-readable sentence. The backend accepts only
- * FREQ=DAILY/WEEKLY/MONTHLY/YEARLY (+ optional INTERVAL), so that is all we ever generate.
+ * stored TaskAssignment schedule as a human-readable sentence. This portal creates only
+ * FREQ=DAILY/WEEKLY/MONTHLY/YEARLY (+ optional INTERVAL), but the backend can store richer
+ * RRULE options, which are shown explicitly rather than simplified incorrectly.
  */
 import type { TaskAssignment } from '../../../api/apiTypes';
 
@@ -27,12 +28,18 @@ const FREQ_UNIT: Record<RecurrenceFrequency, [singular: string, plural: string]>
 };
 
 /** Parse `FREQ` and `INTERVAL` back out of a stored RRULE (tolerates an `RRULE:` prefix). */
-function parseRrule(rule: string): { frequency?: RecurrenceFrequency; interval?: number } {
+export function parseRrule(rule: string): {
+  frequency?: RecurrenceFrequency;
+  interval?: number;
+} {
   const parts = rule.replace(/^RRULE:/i, '').split(';');
   const result: { frequency?: RecurrenceFrequency; interval?: number } = {};
   for (const part of parts) {
     const [key, value] = part.split('=');
-    if (key?.toUpperCase() === 'FREQ' && RECURRENCE_FREQUENCIES.includes(value as RecurrenceFrequency)) {
+    if (
+      key?.toUpperCase() === 'FREQ' &&
+      RECURRENCE_FREQUENCIES.includes(value as RecurrenceFrequency)
+    ) {
       result.frequency = value as RecurrenceFrequency;
     }
     if (key?.toUpperCase() === 'INTERVAL') {
@@ -74,6 +81,14 @@ export function describeSchedule(assignment: TaskAssignment): string {
   const { frequency, interval } = assignment.scheduleRule
     ? parseRrule(assignment.scheduleRule)
     : {};
+  const normalizedRule = assignment.scheduleRule?.replace(/^RRULE:/i, '') ?? '';
+  const hasAdvancedOptions = normalizedRule
+    .split(';')
+    .filter(Boolean)
+    .some((part) => {
+      const key = part.split('=')[0]?.toUpperCase();
+      return key !== 'FREQ' && key !== 'INTERVAL';
+    });
   const every = frequency
     ? interval && interval > 1
       ? `Every ${interval} ${FREQ_UNIT[frequency][1]}`
@@ -84,6 +99,9 @@ export function describeSchedule(assignment: TaskAssignment): string {
   const at = assignment.startTime ? ` at ${assignment.startTime}` : '';
   const from = assignment.startDate ? ` from ${assignment.startDate}` : '';
   const until = assignment.endDate ? ` until ${assignment.endDate}` : '';
+  if (hasAdvancedOptions) {
+    return `Advanced recurrence (${normalizedRule})${at}${from}${until} (${assignment.timezone})`;
+  }
   return `${every}${at}${from}${until} (${assignment.timezone})`;
 }
 
@@ -94,4 +112,25 @@ export function todayIsoDate(): string {
   const month = String(now.getMonth() + 1).padStart(2, '0');
   const day = String(now.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
+}
+
+/** Today's YYYY-MM-DD in a schedule's timezone (falls back to the browser timezone). */
+export function todayIsoDateInTimezone(timezone: string): string {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(new Date());
+    const valueOf = (type: Intl.DateTimeFormatPartTypes) =>
+      parts.find((part) => part.type === type)?.value;
+    const year = valueOf('year');
+    const month = valueOf('month');
+    const day = valueOf('day');
+    if (year && month && day) return `${year}-${month}-${day}`;
+  } catch {
+    // Invalid legacy timezone: use the same browser-local fallback as a new assignment.
+  }
+  return todayIsoDate();
 }

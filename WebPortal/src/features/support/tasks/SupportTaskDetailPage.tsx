@@ -28,7 +28,7 @@ import adminStyles from '../../admin/admin.module.css';
 
 /**
  * `/support/tasks/:taskId` — detail/editing for one OWNED task template: metadata editing,
- * the step editor, the assignment workflow, and deletion. getTask also succeeds for tasks
+ * the step editor, new-assignment form, and deletion. getTask also succeeds for tasks
  * the caller can merely read (delegated or assigned access), so the page explicitly verifies
  * `task.ownerId === caller` and refuses to manage anything it doesn't own.
  */
@@ -88,7 +88,7 @@ export default function SupportTaskDetailPage() {
   );
 }
 
-/** Everything below the guard: editing, steps, assignments, and the danger zone. */
+/** Everything below the guard: editing, steps, assignment creation, and the danger zone. */
 function OwnedTaskDetail({
   task,
   ownerId,
@@ -118,6 +118,7 @@ function OwnedTaskDetail({
       <div style={{ height: '1.25rem' }} />
       <div id="assignments">
         <TaskAssignmentPanel
+          key={task.taskId}
           taskId={task.taskId}
           initialTargetUserId={initialTargetUserId}
         />
@@ -271,7 +272,7 @@ function DeleteTaskSection({
   return (
     <Panel
       title="Delete this template"
-      description="Permanently removes the task and all of its steps. The backend rejects deletion while any ACTIVE assignment still references this task — stop or end those in the Assignments panel first. Snapshots of occurrences a user already started are kept."
+      description="Permanently removes the task and all of its steps. The backend rejects deletion while any ACTIVE assignment still references this task — stop or end those below the supported user's calendar first. Snapshots of occurrences a user already started are kept."
       icon={<Trash2 size={16} />}
     >
       <form className={adminStyles.panelForm} onSubmit={handleSubmit}>

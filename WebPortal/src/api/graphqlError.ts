@@ -13,3 +13,9 @@ export function gqlErrorMessage(error: unknown): string {
   if (serverMessage) return serverMessage;
   return authErrorMessage(error);
 }
+
+/** True when AppSync returned a GraphQL application error instead of an ambiguous transport loss. */
+export function hasGraphqlErrorResponse(error: unknown): boolean {
+  const errors = (error as { response?: { errors?: unknown[] } })?.response?.errors;
+  return Array.isArray(errors) && errors.length > 0;
+}

@@ -2,7 +2,7 @@ import { useEffect, type ReactNode } from 'react';
 import { ArrowLeft, ClipboardList, FolderTree, ListChecks, RefreshCw } from 'lucide-react';
 import { Link, useLocation, useParams } from 'react-router-dom';
 import {
-  useUserAssignments,
+  useUserAssignmentsAll,
   useUserCategories,
   useUserProfile,
   useTasksByOwner,
@@ -14,15 +14,15 @@ import { EmptyState } from '../../components/ui/EmptyState';
 import { Spinner } from '../../components/ui/Spinner';
 import { MetricStrip } from '../admin/components/MetricStrip';
 import { Panel } from '../admin/components/Panel';
-import { formatDate, IdCell, RoleBadge, StatusBadge } from '../admin/components/display';
+import { formatDate, IdCell, RoleBadge } from '../admin/components/display';
 import { SupportedUserCalendar } from './calendar/SupportedUserCalendar';
+import { SupportedUserAssignments } from './tasks/SupportedUserAssignments';
 import styles from '../admin/admin.module.css';
 
 /**
- * Read-only detail of one supported primary user at `/support/users/:userId`: their profile,
- * task templates, categories, and schedule rules — all via SupportPerson delegated-access
- * reads (an ACTIVE SupportLink to this user is required for the delegated lists). Reached
- * from the support home.
+ * Detail of one supported primary user at `/support/users/:userId`: delegated profile/task
+ * reads plus calendar and schedule management. An effective SupportLink is required for every
+ * user-scoped query and mutation.
  */
 export default function SupportUserDetailPage() {
   const { userId = '' } = useParams<{ userId: string }>();
@@ -31,12 +31,12 @@ export default function SupportUserDetailPage() {
   const profileQuery = useUserProfile(userId);
   const tasksQuery = useTasksByOwner(userId);
   const categoriesQuery = useUserCategories(userId);
-  const assignmentsQuery = useUserAssignments(userId);
+  const assignmentsQuery = useUserAssignmentsAll(userId);
 
   const profile = profileQuery.data;
   const tasks = tasksQuery.data?.items ?? [];
   const categories = categoriesQuery.data?.items ?? [];
-  const assignments = assignmentsQuery.data?.items ?? [];
+  const assignments = assignmentsQuery.data ?? [];
 
   const displayName = profile?.displayName || profile?.email || userId;
   const anyFetching =
@@ -46,10 +46,16 @@ export default function SupportUserDetailPage() {
     assignmentsQuery.isFetching;
 
   useEffect(() => {
-    if (location.hash === '#calendar') {
-      document.getElementById('calendar')?.scrollIntoView({ block: 'start' });
+    const targetId =
+      location.hash === '#calendar'
+        ? 'calendar'
+        : location.hash === '#assignments'
+          ? 'assignments'
+          : '';
+    if (targetId) {
+      document.getElementById(targetId)?.scrollIntoView({ block: 'start' });
     }
-  }, [location.hash]);
+  }, [location.hash, userId]);
 
   function refetchAll() {
     profileQuery.refetch();
@@ -122,6 +128,13 @@ export default function SupportUserDetailPage() {
 
       <SupportedUserCalendar userId={userId} displayName={displayName} />
 
+      <SupportedUserAssignments
+        key={userId}
+        userId={userId}
+        displayName={displayName}
+        primaryUserTasks={tasks}
+      />
+
       <Section icon={<ListChecks size={17} />} title="Tasks" count={tasks.length}>
         <ListBody
           query={tasksQuery}
@@ -132,7 +145,9 @@ export default function SupportUserDetailPage() {
             {tasks.map((task) => (
               <tr key={task.taskId}>
                 <td className={styles.cellPrimary}>{task.title}</td>
-                <td><IdCell id={task.taskId} /></td>
+                <td>
+                  <IdCell id={task.taskId} />
+                </td>
                 <td>{task.categoryId ? <IdCell id={task.categoryId} /> : <Dash />}</td>
                 <td className={styles.cellMuted}>{formatDate(task.createdAt)}</td>
               </tr>
@@ -152,28 +167,10 @@ export default function SupportUserDetailPage() {
               <tr key={cat.categoryId}>
                 <td className={styles.cellPrimary}>{cat.name}</td>
                 <td>{cat.isDefault ? 'Yes' : <Dash />}</td>
-                <td><IdCell id={cat.categoryId} /></td>
+                <td>
+                  <IdCell id={cat.categoryId} />
+                </td>
                 <td className={styles.cellMuted}>{formatDate(cat.createdAt)}</td>
-              </tr>
-            ))}
-          </Table>
-        </ListBody>
-      </Section>
-
-      <Section icon={<ClipboardList size={17} />} title="Assignments" count={assignments.length}>
-        <ListBody
-          query={assignmentsQuery}
-          empty="This user has no schedule rules."
-          loadingLabel="Loading assignments…"
-        >
-          <Table head={['Assignment id', 'Task id', 'Schedule', 'Active', 'Assigned']}>
-            {assignments.map((a) => (
-              <tr key={a.assignmentId}>
-                <td><IdCell id={a.assignmentId} /></td>
-                <td><IdCell id={a.taskId} /></td>
-                <td><StatusBadge status={a.scheduleType} /></td>
-                <td>{a.active ? 'Yes' : <Dash />}</td>
-                <td className={styles.cellMuted}>{formatDate(a.assignedAt)}</td>
               </tr>
             ))}
           </Table>
@@ -205,8 +202,8 @@ function ListBody({
   if (query.isError) {
     return (
       <Alert variant="error" title="Could not load this section">
-        {authErrorMessage(query.error)} You can only view this data while you actively support
-        this user.
+        {authErrorMessage(query.error)} You can only view this data while you actively support this
+        user.
       </Alert>
     );
   }
@@ -258,7 +255,11 @@ function Table({ head, children }: { head: string[]; children: ReactNode }) {
       <div className={styles.tableScroll}>
         <table className={styles.table}>
           <thead>
-            <tr>{head.map((h) => <th key={h}>{h}</th>)}</tr>
+            <tr>
+              {head.map((h) => (
+                <th key={h}>{h}</th>
+              ))}
+            </tr>
           </thead>
           <tbody>{children}</tbody>
         </table>

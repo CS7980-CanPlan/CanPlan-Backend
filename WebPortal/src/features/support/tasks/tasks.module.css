@@ -155,7 +155,195 @@
   min-width: 0;
 }
 
+/* ── AI task preview ───────────────────────────────────────────────────────── */
+.aiParameterGrid {
+  display: grid;
+  gap: 0.85rem;
+}
+
+@media (min-width: 700px) {
+  .aiParameterGrid {
+    grid-template-columns: minmax(0, 1.4fr) minmax(12rem, 0.6fr);
+  }
+}
+
+.aiGenerationHelp {
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+}
+
+.aiPreview {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  margin-top: 1rem;
+  padding: 0.9rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-bg);
+}
+
+.aiPreviewHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.aiPreviewEyebrow {
+  color: var(--color-text-muted);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.aiPreviewTitle {
+  margin: 0.15rem 0 0;
+  font-size: 1.05rem;
+  overflow-wrap: anywhere;
+}
+
+.aiPreviewSteps {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  margin: 0;
+  padding-left: 1.6rem;
+}
+
+.aiPreviewStep {
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+}
+
+.aiPreviewStep::marker {
+  color: var(--color-primary);
+  font-weight: 700;
+}
+
+.aiPreviewStepText {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.aiCitationDetails {
+  margin-top: 0.5rem;
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+}
+
+.aiCitationDetails > summary {
+  cursor: pointer;
+  color: var(--color-primary);
+  font-weight: 600;
+}
+
+.aiCitationList {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  margin: 0.55rem 0 0;
+  padding-left: 1.1rem;
+}
+
+.aiCitationTitle {
+  color: var(--color-text);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.aiCitationTitle a {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+}
+
+.aiCitationSnippet {
+  margin: 0.2rem 0;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.aiCitationId {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  overflow-wrap: anywhere;
+}
+
+.aiTokenUsage,
+.aiPreviewFootnote {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
+.aiAppliedNotice {
+  margin-top: 0.1rem;
+}
+
 /* ── Assignment list ─────────────────────────────────────────────────────────── */
+.assignmentAnchor {
+  scroll-margin-top: 8rem;
+  margin-top: 1.25rem;
+}
+
+.assignmentLoading {
+  min-height: 10rem;
+  display: grid;
+  place-items: center;
+}
+
+.assignmentError {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+
+.assignmentNotice {
+  margin-bottom: 0.75rem;
+}
+
+.assignmentEmptyAction {
+  display: grid;
+  place-items: center;
+  padding-bottom: 1rem;
+}
+
+.assignmentFilterToolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 0.65rem 1rem;
+  margin-bottom: 0.85rem;
+}
+
+.assignmentFilterControl {
+  width: min(100%, 22rem);
+}
+
+.assignmentFilterSummary {
+  margin: 0 0 0.25rem;
+  color: var(--color-text-muted);
+  font-size: 0.8rem;
+}
+
+.alertActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.65rem;
+}
+
 .assignmentList {
   display: flex;
   flex-direction: column;
@@ -175,7 +363,6 @@
 }
 
 .assignmentEnded {
-  opacity: 0.75;
   background: var(--color-bg);
 }
 
@@ -189,6 +376,19 @@
 .assignmentSchedule {
   font-weight: 600;
   font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.assignmentRuleHelp {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.assignmentTaskTitle {
+  margin: 0;
+  font-size: 0.95rem;
   overflow-wrap: anywhere;
 }
 
@@ -210,7 +410,53 @@
   min-width: 0;
 }
 
+.assignmentIds {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.55rem;
+  margin: 0.2rem 0 0;
+}
+
+.assignmentIds > div {
+  min-width: 0;
+}
+
+.assignmentIds dt {
+  color: var(--color-text-muted);
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.assignmentIds dd {
+  min-width: 0;
+  margin: 0.1rem 0 0;
+}
+
+.assignmentEditForm {
+  grid-column: 1 / -1;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--color-border);
+}
+
+.assignmentEditTitle {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.assignmentEditHelp {
+  margin: 0.25rem 0 0;
+  color: var(--color-text-muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
 @media (max-width: 560px) {
+  .assignmentFilterControl {
+    width: 100%;
+  }
+
   .assignmentRow {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -218,10 +464,15 @@
   .assignmentActions {
     align-items: flex-start;
   }
+
+  .assignmentIds {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 /* Inline confirm strip inside an assignment row (stop / end-from-date). */
 .inlineConfirm {
+  grid-column: 1 / -1;
   display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
@@ -234,8 +485,13 @@
 }
 
 .inlineConfirmLabel {
+  flex: 1 1 18rem;
   font-size: 0.8rem;
   font-weight: 600;
+}
+
+.inlineConfirm > :first-child:not(.inlineConfirmLabel) {
+  flex: 1 1 18rem;
 }
 
 /* Small date input used by the end-from-date confirm (matches .control sizing). */
@@ -247,6 +503,12 @@
   border-radius: var(--radius-sm);
   background: var(--color-surface);
   color: inherit;
+}
+
+@media (max-width: 420px) {
+  .inlineConfirm > * {
+    width: 100%;
+  }
 }
 
 /* ── Misc ────────────────────────────────────────────────────────────────────── */

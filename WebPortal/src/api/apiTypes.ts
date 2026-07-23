@@ -7,6 +7,8 @@
 export type UserRole = 'PRIMARY_USER' | 'SUPPORT_PERSON' | 'ORG_ADMIN';
 /** The base role an admin can assign (mirrors UserRole; SystemAdmin is not a base role). */
 export type AdminBaseRole = 'PRIMARY_USER' | 'SUPPORT_PERSON' | 'ORG_ADMIN';
+export type AiTaskGroundingMode = 'GROUNDED_ONLY' | 'ALLOW_UNGROUNDED_FALLBACK';
+export type AiTaskGenerationSource = 'CORPUS' | 'UNGROUNDED_AI';
 
 // ── Entity shapes (only the fields the portal reads) ─────────────────────────────
 export interface UserProfile {
@@ -45,6 +47,30 @@ export interface TaskStep {
   description?: string | null;
   createdAt?: string | null;
   updatedAt?: string | null;
+}
+
+/** A source passage supporting one AI-generated preview step. */
+export interface Citation {
+  chunkId: string;
+  title: string;
+  url?: string | null;
+  snippet?: string | null;
+}
+
+/** One ordered step in an AI-generated task preview (not a persisted TaskStep). */
+export interface GeneratedAiTaskStep {
+  text: string;
+  citations: Citation[];
+}
+
+/** A createAiTask preview. The caller must explicitly persist it later with createTask. */
+export interface GeneratedAiTask {
+  title: string;
+  steps: GeneratedAiTaskStep[];
+  grounded: boolean;
+  source: AiTaskGenerationSource;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
 }
 
 export interface Category {
@@ -265,6 +291,17 @@ export interface UnselectPrimaryUserInput {
 }
 
 // ── Task-template inputs (SupportPerson-owned templates) ─────────────────────────
+/**
+ * Generate a task preview without persisting it. Omit `stepCount` to let the model choose
+ * (up to 20); when supplied it must be an integer from 1 through 20.
+ */
+export interface CreateAiTaskInput {
+  query: string;
+  /** Omitted by callers only when they want the backend's GROUNDED_ONLY default. */
+  groundingMode?: AiTaskGroundingMode;
+  stepCount?: number;
+}
+
 /** A nested step at task creation (text + optional description; no media). */
 export interface CreateTaskStepNestedInput {
   text: string;
