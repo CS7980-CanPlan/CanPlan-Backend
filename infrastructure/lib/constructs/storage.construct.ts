@@ -44,6 +44,11 @@ export class Storage extends Construct {
           prefix: 'media/pending/task-cover/',
           expiration: cdk.Duration.days(1),
         },
+        {
+          id: 'expire-generated-report-pdf-cache',
+          prefix: 'report-pdf-cache/',
+          expiration: cdk.Duration.days(1),
+        },
       ],
       // Destroyable environments empty + delete on teardown. dev / prod retain.
       removalPolicy: isDestroyable ? cdk.RemovalPolicy.DESTROY : cdk.RemovalPolicy.RETAIN,

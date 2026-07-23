@@ -95,7 +95,9 @@ export class Api extends Construct {
       { typeName: 'Mutation', fieldName: 'saveReport' },
       { typeName: 'Mutation', fieldName: 'deleteReport' },
       { typeName: 'Query', fieldName: 'listReports' },
+      { typeName: 'Query', fieldName: 'listMySupportedUserReports' },
       { typeName: 'Query', fieldName: 'getReportDownloadUrl' },
+      { typeName: 'Query', fieldName: 'getReportPdfDownloadUrl' },
     ]);
 
     // UserProfile + SupportLink (incl. SupportPerson selection of primary users) plus the

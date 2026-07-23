@@ -1,5 +1,5 @@
 import { useMemo, useState, type FormEvent } from 'react';
-import { ArrowRight, CheckCircle2, RefreshCw } from 'lucide-react';
+import { ArrowRight, CheckCircle2, FileText, RefreshCw } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import type { TaskInstance, TaskInstanceStatus } from '../../../api/apiTypes';
 import { useUserCalendar, useUserTaskInstances } from '../../../api/supportHooks';
@@ -12,6 +12,7 @@ import { Spinner } from '../../../components/ui/Spinner';
 import { TextField } from '../../../components/ui/TextField';
 import { Panel } from '../../admin/components/Panel';
 import { formatDate, IdCell, StatusBadge } from '../../admin/components/display';
+import { validateReportRange } from '../reports/reportFormat';
 import {
   defaultInstanceHistoryRange,
   formatDuration,
@@ -79,6 +80,11 @@ export function SupportedUserTaskInstances({
   }
 
   const dateRangeChanged = startDate !== appliedRange.startDate || endDate !== appliedRange.endDate;
+  const reportRangeError = validateReportRange(startDate, endDate);
+  const reportHref =
+    `/support/reports?userId=${encodeURIComponent(userId)}` +
+    `&from=${encodeURIComponent(startDate)}` +
+    `&to=${encodeURIComponent(endDate)}#generate-report`;
 
   return (
     <div id="task-instances" className={styles.sectionAnchor}>
@@ -133,6 +139,28 @@ export function SupportedUserTaskInstances({
             >
               Refresh
             </Button>
+            {reportRangeError ? (
+              <span
+                className={`${styles.reportLink} ${styles.reportLinkDisabled}`}
+                role="link"
+                tabIndex={0}
+                aria-disabled="true"
+                aria-describedby="task-history-report-range-error"
+              >
+                <FileText size={14} aria-hidden="true" />
+                Generate report for selected dates
+              </span>
+            ) : (
+              <Link className={styles.reportLink} to={reportHref}>
+                <FileText size={14} aria-hidden="true" />
+                Generate report for selected dates
+              </Link>
+            )}
+            {reportRangeError && (
+              <span id="task-history-report-range-error" className={styles.reportLinkError}>
+                Report unavailable: {reportRangeError}
+              </span>
+            )}
           </div>
         </form>
 

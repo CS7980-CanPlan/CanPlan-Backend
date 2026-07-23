@@ -27,6 +27,43 @@
   align-items: center;
 }
 
+.reportLink {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  padding: 0.3rem 0.6rem;
+  color: #fff;
+  background: var(--color-primary);
+  border: 1px solid var(--color-primary);
+  border-radius: var(--radius-sm);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.1;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.reportLink:hover {
+  color: #fff;
+  background: var(--color-primary-dark);
+  border-color: var(--color-primary-dark);
+}
+
+.reportLinkDisabled,
+.reportLinkDisabled:hover {
+  cursor: not-allowed;
+  color: var(--color-text-muted);
+  background: var(--color-bg);
+  border-color: var(--color-border);
+}
+
+.reportLinkError {
+  flex-basis: 100%;
+  color: var(--color-danger);
+  font-size: 0.75rem;
+}
+
 .resultSummary,
 .timingHelp {
   margin: 0.55rem 0 0.8rem;

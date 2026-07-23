@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react';
 import { NavLink } from 'react-router-dom';
-import { LifeBuoy, ListChecks, LogOut, Settings, UserRound, Users } from 'lucide-react';
+import { FileText, LifeBuoy, ListChecks, LogOut, Settings, UserRound, Users } from 'lucide-react';
 import { useAuth } from '../../auth/useAuth';
 import { Button } from '../../components/ui/Button';
 import { Badge } from '../../components/ui/Badge';
@@ -17,6 +17,7 @@ const TABS: TabDef[] = [
   { to: '/support/home', label: 'People I support', icon: <Users size={16} />, end: true },
   { to: '/support/manage', label: 'Manage people', icon: <Settings size={16} /> },
   { to: '/support/tasks', label: 'Tasks', icon: <ListChecks size={16} /> },
+  { to: '/support/reports', label: 'Reports', icon: <FileText size={16} /> },
   { to: '/support/profile', label: 'My profile', icon: <UserRound size={16} /> },
 ];
 
@@ -50,7 +51,13 @@ export function SupportShell({ children }: { children: ReactNode }) {
             <span className={styles.accountEmail} title={user?.email ?? user?.username}>
               {user?.email ?? user?.username}
             </span>
-            <Button size="sm" variant="ghost" icon={<LogOut size={15} />} loading={signingOut} onClick={handleSignOut}>
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={<LogOut size={15} />}
+              loading={signingOut}
+              onClick={handleSignOut}
+            >
               Sign out
             </Button>
           </div>

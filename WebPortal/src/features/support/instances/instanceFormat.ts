@@ -31,9 +31,8 @@ function toLocalIsoDate(date: Date): string {
 }
 
 export function defaultInstanceHistoryRange(): { startDate: string; endDate: string } {
-  const end = new Date();
-  const start = new Date(end.getFullYear(), end.getMonth(), end.getDate() - 89);
-  return { startDate: toLocalIsoDate(start), endDate: toLocalIsoDate(end) };
+  const today = toLocalIsoDate(new Date());
+  return { startDate: today, endDate: today };
 }
 
 function validIsoDate(value: string): boolean {

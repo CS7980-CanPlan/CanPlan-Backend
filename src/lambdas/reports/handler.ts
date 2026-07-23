@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { requireCaller } from '../../shared/authz';
 import { pageArgs } from '../../shared/pagination';
 import { buildReportStats } from '../../shared/reportMetrics';
-import { assertCanAccessUserReports } from '../../shared/reportAuthz';
+import { assertCanAccessUserReports, listAccessibleReportUserIds } from '../../shared/reportAuthz';
 import {
   signReportDraft,
   verifyReportDraft,
@@ -12,6 +12,8 @@ import { generateReportNarrative } from '../../shared/reportNarrative';
 import {
   deleteReport,
   getReportDownloadUrl,
+  getReportPdfDownloadUrl,
+  listMySupportedUserReports,
   listReports,
   writeReport,
 } from '../../shared/reportStorage';
@@ -26,7 +28,12 @@ import type {
   ReportDocument,
   ReportStats,
   SaveReportInput,
+  SupportedReportFilterInput,
 } from '../../shared/types';
+
+type NullableSupportedReportFilterInput = {
+  [K in keyof SupportedReportFilterInput]?: SupportedReportFilterInput[K] | null;
+};
 
 /** Hard cap on a report's date span so a single synchronous call stays bounded. */
 export const MAX_REPORT_RANGE_DAYS = 366;
@@ -40,8 +47,8 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
  *     the narrative).
  *   - saveReport — verify the signed draft token against the re-submitted content, then persist
  *     it (S3 JSON + DynamoDB index row). Recomputes no stats and calls no model.
- * Plus listReports, getReportDownloadUrl, and deleteReport over saved reports. Routed by
- * fieldName; authorization for every field is the single seam assertCanAccessUserReports.
+ * Plus per-user and cross-supported-user listing, getReportDownloadUrl, and deleteReport over
+ * saved reports. Routed by fieldName; authorization stays behind the reportAuthz seam.
  */
 export const handler = async (
   event: AppSyncEvent<Record<string, unknown>>,
@@ -61,6 +68,20 @@ export const handler = async (
       await assertCanAccessUserReports(event.identity, userId);
       return listReports(userId, pageArgs(args));
     }
+    case 'listMySupportedUserReports': {
+      const filter = normalizeSupportedReportFilter(
+        args.filter as NullableSupportedReportFilterInput | null | undefined,
+      );
+      // A selected-user query can fail fast through the normal per-user authorization seam.
+      // The all-users feed resolves every currently effective link in one batch-oriented pass.
+      const userIds = filter.userId
+        ? [filter.userId]
+        : await listAccessibleReportUserIds(event.identity);
+      if (filter.userId) {
+        await assertCanAccessUserReports(event.identity, filter.userId);
+      }
+      return listMySupportedUserReports(userIds, filter, pageArgs(args));
+    }
     case 'getReportDownloadUrl': {
       const userId = (args.userId as string)?.trim();
       const reportId = (args.reportId as string)?.trim();
@@ -68,6 +89,14 @@ export const handler = async (
       if (!reportId) throw new ValidationError('reportId is required');
       await assertCanAccessUserReports(event.identity, userId);
       return getReportDownloadUrl(userId, reportId);
+    }
+    case 'getReportPdfDownloadUrl': {
+      const userId = (args.userId as string)?.trim();
+      const reportId = (args.reportId as string)?.trim();
+      if (!userId) throw new ValidationError('userId is required');
+      if (!reportId) throw new ValidationError('reportId is required');
+      await assertCanAccessUserReports(event.identity, userId);
+      return getReportPdfDownloadUrl(userId, reportId);
     }
     case 'deleteReport': {
       const userId = (args.userId as string)?.trim();
@@ -81,6 +110,35 @@ export const handler = async (
       throw new Error(`reports handler: unsupported field "${event.info?.fieldName}"`);
   }
 };
+
+/** Validate and canonicalize optional saved-at filters before they are cursor-bound. */
+function normalizeSupportedReportFilter(
+  input: NullableSupportedReportFilterInput | null | undefined,
+): SupportedReportFilterInput {
+  const filter = input ?? {};
+  const userId = filter.userId == null ? undefined : filter.userId.trim();
+  if (filter.userId != null && !userId) {
+    throw new ValidationError('filter.userId cannot be empty');
+  }
+
+  const createdFrom = normalizeAwsDateTime(filter.createdFrom, 'filter.createdFrom');
+  const createdTo = normalizeAwsDateTime(filter.createdTo, 'filter.createdTo');
+  if (createdFrom && createdTo && createdFrom > createdTo) {
+    throw new ValidationError('filter.createdFrom must be on or before filter.createdTo');
+  }
+
+  return { userId, createdFrom, createdTo };
+}
+
+function normalizeAwsDateTime(value: string | null | undefined, field: string): string | undefined {
+  if (value == null) return undefined;
+  const trimmed = value.trim();
+  const timestamp = Date.parse(trimmed);
+  if (!trimmed || !Number.isFinite(timestamp)) {
+    throw new ValidationError(`${field} must be a valid AWSDateTime`);
+  }
+  return new Date(timestamp).toISOString();
+}
 
 /**
  * Compute the report's deterministic stats and AI narrative and return them inline with a
@@ -98,8 +156,9 @@ async function generateReport(
   if (!from || !DATE_RE.test(from)) throw new ValidationError('from must be a YYYY-MM-DD date');
   if (!to || !DATE_RE.test(to)) throw new ValidationError('to must be a YYYY-MM-DD date');
   if (from > to) throw new ValidationError('from must be on or before to');
-  const spanDays = (Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000;
-  if (spanDays > MAX_REPORT_RANGE_DAYS) {
+  const inclusiveDays =
+    (Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000 + 1;
+  if (inclusiveDays > MAX_REPORT_RANGE_DAYS) {
     throw new ValidationError(`date range must be at most ${MAX_REPORT_RANGE_DAYS} days`);
   }
 
@@ -155,10 +214,12 @@ async function saveReport(
   const stats = input?.stats as ReportStats | undefined;
 
   if (!userId) throw new ValidationError('scope.userId is required');
-  if (!from || !DATE_RE.test(from)) throw new ValidationError('dateRange.from must be a YYYY-MM-DD date');
+  if (!from || !DATE_RE.test(from))
+    throw new ValidationError('dateRange.from must be a YYYY-MM-DD date');
   if (!to || !DATE_RE.test(to)) throw new ValidationError('dateRange.to must be a YYYY-MM-DD date');
   if (!generatedAt) throw new ValidationError('generatedAt is required');
-  if (typeof narrative !== 'string' || !narrative) throw new ValidationError('narrative is required');
+  if (typeof narrative !== 'string' || !narrative)
+    throw new ValidationError('narrative is required');
   if (!stats || typeof stats !== 'object') throw new ValidationError('stats is required');
 
   // Verify the token binds exactly this content and has not expired. Throws on any mismatch.

@@ -10,6 +10,9 @@ import SupportManagePage from '../features/support/SupportManagePage';
 import SupportProfilePage from '../features/support/SupportProfilePage';
 import SupportUserDetailPage from '../features/support/SupportUserDetailPage';
 import SupportTaskInstanceDetailPage from '../features/support/instances/SupportTaskInstanceDetailPage';
+import SupportUserReportsPage from '../features/support/reports/SupportUserReportsPage';
+import SupportReportsPage from '../features/support/reports/SupportReportsPage';
+import SupportReportDetailPage from '../features/support/reports/SupportReportDetailPage';
 import SupportTasksPage from '../features/support/tasks/SupportTasksPage';
 import SupportTaskCreatePage from '../features/support/tasks/SupportTaskCreatePage';
 import SupportTaskDetailPage from '../features/support/tasks/SupportTaskDetailPage';
@@ -65,8 +68,11 @@ export function AppRoutes() {
         <Route path="/support/tasks" element={<SupportTasksPage />} />
         <Route path="/support/tasks/new" element={<SupportTaskCreatePage />} />
         <Route path="/support/tasks/:taskId" element={<SupportTaskDetailPage />} />
+        <Route path="/support/reports" element={<SupportReportsPage />} />
+        <Route path="/support/reports/:userId/:reportId" element={<SupportReportDetailPage />} />
         <Route path="/support/profile" element={<SupportProfilePage />} />
         <Route path="/support/users/:userId" element={<SupportUserDetailPage />} />
+        <Route path="/support/users/:userId/reports" element={<SupportUserReportsPage />} />
         <Route
           path="/support/users/:userId/task-instances/:instanceId"
           element={<SupportTaskInstanceDetailPage />}

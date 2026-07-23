@@ -12,9 +12,20 @@ import type {
   DeleteTaskStepInput,
   EndTaskAssignmentInput,
   GeneratedAiTask,
+  GeneratedReport,
+  GenerateReportInput,
   PageArgs,
+  ParsedGeneratedReport,
   ReorderTaskStepsInput,
+  Report,
+  ReportConnection,
+  ReportDateRange,
+  ReportDownloadTarget,
+  ReportScope,
+  ReportStats,
+  SaveReportInput,
   SelectPrimaryUserInput,
+  SupportedReportFilterInput,
   SupportLink,
   SupportLinkConnection,
   Task,
@@ -41,10 +52,14 @@ import {
   CREATE_TASK,
   CREATE_TASK_ASSIGNMENT,
   CREATE_TASK_STEP,
+  DELETE_REPORT,
   DELETE_TASK,
   DELETE_TASK_ASSIGNMENT,
   DELETE_TASK_STEP,
   END_TASK_ASSIGNMENT,
+  GENERATE_REPORT,
+  GET_REPORT_DOWNLOAD_URL,
+  GET_REPORT_PDF_DOWNLOAD_URL,
   GET_TASK_INSTANCE,
   GET_TASK_INSTANCE_VIEWS,
   GET_TASK,
@@ -52,12 +67,15 @@ import {
   LIST_MY_CATEGORIES,
   LIST_MY_ORGANIZATION_USERS,
   LIST_MY_SUPPORT_LIST,
+  LIST_MY_SUPPORTED_USER_REPORTS,
+  LIST_REPORTS,
   LIST_TASK_ASSIGNMENTS_FOR_USER,
   LIST_TASK_INSTANCES,
   LIST_TASK_INSTANCE_STEPS,
   LIST_TASK_STEPS,
   LIST_TASKS_BY_OWNER,
   REORDER_TASK_STEPS,
+  SAVE_REPORT,
   SELECT_PRIMARY_USER,
   UNSELECT_PRIMARY_USER,
   UPDATE_MY_USER_PROFILE,
@@ -266,6 +284,60 @@ export async function listAllTaskInstanceSteps(
   return steps.sort((left, right) => left.order - right.order);
 }
 
+/** One newest-first cursor page of reports saved for a supported primary user. */
+export async function listReports(userId: string, args: PageArgs = {}): Promise<ReportConnection> {
+  const data = await gqlRequest<{ listReports: ReportConnection }>(LIST_REPORTS, {
+    userId,
+    limit: args.limit,
+    nextToken: args.nextToken ?? null,
+  });
+  return data.listReports;
+}
+
+/**
+ * One newest-first page from the caller's report directory. The backend resolves and enforces
+ * the caller's currently effective support relationships; an empty filter means every supported
+ * primary user and every saved date.
+ */
+export async function listMySupportedUserReports(
+  filter: SupportedReportFilterInput = {},
+  args: PageArgs = {},
+): Promise<ReportConnection> {
+  const data = await gqlRequest<{ listMySupportedUserReports: ReportConnection }>(
+    LIST_MY_SUPPORTED_USER_REPORTS,
+    {
+      filter,
+      limit: args.limit,
+      nextToken: args.nextToken ?? null,
+    },
+  );
+  return data.listMySupportedUserReports;
+}
+
+/** Create a fresh, short-lived presigned GET URL for one saved report document. */
+export async function getReportDownloadUrl(
+  userId: string,
+  reportId: string,
+): Promise<ReportDownloadTarget> {
+  const data = await gqlRequest<{ getReportDownloadUrl: ReportDownloadTarget }>(
+    GET_REPORT_DOWNLOAD_URL,
+    { userId, reportId },
+  );
+  return data.getReportDownloadUrl;
+}
+
+/** Create a fresh, short-lived attachment URL for one saved report's formatted PDF. */
+export async function getReportPdfDownloadUrl(
+  userId: string,
+  reportId: string,
+): Promise<ReportDownloadTarget> {
+  const data = await gqlRequest<{ getReportPdfDownloadUrl: ReportDownloadTarget }>(
+    GET_REPORT_PDF_DOWNLOAD_URL,
+    { userId, reportId },
+  );
+  return data.getReportPdfDownloadUrl;
+}
+
 /**
  * Drain EVERY page of one user's assignments. User-centered schedule management must include
  * active and ended rules beyond the first DynamoDB/AppSync page.
@@ -350,6 +422,98 @@ export async function unselectPrimaryUser(input: UnselectPrimaryUserInput): Prom
     input,
   });
   return data.unselectPrimaryUser;
+}
+
+// ── AI progress reports ─────────────────────────────────────────────────────────
+/**
+ * Generate a preview only. The returned AWSJSON fields intentionally remain encoded strings:
+ * saving requires sending every field back exactly as received within the token's 15-minute TTL.
+ */
+export async function generateReport(input: GenerateReportInput): Promise<GeneratedReport> {
+  const data = await gqlRequest<{ generateReport: GeneratedReport }>(GENERATE_REPORT, { input });
+  return data.generateReport;
+}
+
+/** Persist one exact, unmodified generateReport draft. */
+export async function saveReport(input: SaveReportInput): Promise<Report> {
+  const data = await gqlRequest<{ saveReport: Report }>(SAVE_REPORT, { input });
+  return data.saveReport;
+}
+
+/** Permanently remove a saved report's metadata and private JSON object. */
+export async function deleteReport(userId: string, reportId: string): Promise<boolean> {
+  const data = await gqlRequest<{ deleteReport: boolean }>(DELETE_REPORT, { userId, reportId });
+  return data.deleteReport;
+}
+
+/** Build save input without parsing/re-serializing any signed AWSJSON content. */
+export function toSaveReportInput(report: GeneratedReport): SaveReportInput {
+  return {
+    draftToken: report.draftToken,
+    scope: report.scope,
+    dateRange: report.dateRange,
+    generatedAt: report.generatedAt,
+    narrative: report.narrative,
+    stats: report.stats,
+  };
+}
+
+function parseAwsJsonRecord(value: string, fieldName: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    throw new Error(`Report ${fieldName} is not valid JSON.`);
+  }
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`Report ${fieldName} must be a JSON object.`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+/** Decode and minimally validate one report scope AWSJSON value for presentation. */
+export function parseReportScope(value: string): ReportScope {
+  const parsed = parseAwsJsonRecord(value, 'scope');
+  if (typeof parsed.userId !== 'string' || !parsed.userId) {
+    throw new Error('Report scope is missing userId.');
+  }
+  return { userId: parsed.userId };
+}
+
+/** Decode and minimally validate one report dateRange AWSJSON value for presentation. */
+export function parseReportDateRange(value: string): ReportDateRange {
+  const parsed = parseAwsJsonRecord(value, 'dateRange');
+  if (typeof parsed.from !== 'string' || typeof parsed.to !== 'string') {
+    throw new Error('Report dateRange is missing from or to.');
+  }
+  return { from: parsed.from, to: parsed.to };
+}
+
+/** Decode report statistics. Core sections are checked before exposing the typed object. */
+export function parseReportStats(value: string): ReportStats {
+  const parsed = parseAwsJsonRecord(value, 'stats');
+  if (
+    typeof parsed.meta !== 'object' ||
+    parsed.meta === null ||
+    typeof parsed.completion !== 'object' ||
+    parsed.completion === null
+  ) {
+    throw new Error('Report stats are missing required sections.');
+  }
+  return parsed as unknown as ReportStats;
+}
+
+/** Decode copies for rendering while retaining the original GeneratedReport for an exact save. */
+export function parseGeneratedReport(report: GeneratedReport): ParsedGeneratedReport {
+  return {
+    draftToken: report.draftToken,
+    scope: parseReportScope(report.scope),
+    dateRange: parseReportDateRange(report.dateRange),
+    generatedAt: report.generatedAt,
+    narrative: report.narrative,
+    stats: parseReportStats(report.stats),
+  };
 }
 
 // ── Task-template mutations ──────────────────────────────────────────────────────

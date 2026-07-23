@@ -12,10 +12,15 @@ import {
   buildReportStats,
 } from './reportMetrics';
 import type { TaskInstance, Task, Category, TaskInstanceStep, ReportComputeInput } from './types';
-import { queryAll, queryAllItems } from './batch';
+import { batchGet, queryAll, queryAllItems } from './batch';
 
-jest.mock('./batch', () => ({ queryAll: jest.fn(), queryAllItems: jest.fn() }));
+jest.mock('./batch', () => ({
+  batchGet: jest.fn(),
+  queryAll: jest.fn(),
+  queryAllItems: jest.fn(),
+}));
 
+const mockBatchGet = batchGet as jest.Mock;
 const mockQueryAll = queryAll as jest.Mock;
 const mockQueryAllItems = queryAllItems as jest.Mock;
 
@@ -96,11 +101,45 @@ describe('aggregateByTask', () => {
 
 describe('aggregateByCategory', () => {
   it('maps task → category and groups completion by category', () => {
-    const tasks = [{ taskId: 't1', categoryId: 'c1', title: 'X' } as Task];
-    const cats = [{ categoryId: 'c1', name: 'Hygiene' } as Category];
+    const tasks = [{ taskId: 't1', ownerId: 'support-1', categoryId: 'c1', title: 'X' } as Task];
+    const cats = [{ categoryId: 'c1', ownerId: 'support-1', name: 'Hygiene' } as Category];
     const out = aggregateByCategory([inst({ taskId: 't1', status: 'COMPLETED' })], tasks, cats);
     expect(out).toEqual([
       { categoryId: 'c1', categoryName: 'Hygiene', completed: 1, total: 1, completionRate: 1 },
+    ]);
+  });
+
+  it('keeps an owner/category pair isolated if category ids ever collide across owners', () => {
+    const tasks = [
+      { taskId: 't1', ownerId: 'support-1', categoryId: 'same-id', title: 'X' } as Task,
+      { taskId: 't2', ownerId: 'support-2', categoryId: 'same-id', title: 'Y' } as Task,
+    ];
+    const cats = [
+      { categoryId: 'same-id', ownerId: 'support-1', name: 'Morning' } as Category,
+      { categoryId: 'same-id', ownerId: 'support-2', name: 'Evening' } as Category,
+    ];
+
+    expect(
+      aggregateByCategory(
+        [inst({ taskId: 't1', status: 'COMPLETED' }), inst({ taskId: 't2', status: 'SKIPPED' })],
+        tasks,
+        cats,
+      ),
+    ).toEqual([
+      {
+        categoryId: 'same-id',
+        categoryName: 'Morning',
+        completed: 1,
+        total: 1,
+        completionRate: 1,
+      },
+      {
+        categoryId: 'same-id',
+        categoryName: 'Evening',
+        completed: 0,
+        total: 1,
+        completionRate: 0,
+      },
     ]);
   });
 });
@@ -140,9 +179,30 @@ const STARTED = '2026-06-01T09:00:00.000Z';
 describe('aggregateStepDwell', () => {
   it('averages server-measured active seconds per (task, step order) across instances', () => {
     const steps = [
-      step({ instanceId: 'i1', stepId: 's1', order: 0, text: 'A', firstStartedAt: STARTED, activeDurationSeconds: 30 }),
-      step({ instanceId: 'i2', stepId: 's1', order: 0, text: 'A', firstStartedAt: STARTED, activeDurationSeconds: 90 }),
-      step({ instanceId: 'i1', stepId: 's2', order: 1, text: 'B', firstStartedAt: STARTED, activeDurationSeconds: 60 }),
+      step({
+        instanceId: 'i1',
+        stepId: 's1',
+        order: 0,
+        text: 'A',
+        firstStartedAt: STARTED,
+        activeDurationSeconds: 30,
+      }),
+      step({
+        instanceId: 'i2',
+        stepId: 's1',
+        order: 0,
+        text: 'A',
+        firstStartedAt: STARTED,
+        activeDurationSeconds: 90,
+      }),
+      step({
+        instanceId: 'i1',
+        stepId: 's2',
+        order: 1,
+        text: 'B',
+        firstStartedAt: STARTED,
+        activeDurationSeconds: 60,
+      }),
     ];
     const tasks = [{ taskId: 't1', title: 'Brush' } as Task];
     expect(aggregateStepDwell(steps, tasks)).toEqual([
@@ -239,7 +299,11 @@ describe('aggregateSkipPatterns', () => {
 describe('aggregateTimeOfDay', () => {
   it('buckets COMPLETED instances by local completion hour', () => {
     const out = aggregateTimeOfDay([
-      inst({ status: 'COMPLETED', completedAt: '2026-06-01T13:00:00.000Z', timezone: 'America/Toronto' }),
+      inst({
+        status: 'COMPLETED',
+        completedAt: '2026-06-01T13:00:00.000Z',
+        timezone: 'America/Toronto',
+      }),
     ]);
     expect(out[9]).toBe(1);
     expect(out).toHaveLength(24);
@@ -293,23 +357,129 @@ describe('computeReportStats', () => {
 });
 
 describe('buildReportStats', () => {
-  afterEach(() => jest.clearAllMocks());
+  afterEach(() => jest.resetAllMocks());
 
-  it('queries instances by date range, steps + categories by prefix, tasks by owner index', async () => {
-    mockQueryAll
-      .mockResolvedValueOnce([inst({ status: 'COMPLETED' })]) // instances (BETWEEN)
-      .mockResolvedValueOnce([{ taskId: 't1', title: 'Brush', categoryId: 'c1' }]); // tasks (owner index)
-    mockQueryAllItems
-      .mockResolvedValueOnce([]) // steps
-      .mockResolvedValueOnce([{ categoryId: 'c1', name: 'Hygiene' }]); // categories
+  it('loads metadata from the SupportPerson-owned task assigned to the primary user', async () => {
+    mockQueryAll.mockResolvedValueOnce([
+      inst({ instanceId: 'i1', taskId: 'support-task', status: 'COMPLETED' }),
+      inst({ instanceId: 'i2', taskId: 'support-task', status: 'SKIPPED' }),
+    ]);
+    mockQueryAllItems.mockResolvedValueOnce([]);
+    mockBatchGet
+      .mockResolvedValueOnce([
+        {
+          PK: 'TASK#support-task',
+          SK: '#META',
+          entityType: 'Task',
+          taskId: 'support-task',
+          ownerId: 'support-1',
+          title: 'Supported morning routine',
+          categoryId: 'support-category',
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          PK: 'USER#support-1',
+          SK: 'CATEGORY#support-category',
+          entityType: 'Category',
+          categoryId: 'support-category',
+          ownerId: 'support-1',
+          name: 'Daily living',
+        },
+      ]);
 
     const stats = await buildReportStats('u1', '2026-06-01', '2026-06-30');
 
-    expect(stats.meta.totalInstances).toBe(1);
+    expect(stats.meta.totalInstances).toBe(2);
+    expect(stats.byTask).toEqual([
+      {
+        taskId: 'support-task',
+        title: 'Supported morning routine',
+        completed: 1,
+        total: 2,
+        completionRate: 0.5,
+      },
+    ]);
+    expect(stats.byCategory).toEqual([
+      {
+        categoryId: 'support-category',
+        categoryName: 'Daily living',
+        completed: 1,
+        total: 2,
+        completionRate: 0.5,
+      },
+    ]);
+
     // instances query uses a BETWEEN on the TASK_INSTANCE# prefix
     const between = mockQueryAll.mock.calls[0][0];
     expect(between.KeyConditionExpression).toContain('BETWEEN');
     expect(between.ExpressionAttributeValues[':from']).toBe('TASK_INSTANCE#2026-06-01');
     expect(between.ExpressionAttributeValues[':to']).toBe('TASK_INSTANCE#2026-06-30￿');
+
+    // Duplicate occurrences load one task row, then only that task owner's category.
+    expect(mockBatchGet.mock.calls[0][0]).toEqual([{ PK: 'TASK#support-task', SK: '#META' }]);
+    expect(mockBatchGet.mock.calls[1][0]).toEqual([
+      { PK: 'USER#support-1', SK: 'CATEGORY#support-category' },
+    ]);
+  });
+
+  it('preserves counts and safe fallbacks when a referenced task or category was deleted', async () => {
+    mockQueryAll.mockResolvedValueOnce([
+      inst({ instanceId: 'i1', taskId: 'known-task', status: 'COMPLETED' }),
+      inst({ instanceId: 'i2', taskId: 'deleted-task', status: 'SKIPPED' }),
+    ]);
+    mockQueryAllItems.mockResolvedValueOnce([]);
+    mockBatchGet
+      .mockResolvedValueOnce([
+        {
+          PK: 'TASK#known-task',
+          SK: '#META',
+          entityType: 'Task',
+          taskId: 'known-task',
+          ownerId: 'support-1',
+          title: 'Known task',
+          categoryId: 'deleted-category',
+        },
+        // DynamoDB omits the missing TASK#deleted-task row.
+      ])
+      .mockResolvedValueOnce([]); // referenced category was also deleted
+
+    const stats = await buildReportStats('u1', '2026-06-01', '2026-06-30');
+
+    expect(stats.meta.totalInstances).toBe(2);
+    expect(stats.completion.completed).toBe(1);
+    expect(stats.completion.skipped).toBe(1);
+    expect(stats.byTask).toEqual([
+      {
+        taskId: 'known-task',
+        title: 'Known task',
+        completed: 1,
+        total: 1,
+        completionRate: 1,
+      },
+      {
+        taskId: 'deleted-task',
+        title: 'deleted-task',
+        completed: 0,
+        total: 1,
+        completionRate: 0,
+      },
+    ]);
+    expect(stats.byCategory).toEqual([
+      {
+        categoryId: 'deleted-category',
+        categoryName: 'deleted-category',
+        completed: 1,
+        total: 1,
+        completionRate: 1,
+      },
+      {
+        categoryId: 'unknown',
+        categoryName: 'unknown',
+        completed: 0,
+        total: 1,
+        completionRate: 0,
+      },
+    ]);
   });
 });

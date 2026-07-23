@@ -132,6 +132,17 @@ const TASK_INSTANCE_STEP_FIELDS = `
   updatedAt
 `;
 
+const REPORT_FIELDS = `
+  reportId
+  scope
+  dateRange
+  s3Key
+  createdBy
+  createdAt
+  narrative
+  stats
+`;
+
 // ── Queries ──────────────────────────────────────────────────────────────────────
 export const GET_USER_PROFILE = /* GraphQL */ `
   query GetUserProfile($userId: ID!) {
@@ -291,6 +302,59 @@ export const LIST_TASK_INSTANCE_STEPS = /* GraphQL */ `
   }
 `;
 
+/** Saved report metadata, newest-first. Full contents are downloaded through the URL query. */
+export const LIST_REPORTS = /* GraphQL */ `
+  query ListReports($userId: ID!, $limit: Int, $nextToken: String) {
+    listReports(userId: $userId, limit: $limit, nextToken: $nextToken) {
+      items {
+        ${REPORT_FIELDS}
+      }
+      nextToken
+    }
+  }
+`;
+
+/**
+ * The caller's saved-report directory across every currently supported primary user.
+ * Results are newest-first; user and saved-date bounds are optional.
+ */
+export const LIST_MY_SUPPORTED_USER_REPORTS = /* GraphQL */ `
+  query ListMySupportedUserReports(
+    $filter: SupportedReportFilterInput
+    $limit: Int
+    $nextToken: String
+  ) {
+    listMySupportedUserReports(filter: $filter, limit: $limit, nextToken: $nextToken) {
+      items {
+        ${REPORT_FIELDS}
+      }
+      nextToken
+    }
+  }
+`;
+
+/** Mint a short-lived presigned GET URL for one saved report JSON document. */
+export const GET_REPORT_DOWNLOAD_URL = /* GraphQL */ `
+  query GetReportDownloadUrl($userId: ID!, $reportId: ID!) {
+    getReportDownloadUrl(userId: $userId, reportId: $reportId) {
+      downloadUrl
+      s3Key
+      expiresIn
+    }
+  }
+`;
+
+/** Mint a short-lived attachment URL for a well-formatted PDF of one saved report. */
+export const GET_REPORT_PDF_DOWNLOAD_URL = /* GraphQL */ `
+  query GetReportPdfDownloadUrl($userId: ID!, $reportId: ID!) {
+    getReportPdfDownloadUrl(userId: $userId, reportId: $reportId) {
+      downloadUrl
+      s3Key
+      expiresIn
+    }
+  }
+`;
+
 // ── Mutations ────────────────────────────────────────────────────────────────────
 /** Partial update of the caller's OWN profile (displayName / organizationId / settings). */
 export const UPDATE_MY_USER_PROFILE = /* GraphQL */ `
@@ -314,6 +378,37 @@ export const UNSELECT_PRIMARY_USER = /* GraphQL */ `
     unselectPrimaryUser(input: $input) {
       ${SUPPORT_LINK_FIELDS}
     }
+  }
+`;
+
+// ── AI progress reports (SupportPerson-only delegated access) ───────────────────
+/** Generate an unsaved preview over the requested inclusive date window. */
+export const GENERATE_REPORT = /* GraphQL */ `
+  mutation GenerateReport($input: GenerateReportInput!) {
+    generateReport(input: $input) {
+      draftToken
+      scope
+      dateRange
+      generatedAt
+      narrative
+      stats
+    }
+  }
+`;
+
+/** Persist an exact, still-valid generateReport response without modifying any content. */
+export const SAVE_REPORT = /* GraphQL */ `
+  mutation SaveReport($input: SaveReportInput!) {
+    saveReport(input: $input) {
+      ${REPORT_FIELDS}
+    }
+  }
+`;
+
+/** Permanently delete a saved report's index row and S3 JSON object. */
+export const DELETE_REPORT = /* GraphQL */ `
+  mutation DeleteReport($userId: ID!, $reportId: ID!) {
+    deleteReport(userId: $userId, reportId: $reportId)
   }
 `;
 

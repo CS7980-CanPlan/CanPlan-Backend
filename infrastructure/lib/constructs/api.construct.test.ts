@@ -46,6 +46,16 @@ function schemaDefinition(template: Template): string {
 }
 
 describe('Api construct — resolver bindings', () => {
+  it('wires the cross-user feed and PDF download on the reports data source', () => {
+    const fields = resolverFields(synth());
+    for (const fieldName of ['listMySupportedUserReports', 'getReportPdfDownloadUrl']) {
+      expect(fields).toContainEqual({
+        typeName: 'Query',
+        fieldName,
+      });
+    }
+  });
+
   it('wires the organization-directory and support-link queries on the users data source', () => {
     const fields = resolverFields(synth());
     for (const fieldName of [
@@ -84,6 +94,19 @@ describe('Api construct — resolver bindings', () => {
 });
 
 describe('Api construct — schema authorization directives', () => {
+  it('gates the cross-user report feed to the SupportPerson Cognito group', () => {
+    const definition = schemaDefinition(synth());
+    expect(definition).toMatch(
+      /listMySupportedUserReports\([\s\S]*?\): ReportConnection!\s*@aws_cognito_user_pools\(cognito_groups: \["SupportPerson"\]\)/,
+    );
+  });
+
+  it('exposes the per-report PDF download contract in the schema', () => {
+    expect(schemaDefinition(synth())).toMatch(
+      /getReportPdfDownloadUrl\(userId: ID!, reportId: ID!\): MediaDownloadTarget!/,
+    );
+  });
+
   it('gates the organization directory to the PrimaryUser + SupportPerson Cognito groups', () => {
     const definition = schemaDefinition(synth());
     // Both directory fields carry the two-group directive (and never an API-key directive).

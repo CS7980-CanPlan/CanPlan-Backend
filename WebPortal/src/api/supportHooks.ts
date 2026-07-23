@@ -6,16 +6,27 @@
  * consumers filter them (ACTIVE links, PRIMARY_USER candidates, name lookups), and a single
  * truncated page would silently hide selectable people.
  */
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+  type InfiniteData,
+  useInfiniteQuery,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query';
 import {
   createAiTask,
   createTask,
   createTaskAssignment,
   createTaskStep,
+  deleteReport,
   deleteTask,
   deleteTaskAssignment,
   deleteTaskStep,
   endTaskAssignment,
+  generateReport,
+  getReportDownloadUrl,
+  getReportPdfDownloadUrl,
   getTaskInstance,
   getTaskInstanceViews,
   getTask,
@@ -27,9 +38,12 @@ import {
   listAllTaskInstanceSteps,
   listAllTaskSteps,
   listMyCategories,
+  listMySupportedUserReports,
+  listReports,
   listTaskAssignmentsForUser,
   listTasksByOwner,
   reorderTaskSteps,
+  saveReport,
   selectPrimaryUser,
   unselectPrimaryUser,
   updateMyUserProfile,
@@ -44,8 +58,13 @@ import type {
   DeleteTaskAssignmentInput,
   DeleteTaskStepInput,
   EndTaskAssignmentInput,
+  GenerateReportInput,
+  ReportConnection,
   ReorderTaskStepsInput,
+  ReportTargetInput,
+  SaveReportInput,
   SelectPrimaryUserInput,
+  SupportedReportFilterInput,
   UnselectPrimaryUserInput,
   UpdateMyUserProfileInput,
   UpdateTaskInput,
@@ -57,6 +76,9 @@ const LIST_PAGE_SIZE = 100;
 const OWNED_TASKS_PAGE_SIZE = 25;
 const SUPPORT_CALENDAR_KEY = ['support', 'calendar'] as const;
 const SUPPORT_TASK_INSTANCES_KEY = ['support', 'taskInstances'] as const;
+const SUPPORT_REPORTS_KEY = ['support', 'reports'] as const;
+const SUPPORT_REPORT_DIRECTORY_KEY = [...SUPPORT_REPORTS_KEY, 'directory'] as const;
+const REPORTS_PAGE_SIZE = 25;
 
 /** Centralized query keys so hooks and invalidation can't drift apart. */
 export const supportKeys = {
@@ -75,6 +97,14 @@ export const supportKeys = {
     [...supportKeys.taskInstances(userId), 'detail', instanceId] as const,
   taskInstanceSteps: (userId: string, instanceId: string) =>
     [...supportKeys.taskInstance(userId, instanceId), 'steps'] as const,
+  reports: (userId: string) => [...SUPPORT_REPORTS_KEY, 'user', userId] as const,
+  reportDirectory: (filter: SupportedReportFilterInput = {}) =>
+    [
+      ...SUPPORT_REPORT_DIRECTORY_KEY,
+      filter.userId ?? null,
+      filter.createdFrom ?? null,
+      filter.createdTo ?? null,
+    ] as const,
   ownedTasks: (ownerId: string) => ['support', 'ownedTasks', ownerId] as const,
   task: (taskId: string) => ['support', 'task', taskId] as const,
   taskSteps: (taskId: string) => ['support', 'taskSteps', taskId] as const,
@@ -108,6 +138,23 @@ export function useUserProfile(userId: string | undefined) {
     queryFn: () => getUserProfile(userId as string),
     enabled: Boolean(userId),
   });
+}
+
+/**
+ * Profile lookups for a dynamic set of supported-user ids. De-duplicate and sort first so the
+ * returned `{ userId, query }` entries and their query keys remain deterministic when the
+ * support-list response order changes.
+ */
+export function useSupportedUserProfiles(userIds: string[]) {
+  const stableUserIds = [...new Set(userIds.map((userId) => userId.trim()).filter(Boolean))].sort();
+  const queries = useQueries({
+    queries: stableUserIds.map((userId) => ({
+      queryKey: supportKeys.profile(userId),
+      queryFn: () => getUserProfile(userId),
+    })),
+  });
+
+  return stableUserIds.map((userId, index) => ({ userId, query: queries[index] }));
 }
 
 /** A supported user's task templates (delegated access). Disabled until an ownerId is provided. */
@@ -187,6 +234,42 @@ export function useUserTaskInstanceSteps(
 }
 
 /**
+ * Saved reports for one supported primary user, newest-first and cursor-paginated. A presigned
+ * download URL is requested only when the user chooses a report, so expired URLs are not cached.
+ */
+export function useReports(userId: string | undefined) {
+  return useInfiniteQuery({
+    queryKey: supportKeys.reports(userId ?? ''),
+    queryFn: ({ pageParam }) =>
+      listReports(userId as string, {
+        limit: REPORTS_PAGE_SIZE,
+        nextToken: pageParam,
+      }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) => lastPage.nextToken ?? undefined,
+    enabled: Boolean(userId),
+  });
+}
+
+/**
+ * Newest-first saved reports across every currently supported primary user. Optional directory
+ * filters are part of the query key, so multiple applied filter combinations paginate
+ * independently and can all be reconciled after save/delete.
+ */
+export function useMySupportedUserReports(filter: SupportedReportFilterInput = {}) {
+  return useInfiniteQuery({
+    queryKey: supportKeys.reportDirectory(filter),
+    queryFn: ({ pageParam }) =>
+      listMySupportedUserReports(filter, {
+        limit: REPORTS_PAGE_SIZE,
+        nextToken: pageParam,
+      }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) => lastPage.nextToken ?? undefined,
+  });
+}
+
+/**
  * ALL of one user's assignments, every page drained for the user-centered management panel.
  * Its key extends
  * `supportKeys.assignments(userId)`, so the assignment-mutation hooks' prefix invalidation
@@ -215,8 +298,9 @@ export function useUpdateMyUserProfile(userId: string | undefined) {
       qc.invalidateQueries({ queryKey: supportKeys.supportList });
       qc.invalidateQueries({ queryKey: supportKeys.calendars });
       // An organization change can revoke every delegated relationship immediately. Remove
-      // lifecycle/step details so stale supported-user data cannot remain visible from cache.
+      // lifecycle/step/report details so stale supported-user data cannot remain in cache.
       qc.removeQueries({ queryKey: SUPPORT_TASK_INSTANCES_KEY });
+      qc.removeQueries({ queryKey: SUPPORT_REPORTS_KEY });
     },
   });
 }
@@ -225,7 +309,11 @@ export function useSelectPrimaryUser() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: SelectPrimaryUserInput) => selectPrimaryUser(input),
-    onSuccess: () => qc.invalidateQueries({ queryKey: supportKeys.supportList }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: supportKeys.supportList });
+      // A newly effective relationship can make that user's saved reports visible globally.
+      qc.invalidateQueries({ queryKey: SUPPORT_REPORT_DIRECTORY_KEY });
+    },
   });
 }
 
@@ -237,7 +325,98 @@ export function useUnselectPrimaryUser() {
       qc.invalidateQueries({ queryKey: supportKeys.supportList });
       qc.removeQueries({ queryKey: supportKeys.calendar(link.primaryUserId) });
       qc.removeQueries({ queryKey: supportKeys.taskInstances(link.primaryUserId) });
+      // Directory pages can contain this user's report metadata. Clear the entire reports
+      // domain immediately so a revoked relationship never leaves cached cross-user results.
+      qc.removeQueries({ queryKey: SUPPORT_REPORTS_KEY });
     },
+  });
+}
+
+// ── AI progress reports ─────────────────────────────────────────────────────────
+/** Generate an unsaved preview; saving remains an explicit second action. */
+export function useGenerateReport() {
+  return useMutation({
+    mutationFn: (input: GenerateReportInput) => generateReport(input),
+  });
+}
+
+/**
+ * Persist an exact generated preview. The supported user id is hook context only—it is not
+ * added to SaveReportInput because the backend resolves it from the signed draft token.
+ */
+export function useSaveReport(userId: string | undefined) {
+  const qc = useQueryClient();
+  const refreshReports = () => {
+    // One save changes every global-directory filter that can contain it and the selected
+    // user's report-list/detail cache.
+    qc.invalidateQueries({ queryKey: SUPPORT_REPORT_DIRECTORY_KEY });
+    if (userId) qc.invalidateQueries({ queryKey: supportKeys.reports(userId) });
+  };
+
+  return useMutation({
+    mutationFn: (input: SaveReportInput) => saveReport(input),
+    onSuccess: refreshReports,
+    // A lost response can hide a successful non-idempotent save. Refresh before any retry.
+    onError: refreshReports,
+  });
+}
+
+/** Mint a fresh URL on demand instead of caching a presigned URL that expires. */
+export function useReportDownloadUrl() {
+  return useMutation({
+    mutationFn: (input: ReportTargetInput) => getReportDownloadUrl(input.userId, input.reportId),
+  });
+}
+
+/** Mint a fresh PDF URL on demand instead of caching an expiring presigned attachment. */
+export function useReportPdfDownloadUrl() {
+  return useMutation({
+    mutationFn: (input: ReportTargetInput) => getReportPdfDownloadUrl(input.userId, input.reportId),
+  });
+}
+
+/** Permanently delete one saved report, then reconcile the paginated metadata list. */
+export function useDeleteReport(userId: string | undefined) {
+  const qc = useQueryClient();
+  const removeCachedReport = (reportId: string) => {
+    const withoutReport = (
+      cached: InfiniteData<ReportConnection, string | null> | undefined,
+    ): InfiniteData<ReportConnection, string | null> | undefined =>
+      cached
+        ? {
+            ...cached,
+            pages: cached.pages.map((page) => ({
+              ...page,
+              items: page.items.filter((report) => report.reportId !== reportId),
+            })),
+          }
+        : cached;
+
+    qc.setQueriesData<InfiniteData<ReportConnection, string | null>>(
+      { queryKey: SUPPORT_REPORT_DIRECTORY_KEY },
+      withoutReport,
+    );
+    if (userId) {
+      qc.setQueryData<InfiniteData<ReportConnection, string | null>>(
+        supportKeys.reports(userId),
+        withoutReport,
+      );
+    }
+  };
+  const refreshReports = () => {
+    // A deletion affects every directory filter that may contain the row, plus its per-user list.
+    qc.invalidateQueries({ queryKey: SUPPORT_REPORT_DIRECTORY_KEY });
+    if (userId) qc.invalidateQueries({ queryKey: supportKeys.reports(userId) });
+  };
+
+  return useMutation({
+    mutationFn: (reportId: string) => deleteReport(userId as string, reportId),
+    onSuccess: (_deleted, reportId) => {
+      removeCachedReport(reportId);
+      refreshReports();
+    },
+    // Deletion spans DynamoDB and S3; refresh even when the response is ambiguous.
+    onError: refreshReports,
   });
 }
 

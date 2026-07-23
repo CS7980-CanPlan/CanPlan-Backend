@@ -788,8 +788,8 @@ export interface AppSyncEvent<TArgs = Record<string, unknown>> {
   };
 }
 
-// A paginated list result (mirrors the GraphQL *Connection types). `nextToken` is an
-// opaque, base64-encoded DynamoDB LastEvaluatedKey; null when there are no more pages.
+// A paginated list result (mirrors the GraphQL *Connection types). `nextToken` is an opaque,
+// query-owned cursor (often a base64-encoded DynamoDB key); null when there are no more pages.
 export interface Connection<T> {
   items: T[];
   nextToken: string | null;
@@ -994,6 +994,22 @@ export interface SaveReportInput {
   generatedAt: string;
   narrative: string;
   stats: ReportStats;
+}
+
+/**
+ * Optional filters for the SupportPerson's cross-user saved-report feed.
+ *
+ * `createdFrom` / `createdTo` filter the time the report was SAVED, not the task-history
+ * coverage held in `Report.dateRange`. They are exact ISO-8601 instants (GraphQL AWSDateTime);
+ * the web client turns local date-picker boundaries into UTC instants before calling the API.
+ */
+export interface SupportedReportFilterInput {
+  /** Restrict the feed to one currently supported primary user. */
+  userId?: string;
+  /** Inclusive lower bound on Report.createdAt. */
+  createdFrom?: string;
+  /** Inclusive upper bound on Report.createdAt. */
+  createdTo?: string;
 }
 
 /**

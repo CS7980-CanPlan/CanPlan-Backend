@@ -856,6 +856,16 @@ input GenerateReportInput {
   to: AWSDate!
 }
 
+# Filters the SupportPerson's cross-user saved-report feed. `createdFrom` / `createdTo`
+# constrain Report.createdAt (the instant the report was SAVED), not the task-history period
+# inside Report.dateRange. Both timestamp bounds are inclusive.
+input SupportedReportFilterInput {
+  # Optional cared-for user. When omitted, reports for every currently supported user are merged.
+  userId: ID
+  createdFrom: AWSDateTime
+  createdTo: AWSDateTime
+}
+
 # Save a previously generated report. Re-submit the EXACT content returned by generateReport
 # (scope, dateRange, generatedAt, narrative, stats) plus its `draftToken`. The server recomputes
 # a canonical hash of this content and verifies it against the signed token — a stale, expired,
@@ -872,8 +882,8 @@ input SaveReportInput {
 
 # ─── Pagination / connections ───────────────────────────────────────────────--
 # Every list query is paginated: pass an optional `limit` (page size) and the
-# `nextToken` from the previous page. `nextToken` is an opaque, base64-encoded
-# DynamoDB key; it is null when there are no more pages.
+# `nextToken` from the previous page. `nextToken` is an opaque query-owned cursor;
+# it is null when there are no more pages.
 
 type UserProfileConnection {
   items: [UserProfile!]!
@@ -1087,7 +1097,19 @@ type Query {
   # SupportLink to the target PRIMARY_USER (ACTIVE with a current organization/membership
   # snapshot; a user cannot read their own reports); see assertCanAccessUserReports.
   listReports(userId: ID!, limit: Int, nextToken: String): ReportConnection!
+  # Newest-first saved reports across every primary user the caller CURRENTLY supports.
+  # Optional filters select one supported user and/or an inclusive saved-at timestamp window.
+  # Pagination is globally stable across the merged user partitions; a nextToken is bound to
+  # the exact filter values and cannot be reused after changing them.
+  listMySupportedUserReports(
+    filter: SupportedReportFilterInput
+    limit: Int
+    nextToken: String
+  ): ReportConnection! @aws_cognito_user_pools(cognito_groups: ["SupportPerson"])
   getReportDownloadUrl(userId: ID!, reportId: ID!): MediaDownloadTarget!
+  # Generate a PDF from the immutable saved report JSON and return a short-lived private
+  # attachment URL. The same current effective SupportLink authorization applies.
+  getReportPdfDownloadUrl(userId: ID!, reportId: ID!): MediaDownloadTarget!
 }
 
 type Mutation {
@@ -1222,9 +1244,10 @@ type Mutation {
   # drafts) and writes the JSON to S3 + a DynamoDB index row. Recomputes no stats and calls no model.
   saveReport(input: SaveReportInput!): Report!
 
-  # Delete a persisted report (its DynamoDB index row + S3 JSON object). Restricted to a
+  # Delete a persisted report (its DynamoDB index row, S3 JSON, and cached PDF). Restricted to a
   # SupportPerson with delegated access to the target user (see assertCanAccessUserReports).
-  # Returns true when a report was deleted; errors if no such report exists.
+  # Cleanup is retry-safe after a partial storage failure. Returns true when cleanup completes;
+  # errors if neither the report nor an unfinished deletion exists.
   deleteReport(userId: ID!, reportId: ID!): Boolean!
 
   # ─── Admin mutations (SystemAdmin-only) ──────────────────────────────────────

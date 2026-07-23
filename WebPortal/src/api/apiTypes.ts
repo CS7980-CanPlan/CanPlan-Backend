@@ -159,6 +159,146 @@ export interface TaskInstanceStep {
 }
 
 /**
+ * AWSJSON is transported by AppSync as a JSON-encoded string. Keep that wire representation
+ * explicit: report drafts must send these exact strings back to saveReport without editing.
+ */
+export type AwsJsonString = string;
+
+export interface ReportScope {
+  userId: string;
+}
+
+export interface ReportDateRange {
+  from: string;
+  to: string;
+}
+
+/** Deterministic statistics computed by the backend over materialized task instances. */
+export interface ReportStats {
+  meta: {
+    userId: string;
+    from: string;
+    to: string;
+    basis: 'attempted-instances-only';
+    totalInstances: number;
+  };
+  completion: {
+    completed: number;
+    skipped: number;
+    cancelled: number;
+    overdue: number;
+    inProgress: number;
+    toDo: number;
+    completionRate: number;
+  };
+  trend: Array<{
+    weekStart: string;
+    completed: number;
+    total: number;
+    completionRate: number;
+  }>;
+  byCategory: Array<{
+    categoryId: string;
+    categoryName: string;
+    completed: number;
+    total: number;
+    completionRate: number;
+  }>;
+  byTask: Array<{
+    taskId: string;
+    title: string;
+    completed: number;
+    total: number;
+    completionRate: number;
+  }>;
+  stepDwell: Array<{
+    taskId: string;
+    title: string;
+    stepOrder: number;
+    stepText: string;
+    samples: number;
+    avgSeconds: number;
+  }>;
+  focus: {
+    byTask: Array<{
+      taskId: string;
+      title: string;
+      samples: number;
+      avgActiveSeconds: number;
+    }>;
+    focusRatio: number | null;
+  };
+  skipPatterns: {
+    byTask: Array<{ taskId: string; title: string; skipped: number }>;
+    /** Twenty-four hourly buckets, indexed from 0 through 23. */
+    byHour: number[];
+  };
+  abandonment: Array<{
+    instanceId: string;
+    taskId: string;
+    title: string;
+    stalledAtStepOrder: number | null;
+  }>;
+  /** Twenty-four completion buckets, indexed from 0 through 23. */
+  timeOfDay: number[];
+}
+
+/**
+ * An unsaved report preview. AWSJSON properties stay encoded so this exact object can safely
+ * drive SaveReportInput; parse copies for rendering rather than changing these strings.
+ */
+export interface GeneratedReport {
+  draftToken: string;
+  scope: AwsJsonString;
+  dateRange: AwsJsonString;
+  generatedAt: string;
+  narrative: string;
+  stats: AwsJsonString;
+}
+
+/** A generated preview with its AWSJSON fields decoded for read-only presentation. */
+export interface ParsedGeneratedReport extends Omit<
+  GeneratedReport,
+  'scope' | 'dateRange' | 'stats'
+> {
+  scope: ReportScope;
+  dateRange: ReportDateRange;
+  stats: ReportStats;
+}
+
+/**
+ * One saved report. listReports returns metadata (`narrative`/`stats` are null); saveReport
+ * echoes the newly saved narrative and stats inline.
+ */
+export interface Report {
+  reportId: string;
+  scope: AwsJsonString | null;
+  dateRange: AwsJsonString | null;
+  s3Key: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  narrative: string | null;
+  stats: AwsJsonString | null;
+}
+
+/** The raw JSON document returned by HTTP GET against a report download URL. */
+export interface ReportDocument {
+  reportId: string;
+  scope: ReportScope;
+  dateRange: ReportDateRange;
+  createdBy: string;
+  createdAt: string;
+  stats: ReportStats;
+  narrative: string;
+}
+
+export interface ReportDownloadTarget {
+  downloadUrl: string;
+  s3Key: string;
+  expiresIn: number;
+}
+
+/**
  * One calendar occurrence returned by getTaskInstanceViews. A virtual occurrence comes from
  * an active schedule rule and has no persisted TaskInstance yet (`instanceId: null`).
  */
@@ -253,6 +393,12 @@ export interface TaskInstanceStepConnection {
   nextToken: string | null;
 }
 
+/** Saved reports are returned newest-first. */
+export interface ReportConnection {
+  items: Report[];
+  nextToken: string | null;
+}
+
 export interface OrganizationConnection {
   items: Organization[];
   nextToken: string | null;
@@ -343,6 +489,42 @@ export interface SelectPrimaryUserInput {
 /** A SupportPerson un-selects a previously selected primary user (soft-revoke). */
 export interface UnselectPrimaryUserInput {
   primaryUserId: string;
+}
+
+// ── AI progress-report inputs (SupportPerson for a supported primary user) ──────
+/** Inclusive YYYY-MM-DD date window. The backend permits at most 366 calendar days. */
+export interface GenerateReportInput {
+  userId: string;
+  from: string;
+  to: string;
+}
+
+/**
+ * Optional filters for the SupportPerson's cross-user saved-report directory.
+ * Omitting every field returns the newest reports for all currently supported users.
+ */
+export interface SupportedReportFilterInput {
+  userId?: string;
+  createdFrom?: string;
+  createdTo?: string;
+}
+
+/**
+ * The exact, unmodified generateReport response fields. The signed token expires after
+ * 15 minutes; changing any field makes backend verification fail.
+ */
+export interface SaveReportInput {
+  draftToken: string;
+  scope: AwsJsonString;
+  dateRange: AwsJsonString;
+  generatedAt: string;
+  narrative: string;
+  stats: AwsJsonString;
+}
+
+export interface ReportTargetInput {
+  userId: string;
+  reportId: string;
 }
 
 // ── Task-template inputs (SupportPerson-owned templates) ─────────────────────────
