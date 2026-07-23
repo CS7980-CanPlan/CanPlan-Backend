@@ -1,0 +1,502 @@
+.generatorForm {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+.sectionAnchor {
+  scroll-margin-top: 8rem;
+}
+
+.generatorGrid,
+.savedFilterGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.85rem;
+}
+
+.savedFilterForm {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  margin-bottom: 1rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.resultSummary {
+  margin: 0 0 0.8rem;
+  color: var(--color-text-muted);
+  font-size: 0.8rem;
+}
+
+.formHelp,
+.metricCaveat,
+.sectionHelp,
+.viewerSubtitle,
+.savedMeta {
+  color: var(--color-text-muted);
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+
+.formHelp,
+.metricCaveat,
+.sectionHelp,
+.viewerSubtitle {
+  margin: 0;
+}
+
+.actionRow,
+.savedCardHead,
+.viewerHead {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.reportViewer {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin-top: 1.25rem;
+  padding: 1.15rem;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+}
+
+.viewerHead,
+.savedCardHead {
+  justify-content: space-between;
+}
+
+.viewerHead {
+  align-items: flex-start;
+  padding-bottom: 0.85rem;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.viewerHead > :first-child,
+.savedCardHead > :first-child {
+  min-width: 0;
+}
+
+.viewerTitle {
+  margin: 0;
+  font-size: 1.08rem;
+}
+
+.viewerTitle:focus {
+  outline: none;
+}
+
+.viewerTitle:focus-visible {
+  outline: 3px solid var(--color-primary);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+.narrative {
+  padding: 1rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-bg);
+}
+
+.narrative h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.narrativeHelp {
+  margin: 0.2rem 0 0.65rem;
+  color: var(--color-text-muted);
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
+.narrativeText {
+  color: var(--color-text);
+  font-size: 0.9rem;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.savedDocumentMeta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0.85rem;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.savedDocumentMeta div {
+  min-width: 0;
+}
+
+.savedDocumentMeta dt,
+.reportIdentity > span {
+  margin-bottom: 0.2rem;
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.savedDocumentMeta dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.savedDocumentMeta code {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  word-break: break-all;
+}
+
+.statsView {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.statsView > :first-child {
+  margin-bottom: 0;
+}
+
+.metricCaveat {
+  padding: 0.75rem 0.85rem;
+  border-left: 3px solid var(--color-primary);
+  background: var(--color-bg);
+}
+
+.reportSection {
+  min-width: 0;
+  padding: 0.95rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+}
+
+.sectionTitle {
+  margin: 0 0 0.7rem;
+  font-size: 0.94rem;
+}
+
+.sectionHelp {
+  margin: -0.25rem 0 0.75rem;
+}
+
+.twoColumnSections {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  min-width: 0;
+}
+
+.statusGrid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(6rem, 1fr));
+  gap: 0.55rem;
+}
+
+.statusMetric {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+  padding: 0.7rem;
+  border-radius: var(--radius-sm);
+  background: var(--color-bg);
+}
+
+.statusValue {
+  font-size: 1.15rem;
+  font-weight: 700;
+}
+
+.statusLabel {
+  color: var(--color-text-muted);
+  font-size: 0.73rem;
+}
+
+.tableScroll {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.statsTable {
+  width: 100%;
+  min-width: 30rem;
+  border-collapse: collapse;
+  font-size: 0.79rem;
+}
+
+.statsTable th,
+.statsTable td {
+  padding: 0.6rem 0.7rem;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.statsTable th {
+  background: var(--color-bg);
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.statsTable tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.cellTitle,
+.secondaryValue {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.cellTitle {
+  margin-bottom: 0.18rem;
+  color: var(--color-text);
+  font-weight: 600;
+}
+
+.secondaryValue {
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+}
+
+.instanceLink {
+  display: block;
+  margin-bottom: 0.18rem;
+  color: var(--color-primary);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.instanceLink:hover {
+  text-decoration: underline;
+}
+
+.compactEmpty > div {
+  min-height: 6rem;
+  padding: 0.75rem;
+}
+
+.rawStats {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg);
+}
+
+.rawStats summary {
+  padding: 0.7rem 0.85rem;
+  cursor: pointer;
+  color: var(--color-text-muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.rawStats pre {
+  max-height: 30rem;
+  margin: 0;
+  padding: 0.85rem;
+  overflow: auto;
+  border-top: 1px solid var(--color-border);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  line-height: 1.5;
+  white-space: pre;
+}
+
+.panelGap {
+  margin-top: 1.25rem;
+}
+
+.savedList {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+.savedCard {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  min-width: 0;
+  padding: 0.9rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+}
+
+.savedCardHead {
+  align-items: flex-start;
+}
+
+.savedRange {
+  font-size: 0.92rem;
+  font-weight: 700;
+}
+
+.savedPerson {
+  margin-bottom: 0.15rem;
+  color: var(--color-primary);
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.savedMeta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.2rem;
+  margin-top: 0.15rem;
+}
+
+.reportIdentity {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding-top: 0.65rem;
+  border-top: 1px solid var(--color-border);
+}
+
+.openReportLink {
+  align-self: flex-start;
+  color: var(--color-primary);
+  font-size: 0.84rem;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.openReportLink:hover {
+  text-decoration: underline;
+}
+
+.deleteForm {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--color-border);
+}
+
+.detailLoading {
+  min-height: 18rem;
+  display: grid;
+  place-items: center;
+}
+
+.deletePanel {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-top: 1.25rem;
+  padding: 1.1rem 1.15rem;
+  border: 1px solid color-mix(in srgb, var(--color-danger) 40%, var(--color-border));
+  border-radius: var(--radius);
+  background: var(--color-surface);
+}
+
+.deletePanel > div:first-child {
+  flex: 1 1 24rem;
+}
+
+.deletePanel h2 {
+  margin: 0 0 0.2rem;
+  font-size: 0.98rem;
+}
+
+.deletePanel p {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 0.8rem;
+}
+
+.deletePanel .deleteForm {
+  flex: 1 0 100%;
+}
+
+.loadingBlock {
+  min-height: 10rem;
+  display: grid;
+  place-items: center;
+}
+
+.errorBlock {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.7rem;
+}
+
+.loadMore {
+  display: flex;
+  justify-content: center;
+  padding-top: 0.9rem;
+}
+
+@media (max-width: 900px) {
+  .generatorGrid,
+  .savedFilterGrid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .generatorGrid > :first-child,
+  .savedFilterGrid > :first-child {
+    grid-column: 1 / -1;
+  }
+
+  .twoColumnSections {
+    grid-template-columns: 1fr;
+  }
+
+  .statusGrid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 700px) {
+  .generatorGrid,
+  .savedFilterGrid,
+  .savedDocumentMeta {
+    grid-template-columns: 1fr;
+  }
+
+  .generatorGrid > :first-child,
+  .savedFilterGrid > :first-child {
+    grid-column: auto;
+  }
+
+  .viewerHead {
+    flex-direction: column;
+  }
+}
+
+@media (max-width: 480px) {
+  .statusGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .reportViewer {
+    padding: 0.85rem;
+  }
+}

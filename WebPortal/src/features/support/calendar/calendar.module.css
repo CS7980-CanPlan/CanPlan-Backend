@@ -1,0 +1,466 @@
+.anchor {
+  scroll-margin-top: 8rem;
+  margin-top: 1.25rem;
+}
+
+.toolbar {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.8rem;
+}
+
+.monthNavigation,
+.actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.actions {
+  justify-content: flex-end;
+}
+
+.monthLabel {
+  font-size: 1.05rem;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.legend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem 1rem;
+  padding: 0.55rem 0.7rem;
+  margin-bottom: 0.75rem;
+  border-radius: var(--radius-sm);
+  background: var(--color-bg);
+  color: var(--color-text-muted);
+  font-size: 0.76rem;
+}
+
+.legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.legendMarker {
+  width: 0.65rem;
+  height: 0.65rem;
+  border-radius: 3px;
+  background: var(--color-surface);
+}
+
+.virtualMarker {
+  border: 1px dashed var(--color-text-muted);
+}
+
+.instanceMarker {
+  border: 1px solid var(--color-primary);
+  box-shadow: inset 3px 0 0 var(--color-primary);
+}
+
+.legendHelp {
+  margin-left: auto;
+}
+
+.centered {
+  min-height: 16rem;
+  display: grid;
+  place-items: center;
+}
+
+.errorBlock {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+
+.desktopCalendar {
+  overflow-x: auto;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-border);
+}
+
+.weekdayRow,
+.calendarGrid {
+  min-width: 47rem;
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 1px;
+}
+
+.weekdayRow {
+  background: #fafbfd;
+}
+
+.weekdayRow span {
+  padding: 0.45rem 0.55rem;
+  color: var(--color-text-muted);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.dayCell {
+  appearance: none;
+  min-height: 7.2rem;
+  min-width: 0;
+  padding: 0.4rem;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.3rem;
+  border: none;
+  background: var(--color-surface);
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.dayCell:hover {
+  background: #fafbfd;
+}
+
+.outsideMonth {
+  background: #f8f9fb;
+  color: var(--color-text-muted);
+}
+
+.selectedDay {
+  box-shadow: inset 0 0 0 2px var(--color-primary);
+  z-index: 1;
+}
+
+.dayNumber {
+  align-self: flex-end;
+  width: 1.55rem;
+  height: 1.55rem;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.todayNumber {
+  background: var(--color-primary);
+  color: #fff;
+}
+
+.cellEvents {
+  display: flex;
+  flex-direction: column;
+  gap: 0.23rem;
+  min-width: 0;
+}
+
+.cellEvent {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.3rem;
+  min-width: 0;
+  padding: 0.18rem 0.28rem;
+  border-radius: 4px;
+  background: #eef1f6;
+  border-left: 3px solid #718096;
+  font-size: 0.72rem;
+  line-height: 1.25;
+}
+
+.virtualEvent {
+  border-left-style: dashed;
+}
+
+.instanceEvent {
+  border-left-style: solid;
+}
+
+.statusTodo {
+  border-left-color: #718096;
+}
+
+.statusInProgress {
+  border-left-color: var(--color-primary);
+  background: #eaf2ff;
+}
+
+.statusOverdue,
+.statusCancelled {
+  border-left-color: var(--color-danger);
+  background: #fcebeb;
+}
+
+.statusCompleted {
+  border-left-color: var(--color-success);
+  background: #eaf7ef;
+}
+
+.statusSkipped {
+  border-left-color: var(--color-warning);
+  background: #fcf4e3;
+}
+
+.cellEventTime {
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.cellEventTitle {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.moreEvents {
+  padding-left: 0.3rem;
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+  font-weight: 600;
+}
+
+.emptyBlock {
+  margin-top: 0.8rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+}
+
+.dayDetails {
+  margin-top: 1rem;
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--color-border);
+}
+
+.dayDetailsHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.65rem;
+}
+
+.dayDetailsHead h3 {
+  font-size: 0.95rem;
+}
+
+.dayDetailsHead span,
+.noDayEvents {
+  color: var(--color-text-muted);
+  font-size: 0.8rem;
+}
+
+.noDayEvents {
+  margin: 0;
+}
+
+.detailList {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.occurrenceCard {
+  padding: 0.75rem 0.8rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+}
+
+.virtualOccurrence {
+  border-style: dashed;
+}
+
+.realOccurrence {
+  border-left: 4px solid var(--color-primary);
+}
+
+.occurrenceHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.occurrenceTime {
+  color: var(--color-text-muted);
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+.occurrenceTitle {
+  margin: 0.1rem 0 0;
+  font-size: 0.92rem;
+  overflow-wrap: anywhere;
+}
+
+.occurrenceBadges {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.timezone {
+  margin: 0.45rem 0 0;
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+}
+
+.occurrenceIds {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.6rem;
+  margin: 0.65rem 0 0;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--color-border);
+}
+
+.occurrenceIds > div {
+  min-width: 0;
+}
+
+.occurrenceIds dt {
+  margin-bottom: 0.15rem;
+  color: var(--color-text-muted);
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.occurrenceIds dd {
+  min-width: 0;
+  margin: 0;
+}
+
+.notCreated {
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+}
+
+.mobileAgenda {
+  display: none;
+}
+
+@media (max-width: 850px) {
+  .toolbar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .monthLabel {
+    grid-row: 1;
+    text-align: left;
+  }
+
+  .actions {
+    justify-content: flex-start;
+  }
+
+  .legendHelp {
+    width: 100%;
+    margin-left: 0;
+  }
+}
+
+@media (max-width: 680px) {
+  .desktopCalendar {
+    display: none;
+  }
+
+  .mobileAgenda {
+    display: flex;
+    flex-direction: column;
+    gap: 0.8rem;
+  }
+
+  .agendaDay {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .agendaDate {
+    appearance: none;
+    align-self: flex-start;
+    padding: 0.1rem 0;
+    border: none;
+    border-bottom: 2px solid transparent;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.82rem;
+    font-weight: 700;
+  }
+
+  .agendaDateSelected {
+    color: var(--color-primary);
+    border-bottom-color: var(--color-primary);
+  }
+
+  .agendaItems {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .agendaItem {
+    appearance: none;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 0;
+    padding: 0.5rem 0.55rem;
+    border: 1px solid var(--color-border);
+    border-left: 3px solid var(--color-primary);
+    border-radius: var(--radius-sm);
+    background: var(--color-surface);
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    text-align: left;
+  }
+
+  .agendaItem.virtualEvent {
+    border-left-style: dashed;
+  }
+
+  .agendaTime {
+    font-size: 0.74rem;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+
+  .agendaTitle {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.82rem;
+    font-weight: 600;
+  }
+
+  .occurrenceHead {
+    flex-direction: column;
+  }
+
+  .occurrenceBadges {
+    justify-content: flex-start;
+  }
+
+  .occurrenceIds {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

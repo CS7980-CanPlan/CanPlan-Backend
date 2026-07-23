@@ -1,6 +1,6 @@
-import { useState, type FormEvent } from 'react';
-import { Navigate } from 'react-router-dom';
-import { LogIn, ShieldCheck } from 'lucide-react';
+import { useState, type FormEvent, type ReactNode } from 'react';
+import { Link, Navigate } from 'react-router-dom';
+import { ArrowLeft, LogIn } from 'lucide-react';
 import { useAuth } from '../../auth/useAuth';
 import { authErrorMessage } from '../../auth/authError';
 import { Alert } from '../../components/ui/Alert';
@@ -10,13 +10,32 @@ import { TextField } from '../../components/ui/TextField';
 import { NewPasswordRequiredForm } from './NewPasswordRequiredForm';
 import styles from './LoginPage.module.css';
 
+/** Group membership used to route an already-authenticated user to the right place. */
+export interface RedirectContext {
+  isSystemAdmin: boolean;
+  isSupportPerson: boolean;
+}
+
+interface LoginCardProps {
+  /** Brand icon shown in the card header. */
+  icon: ReactNode;
+  /** Brand line, e.g. "CanPlan Admin". */
+  brandText: string;
+  /** Short descriptive line under the brand. */
+  subtitle: string;
+  /** Fine-print line at the bottom of the card. */
+  footnote: string;
+  /** Where to send an already-authenticated user (their portal home, or `/forbidden`). */
+  redirectFor: (ctx: RedirectContext) => string;
+}
+
 /**
- * First screen at `/`. Authenticates with Cognito, then routes by group:
- * SystemAdmin → /admin, any other authenticated user → /forbidden. Supports the
- * FORCE_CHANGE_PASSWORD (new-password-required) challenge for invited admins.
+ * Reusable Cognito sign-in card shared by the admin and support portals. Owns the
+ * password + FORCE_CHANGE_PASSWORD (new-password-required) flow; branding and the
+ * post-login destination are supplied by the wrapping portal via props.
  */
-export default function LoginPage() {
-  const { loading, user, isSystemAdmin, signIn } = useAuth();
+export function LoginCard({ icon, brandText, subtitle, footnote, redirectFor }: LoginCardProps) {
+  const { loading, user, isSystemAdmin, isSupportPerson, signIn } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -31,9 +50,9 @@ export default function LoginPage() {
       </div>
     );
   }
-  // Already authenticated — route by role.
+  // Already authenticated — route by group.
   if (user) {
-    return <Navigate to={isSystemAdmin ? '/admin' : '/forbidden'} replace />;
+    return <Navigate to={redirectFor({ isSystemAdmin, isSupportPerson })} replace />;
   }
 
   async function handleSubmit(event: FormEvent) {
@@ -58,11 +77,11 @@ export default function LoginPage() {
       <div className={styles.card}>
         <div className={styles.brand}>
           <span className={styles.brandMark} aria-hidden="true">
-            <ShieldCheck size={18} />
+            {icon}
           </span>
-          <span className={styles.brandText}>CanPlan Admin</span>
+          <span className={styles.brandText}>{brandText}</span>
         </div>
-        <p className={styles.subtitle}>Sign in to the administration portal.</p>
+        <p className={styles.subtitle}>{subtitle}</p>
 
         {needsNewPassword ? (
           <NewPasswordRequiredForm email={email.trim()} />
@@ -85,6 +104,7 @@ export default function LoginPage() {
             <TextField
               label="Password"
               type="password"
+              showPasswordToggle
               autoComplete="current-password"
               required
               value={password}
@@ -96,7 +116,11 @@ export default function LoginPage() {
           </form>
         )}
 
-        <p className={styles.footnote}>Authorized administrators only.</p>
+        <p className={styles.footnote}>{footnote}</p>
+        <Link to="/" className={styles.backLink}>
+          <ArrowLeft size={14} aria-hidden="true" />
+          Back to portal home
+        </Link>
       </div>
     </div>
   );

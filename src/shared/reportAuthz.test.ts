@@ -1,4 +1,4 @@
-import { assertCanAccessUserReports } from './reportAuthz';
+import { assertCanAccessUserReports, listAccessibleReportUserIds } from './reportAuthz';
 import { dynamo } from './dynamodb';
 import { UnauthorizedError, ValidationError } from './response';
 import type { AppSyncIdentity } from './types';
@@ -18,6 +18,7 @@ type Rec = Record<string, any>; // eslint-disable-line @typescript-eslint/no-exp
 interface DbState {
   profiles?: Record<string, Rec | undefined>;
   links?: Record<string, Rec | undefined>;
+  linkRows?: Rec[];
 }
 let db: DbState = {};
 
@@ -36,6 +37,19 @@ beforeEach(() => {
         const primaryUserId = sk.replace(/^USER#/, '');
         return Promise.resolve({ Item: db.links?.[`${supporterId}->${primaryUserId}`] });
       }
+    }
+    if (command.constructor.name === 'QueryCommand') {
+      return Promise.resolve({ Items: db.linkRows ?? [] });
+    }
+    if (command.constructor.name === 'BatchGetCommand') {
+      const keys = input.RequestItems['CanPlan-test'].Keys as Rec[];
+      return Promise.resolve({
+        Responses: {
+          'CanPlan-test': keys
+            .map((key) => db.profiles?.[String(key.PK).replace(/^USER#/, '')])
+            .filter(Boolean),
+        },
+      });
     }
     return Promise.resolve({});
   });
@@ -145,5 +159,78 @@ describe('assertCanAccessUserReports', () => {
       organizationMembershipId: 'mid-pu-rejoined',
     };
     await expect(assertCanAccessUserReports(supporter, 'pu-1')).rejects.toThrow(UnauthorizedError);
+  });
+});
+
+describe('listAccessibleReportUserIds', () => {
+  const activeLink = (primaryUserId: string, overrides: Rec = {}): Rec => ({
+    supporterId: 'sup-1',
+    primaryUserId,
+    userId: primaryUserId,
+    status: 'ACTIVE',
+    organizationId: 'org-1',
+    supporterOrganizationMembershipId: 'mid-sup',
+    primaryUserOrganizationMembershipId: `mid-${primaryUserId}`,
+    ...overrides,
+  });
+
+  const primaryProfile = (userId: string, overrides: Rec = {}): Rec => ({
+    userId,
+    role: 'PRIMARY_USER',
+    organizationId: 'org-1',
+    organizationMembershipId: `mid-${userId}`,
+    ...overrides,
+  });
+
+  it('returns sorted, de-duplicated ids for only currently effective links', async () => {
+    db.profiles = {
+      'sup-1': {
+        userId: 'sup-1',
+        role: 'SUPPORT_PERSON',
+        organizationId: 'org-1',
+        organizationMembershipId: 'mid-sup',
+      },
+      'pu-a': primaryProfile('pu-a'),
+      'pu-b': primaryProfile('pu-b'),
+      'pu-revoked': primaryProfile('pu-revoked'),
+      'pu-stale': primaryProfile('pu-stale', {
+        organizationMembershipId: 'new-membership',
+      }),
+      'not-primary': primaryProfile('not-primary', { role: 'SUPPORT_PERSON' }),
+    };
+    db.linkRows = [
+      activeLink('pu-b'),
+      activeLink('pu-revoked', { status: 'REVOKED' }),
+      activeLink('pu-a'),
+      activeLink('pu-stale'),
+      activeLink('not-primary'),
+      activeLink('pu-a'),
+    ];
+
+    await expect(listAccessibleReportUserIds(supporter)).resolves.toEqual(['pu-a', 'pu-b']);
+
+    const query = mockSend.mock.calls.find(
+      ([command]) => command.constructor.name === 'QueryCommand',
+    )?.[0].input;
+    expect(query).toMatchObject({
+      ConsistentRead: true,
+      KeyConditionExpression: 'PK = :pk AND begins_with(SK, :prefix)',
+    });
+    expect(query.ExpressionAttributeValues[':pk']).toBe('SUPPORTER#sup-1');
+  });
+
+  it('returns an empty list when the caller has no profile or effective links', async () => {
+    db.profiles = {};
+    db.linkRows = [activeLink('pu-a')];
+    await expect(listAccessibleReportUserIds(supporter)).resolves.toEqual([]);
+    expect(
+      mockSend.mock.calls.some(([command]) => command.constructor.name === 'QueryCommand'),
+    ).toBe(false);
+  });
+
+  it('rejects a caller who is not in the SupportPerson Cognito group before reading', async () => {
+    const primary: AppSyncIdentity = { sub: 'pu-a', groups: ['PrimaryUser'] };
+    await expect(listAccessibleReportUserIds(primary)).rejects.toThrow(UnauthorizedError);
+    expect(mockSend).not.toHaveBeenCalled();
   });
 });

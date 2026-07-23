@@ -142,16 +142,25 @@ export const handler = async (
         identity,
       );
     case 'getTaskInstance':
-      return getTaskInstance(identity, args.instanceId as string);
+      return getTaskInstance(
+        identity,
+        args.instanceId as string,
+        args.userId as string | null | undefined,
+      );
     case 'listTaskInstances':
       return listTaskInstances(
         identity,
         args.startDate as string,
         args.endDate as string,
         pageArgs(args),
+        args.userId as string | null | undefined,
       );
     case 'batchGetTaskInstances':
-      return batchGetTaskInstances(identity, args.instanceIds as string[]);
+      return batchGetTaskInstances(
+        identity,
+        args.instanceIds as string[],
+        args.userId as string | null | undefined,
+      );
     case 'listTaskInstanceSteps':
       return listTaskInstanceSteps(
         args.userId as string,
@@ -1291,16 +1300,17 @@ async function getTaskInstanceViews(
 }
 
 /**
- * getTaskInstance — read ONE of the caller's own materialized TaskInstances by instanceId. The
- * owner is the authenticated caller (Cognito `sub`); no userId is accepted, so a caller can only
- * read their own rows (delegated access is intentionally out of scope). Returns null when the
- * instance doesn't exist for the caller. `status` is derived like getTaskInstanceViews.
+ * getTaskInstance — read ONE materialized TaskInstance by instanceId. Omitted `requestedUserId`
+ * preserves the original self-scoped behavior; a supplied non-self id requires effective
+ * SupportPerson delegation. Returns null when the instance doesn't exist for the resolved user.
+ * `status` is derived like getTaskInstanceViews.
  */
 async function getTaskInstance(
   identity: AppSyncIdentity | undefined,
   instanceId: string,
+  requestedUserId?: string | null,
 ): Promise<TaskInstance | null> {
-  const userId = requireCaller(identity);
+  const userId = await resolveTaskInstanceReadUser(identity, requestedUserId);
   const id = instanceId?.trim();
   if (!id) throw new ValidationError('instanceId is required and cannot be empty');
   const parsed = parseInstanceId(id);
@@ -1317,19 +1327,21 @@ async function getTaskInstance(
 }
 
 /**
- * listTaskInstances — the caller's own real/materialized TaskInstances whose scheduledDate falls
- * in [startDate, endDate]. The owner is the authenticated caller (no userId argument). Unlike
- * getTaskInstanceViews this returns ONLY rows that exist in DynamoDB — it never synthesizes
- * virtual occurrences — and is truly paginated via the opaque nextToken. `status` is derived
- * (a past-due non-terminal instance surfaces as OVERDUE; the stored row is never rewritten).
+ * listTaskInstances — one resolved user's real/materialized TaskInstances whose scheduledDate
+ * falls in [startDate, endDate]. Omitted `requestedUserId` preserves self-scoped reads; a supplied
+ * non-self id requires effective SupportPerson delegation. Unlike getTaskInstanceViews this
+ * returns ONLY rows that exist in DynamoDB — it never synthesizes virtual occurrences — and is
+ * truly paginated via the opaque nextToken. `status` is derived (a past-due non-terminal instance
+ * surfaces as OVERDUE; the stored row is never rewritten).
  */
 async function listTaskInstances(
   identity: AppSyncIdentity | undefined,
   startDate: string,
   endDate: string,
   page: PageArgs,
+  requestedUserId?: string | null,
 ): Promise<Connection<TaskInstance>> {
-  const userId = requireCaller(identity);
+  const userId = await resolveTaskInstanceReadUser(identity, requestedUserId);
   const { start, end } = validateDateRange(startDate, endDate);
 
   // Date-sorted SK ⇒ one BETWEEN scopes the USER#<userId> partition to instance rows in the
@@ -1354,16 +1366,18 @@ async function listTaskInstances(
 }
 
 /**
- * batchGetTaskInstances — read up to 100 of the caller's own materialized TaskInstances by id in
- * one shot. The owner is the authenticated caller (no userId argument). Returns one result per
- * requested id, in the SAME order, with `item: null` for ids that don't exist for the caller.
- * Invalid ids are rejected before any IO. `status` is derived (OVERDUE surfaced).
+ * batchGetTaskInstances — read up to 100 of one resolved user's materialized TaskInstances by id
+ * in one shot. Omitted `requestedUserId` preserves self-scoped reads; a supplied non-self id
+ * requires effective SupportPerson delegation. Returns one result per requested id, in the SAME
+ * order, with `item: null` for ids that don't exist for the resolved user. Invalid ids are rejected
+ * before instance IO. `status` is derived (OVERDUE surfaced).
  */
 async function batchGetTaskInstances(
   identity: AppSyncIdentity | undefined,
   instanceIds: string[],
+  requestedUserId?: string | null,
 ): Promise<TaskInstanceLookupResult[]> {
-  const userId = requireCaller(identity);
+  const userId = await resolveTaskInstanceReadUser(identity, requestedUserId);
   if (!Array.isArray(instanceIds) || instanceIds.length === 0) {
     throw new ValidationError('instanceIds is required and cannot be empty');
   }
@@ -1388,6 +1402,24 @@ async function batchGetTaskInstances(
     const item = bySk.get(sk);
     return { instanceId: id, item: item ? presentInstanceRead(item, nowMs) : null };
   });
+}
+
+/**
+ * Resolve the USER# partition for a materialized-instance read. Keeping userId optional is
+ * backward-compatible with the original self-only API: omitted/null always means the caller.
+ * An explicitly supplied id (including the caller's own id) goes through the shared delegation
+ * predicate, whose self path is read-free and whose non-self path fails closed unless the
+ * SupportPerson relationship is currently effective.
+ */
+async function resolveTaskInstanceReadUser(
+  identity: AppSyncIdentity | undefined,
+  requestedUserId?: string | null,
+): Promise<string> {
+  if (requestedUserId == null) return requireCaller(identity);
+  const userId = requestedUserId.trim();
+  if (!userId) throw new ValidationError('userId is required and cannot be empty');
+  await assertCanActForUser(identity, userId);
+  return userId;
 }
 
 async function listTaskInstanceSteps(

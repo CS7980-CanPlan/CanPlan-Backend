@@ -1,12 +1,13 @@
 import { DateTime } from 'luxon';
-import { queryAll, queryAllItems } from './batch';
+import { batchGet, queryAll, queryAllItems } from './batch';
 import { TABLE_NAME } from './dynamodb';
 import {
   ENTITY,
-  CATEGORY_PREFIX,
+  META_SK,
   TASK_INSTANCE_PREFIX,
   TASK_INSTANCE_STEP_PREFIX,
-  TASK_OWNER_INDEX,
+  categorySk,
+  taskPk,
   userPk,
 } from './keys';
 import type {
@@ -80,19 +81,35 @@ export function aggregateByCategory(
   tasks: Task[],
   categories: Category[],
 ): ReportStats['byCategory'] {
-  const categoryOfTask = new Map(tasks.map((t) => [t.taskId, t.categoryId]));
-  const nameOfCategory = new Map(categories.map((c) => [c.categoryId, c.name]));
-  const acc = new Map<string, { completed: number; total: number }>();
+  const taskById = new Map(tasks.map((task) => [task.taskId, task]));
+  const nameOfCategory = new Map(
+    categories.map((category) => [
+      ownerCategoryKey(category.ownerId, category.categoryId),
+      category.name,
+    ]),
+  );
+  const acc = new Map<
+    string,
+    { categoryId: string; categoryName: string; completed: number; total: number }
+  >();
   for (const inst of instances) {
-    const categoryId = categoryOfTask.get(inst.taskId) ?? 'unknown';
-    const a = acc.get(categoryId) ?? { completed: 0, total: 0 };
+    const task = taskById.get(inst.taskId);
+    const categoryId = task?.categoryId ?? 'unknown';
+    const aggregateKey = task ? ownerCategoryKey(task.ownerId, task.categoryId) : 'unknown';
+    const categoryName = task ? (nameOfCategory.get(aggregateKey) ?? categoryId) : 'unknown';
+    const a = acc.get(aggregateKey) ?? {
+      categoryId,
+      categoryName,
+      completed: 0,
+      total: 0,
+    };
     a.total++;
     if (inst.status === 'COMPLETED') a.completed++;
-    acc.set(categoryId, a);
+    acc.set(aggregateKey, a);
   }
-  return [...acc.entries()].map(([categoryId, a]) => ({
-    categoryId,
-    categoryName: nameOfCategory.get(categoryId) ?? categoryId,
+  return [...acc.values()].map((a) => ({
+    categoryId: a.categoryId,
+    categoryName: a.categoryName,
     completed: a.completed,
     total: a.total,
     completionRate: rate(a.completed, a.total),
@@ -198,7 +215,11 @@ export function aggregateFocus(instances: TaskInstance[], tasks: Task[]): Report
     a.totalSeconds += inst.activeDurationSeconds;
     a.samples++;
     acc.set(inst.taskId, a);
-    if (inst.status === 'COMPLETED' && typeof inst.elapsedSeconds === 'number' && inst.elapsedSeconds > 0) {
+    if (
+      inst.status === 'COMPLETED' &&
+      typeof inst.elapsedSeconds === 'number' &&
+      inst.elapsedSeconds > 0
+    ) {
       activeSum += inst.activeDurationSeconds;
       elapsedSum += inst.elapsedSeconds;
     }
@@ -298,10 +319,84 @@ export function computeReportStats(input: ReportComputeInput): ReportStats {
   };
 }
 
+/** A task/category pair is owner-scoped even though category ids are UUIDs. */
+function ownerCategoryKey(ownerId: string, categoryId: string): string {
+  return `${ownerId}\u0000${categoryId}`;
+}
+
+/**
+ * Load the current metadata for every distinct task represented by the report's instances.
+ * Task ids are globally keyed, so this works for the normal delegated flow where the Task is
+ * owned by the SupportPerson but the TaskInstance lives in the primary user's partition.
+ *
+ * A deleted or malformed row is intentionally omitted: the aggregators already preserve the
+ * instance counts and fall back to taskId / "unknown" metadata.
+ */
+async function loadInstanceTasks(instances: TaskInstance[]): Promise<Task[]> {
+  const requestedIds = [...new Set(instances.map((instance) => instance.taskId))];
+  if (requestedIds.length === 0) return [];
+
+  const requested = new Set(requestedIds);
+  const rows = await batchGet(requestedIds.map((taskId) => ({ PK: taskPk(taskId), SK: META_SK })));
+
+  return rows.filter((row): row is Record<string, unknown> & Task => {
+    const taskId = row.taskId;
+    return (
+      row.entityType === ENTITY.TASK &&
+      typeof taskId === 'string' &&
+      requested.has(taskId) &&
+      row.PK === taskPk(taskId) &&
+      row.SK === META_SK &&
+      typeof row.ownerId === 'string' &&
+      row.ownerId.length > 0 &&
+      typeof row.title === 'string' &&
+      typeof row.categoryId === 'string' &&
+      row.categoryId.length > 0
+    );
+  });
+}
+
+/**
+ * Load only the categories referenced by the resolved tasks. Category storage is owner-scoped,
+ * so the owner/category pair is deduplicated and validated as a pair before its name is used.
+ */
+async function loadTaskCategories(tasks: Task[]): Promise<Category[]> {
+  const requestedPairs = new Map<string, { ownerId: string; categoryId: string }>();
+  for (const task of tasks) {
+    requestedPairs.set(ownerCategoryKey(task.ownerId, task.categoryId), {
+      ownerId: task.ownerId,
+      categoryId: task.categoryId,
+    });
+  }
+  if (requestedPairs.size === 0) return [];
+
+  const rows = await batchGet(
+    [...requestedPairs.values()].map(({ ownerId, categoryId }) => ({
+      PK: userPk(ownerId),
+      SK: categorySk(categoryId),
+    })),
+  );
+
+  return rows.filter((row): row is Record<string, unknown> & Category => {
+    if (
+      row.entityType !== ENTITY.CATEGORY ||
+      typeof row.ownerId !== 'string' ||
+      typeof row.categoryId !== 'string' ||
+      typeof row.name !== 'string'
+    ) {
+      return false;
+    }
+    const requested = requestedPairs.has(ownerCategoryKey(row.ownerId, row.categoryId));
+    return requested && row.PK === userPk(row.ownerId) && row.SK === categorySk(row.categoryId);
+  });
+}
+
 /**
  * Gather a user's task data for the range and compute the deterministic stats.
- * Instances use a single BETWEEN on the date-sorted SK; steps/categories are prefix
- * scans of the user partition; tasks come from the owner index (title + category).
+ * Instances use a single BETWEEN on the date-sorted SK and steps use a prefix scan of the
+ * target user's partition. Task metadata is BatchGot by the distinct task ids represented in
+ * those instances (tasks can be owned by the supporting person); only those tasks' exact
+ * owner/category pairs are then BatchGot for category names.
  */
 export async function buildReportStats(
   userId: string,
@@ -309,7 +404,7 @@ export async function buildReportStats(
   to: string,
 ): Promise<ReportStats> {
   const pk = userPk(userId);
-  const [instances, allSteps, tasks, categories] = await Promise.all([
+  const [instances, allSteps] = await Promise.all([
     queryAll<TaskInstance>({
       TableName: TABLE_NAME,
       KeyConditionExpression: 'PK = :pk AND SK BETWEEN :from AND :to',
@@ -324,19 +419,13 @@ export async function buildReportStats(
     // rows and filters to the range in memory. Fine at current scale; the first scale
     // follow-up is to date-key steps (or add a GSI).
     queryAllItems<TaskInstanceStep>(pk, TASK_INSTANCE_STEP_PREFIX),
-    queryAll<Task>({
-      TableName: TABLE_NAME,
-      IndexName: TASK_OWNER_INDEX,
-      KeyConditionExpression: 'ownerId = :owner',
-      FilterExpression: 'entityType = :task',
-      ExpressionAttributeValues: { ':owner': userId, ':task': ENTITY.TASK },
-    }),
-    queryAllItems<Category>(pk, CATEGORY_PREFIX),
   ]);
 
   // Keep only step rows belonging to in-range instances (steps aren't date-keyed).
   const inRange = new Set(instances.map((i) => i.instanceId));
   const steps = allSteps.filter((s) => inRange.has(s.instanceId));
+  const tasks = await loadInstanceTasks(instances);
+  const categories = await loadTaskCategories(tasks);
 
   return computeReportStats({
     userId,

@@ -14,7 +14,7 @@ interface TabDef {
 }
 
 const TABS: TabDef[] = [
-  { to: '/admin', label: 'Overview', icon: <LayoutDashboard size={16} />, end: true },
+  { to: '/admin/home', label: 'Overview', icon: <LayoutDashboard size={16} />, end: true },
   { to: '/admin/users', label: 'Users', icon: <Users size={16} /> },
   { to: '/admin/tasks', label: 'Tasks', icon: <ListChecks size={16} /> },
   { to: '/admin/organizations', label: 'Organizations', icon: <Building2 size={16} /> },

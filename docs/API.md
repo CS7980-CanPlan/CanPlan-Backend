@@ -1,6 +1,6 @@
 # CanPlan 2.0 — Frontend API Reference
 
-_Last updated: 2026-07-15. Version: SupportPerson delegation (schedules, categories, task templates) + organization management, membership-session-bound SupportLink lifecycle, and the PrimaryUser/SupportPerson organization directory + AI progress reports (two-step generate → save, SupportPerson-only)._
+_Last updated: 2026-07-22. Version: SupportPerson delegation (schedules, categories, task templates) + organization management, membership-session-bound SupportLink lifecycle, the PrimaryUser/SupportPerson organization directory, and SupportPerson-only AI progress reports (generate → save → directory/download)._
 
 > ## 🚨 Breaking change — categories, default category, Task status, TaskStep keys
 >
@@ -50,17 +50,19 @@ human-readable companion.
 > **primary user's** account, never the SupportPerson's. Anyone else gets `NOT_AUTHORIZED`.
 >
 > The **report operations** — `generateReport`, `saveReport`, `listReports`,
-> `getReportDownloadUrl`, `deleteReport` — are a **SupportPerson-only** surface: the caller must
-> be a `SUPPORT_PERSON` with a **currently effective** `SupportLink` to the target
-> `PRIMARY_USER` (ACTIVE, same current organization, and a selection snapshot matching both
-> live membership sessions — the same delegation rule as everything else, below). A primary user may
-> **not** access their own reports. See
-> [AI progress reports](#ai-progress-reports--two-step-generate--save).
+> `listMySupportedUserReports`, `getReportDownloadUrl`, `getReportPdfDownloadUrl`, and
+> `deleteReport` — are a **SupportPerson-only** surface: the caller must be a `SUPPORT_PERSON`
+> with a **currently effective** `SupportLink` to each target `PRIMARY_USER` (ACTIVE, same
+> current organization, and a selection snapshot matching both live membership sessions — the
+> same delegation rule as everything else, below). A primary user may **not** access their own
+> reports. See
+> [AI progress reports](#ai-progress-reports--generate-save-browse-and-download).
 >
-> **Self-scoped TaskInstance reads.** `getTaskInstance`, `listTaskInstances`, and
-> `batchGetTaskInstances` take **no `userId`** — they derive the owner from the caller's `sub`
-> and return `NOT_AUTHORIZED` for an unauthenticated caller, so a caller can only ever read
-> their own instances.
+> **TaskInstance reads.** `getTaskInstance`, `listTaskInstances`, and
+> `batchGetTaskInstances` keep their original self-scoped behavior when `userId` is omitted/null:
+> the partition owner is derived from the caller's `sub`. A supplied non-self `userId` requires
+> currently effective SupportPerson delegation to that primary user. Unauthenticated callers and
+> callers without that relationship get `NOT_AUTHORIZED`.
 >
 > **SupportPerson delegated access.** A `SUPPORT_PERSON` may act on a `PRIMARY_USER`
 > they have **selected** — `selectPrimaryUser` writes an **ACTIVE** `SupportLink` carrying an
@@ -80,8 +82,9 @@ human-readable companion.
 > **every assignment / instance operation** for the selected user (`createTaskAssignment`,
 > `startTaskInstance`, `setTaskInstanceStepCompletion`, `updateTaskInstanceStatus`,
 > `cancelTaskInstance`, `endTaskAssignment`, `deleteTaskAssignment`,
-> `listTaskAssignmentsForUser`, `getTaskInstanceViews`, `listTaskInstanceSteps`), **manage that
-> user's categories**, and **fully manage that user's own task templates** — create tasks under
+> `listTaskAssignmentsForUser`, `getTaskInstanceViews`, `getTaskInstance`, `listTaskInstances`,
+> `batchGetTaskInstances`, `listTaskInstanceSteps`), **manage that user's categories**, and
+> **fully manage that user's own task templates** — create tasks under
 > them, edit/delete their tasks, add/edit/delete/reorder their task steps, manage their task
 > media, and list their tasks (`createTask` with `userId`, `updateTask`, `deleteTask`,
 > `createTaskStep`, `updateTaskStep`, `deleteTaskStep`, `reorderTaskSteps`, `updateTaskOrder`,
@@ -107,9 +110,9 @@ human-readable companion.
 > **Profile APIs:** profile reads (`getUserProfile`) remain readable by any authenticated caller.
 > `updateMyUserProfile` only ever edits the caller's own profile.
 >
-> **Do not bake "the server lets me, so it's allowed" into the client.** Always pass the
-> caller's own id for self-scoped operations, and treat a `NOT_AUTHORIZED` denial as a normal,
-> handleable outcome.
+> **Do not bake "the server lets me, so it's allowed" into the client.** Omit `userId` (or pass
+> the caller's own id) for self-scoped operations, and treat a `NOT_AUTHORIZED` denial as a
+> normal, handleable outcome.
 
 ---
 
@@ -127,12 +130,12 @@ authorization model above). It is also load-bearing in how data is keyed and rea
 - `createUserProfile` ignores any client-supplied id and uses your `sub` from the
   session (see below), so your profile always lands at `USER#<sub>`.
 - The `userId`/`ownerId`-argument operations (`createTaskAssignment`, `startTaskInstance`,
-  `getTaskInstanceViews`, `listTaskInstanceSteps`, and the Task/category/media writes) are
+  `getTaskInstanceViews`, `getTaskInstance`, `listTaskInstances`, `batchGetTaskInstances`,
+  `listTaskInstanceSteps`, and the Task/category/media writes) are
   authorized against that id: it must be your own, or one you may act for as a delegated
   SupportPerson. A non-self id you have no effective delegation for is rejected — it will
-  **not** silently write to another partition. (The newer `getTaskInstance` /
-  `listTaskInstances` / `batchGetTaskInstances` reads take **no `userId`** and always
-  resolve the owner from your identity.)
+  **not** silently read or write another partition. For the three materialized-instance reads,
+  omitted/null `userId` remains shorthand for the authenticated caller.
 - **The exception is `getUserProfile(userId)`**, which is still readable by any
   authenticated caller (per-relationship gating isn't implemented — see
   [Not available yet](#not-available-yet)); passing another user's id returns their
@@ -877,6 +880,14 @@ categories via the optional `userId` — see below)
 > **`reorderTaskSteps`**. A missing/foreign task returns `NOT_FOUND`/`NOT_AUTHORIZED` (no
 > orphan steps are ever created).
 >
+> **An EMPTY task always appends at `order: 1`.** With zero steps there is nothing to
+> collide with, so the append position is 1 regardless of the internal counter — deleting a
+> task's last step does not strand it (the counter is stale after such a delete because
+> deletes never reclaim orders, and it is not readable via GraphQL). The append transaction
+> resets the counter accordingly, which also heals tasks emptied before this rule existed.
+> Clients can rely on: current step count `N > 0` ⇒ normalize with `reorderTaskSteps` then
+> append at `N + 1`; `N = 0` ⇒ append at `1`.
+>
 > A standalone create may include `media: [{ type, assetId }]` to attach existing uploaded
 > assets in the same transaction as the new step. Each type is allowed once and every entry
 > requires a non-null `assetId` of that exact type. The nested `createTask.steps` input does
@@ -1045,9 +1056,9 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 | `deleteTaskAssignment`          | `input: { userId!, assignmentId! }`                                                                                            | `TaskAssignment!` · **soft delete** — `active: false`, `endedAt` set, `activeTaskAssignmentTaskId` removed (unblocking `deleteTask`). 404s if missing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `listTaskAssignmentsForUser`    | `userId!, limit, nextToken`                                                                                                    | `TaskAssignmentConnection!` · a user's schedule rules (active + ended).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `getTaskInstanceViews`          | `userId!, startDate!, endDate!`                                                                                                | `TaskInstanceViewConnection!` · the calendar feed (both dates `YYYY-MM-DD`, **max 370-day** span). See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `getTaskInstance`               | `instanceId!`                                                                                                                  | `TaskInstance` · **self-scoped** — reads one of your **own** materialized instances; the owner is the Cognito identity (**no `userId` argument**). `null` when it doesn't exist for you. `status` is derived (`OVERDUE` surfaced). See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `listTaskInstances`             | `startDate!, endDate!, limit, nextToken`                                                                                       | `TaskInstanceConnection!` · **self-scoped** — your **own** real/materialized instances in `[startDate, endDate]` (`YYYY-MM-DD`, same **max 370-day** span). **Only real rows** — never virtual occurrences. Truly paginated. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `batchGetTaskInstances`         | `instanceIds!`                                                                                                                 | `[TaskInstanceLookupResult!]!` · **self-scoped** — batch-reads up to **100** of your **own** instances by id; returns one entry per id **in request order**, with `item: null` for ids that don't exist for you. `status` derived. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `getTaskInstance`               | `instanceId!, userId`                                                                                                          | `TaskInstance` · reads one materialized instance. Omitted/null `userId` ⇒ caller's own partition; non-self `userId` requires effective SupportPerson delegation. `null` when it doesn't exist for the resolved user. `status` is derived (`OVERDUE` surfaced). See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `listTaskInstances`             | `userId, startDate!, endDate!, limit, nextToken`                                                                               | `TaskInstanceConnection!` · real/materialized instances in `[startDate, endDate]` (`YYYY-MM-DD`, same **max 370-day** span). Omitted/null `userId` ⇒ caller; non-self requires effective SupportPerson delegation. **Only real rows** — never virtual occurrences. Truly paginated. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `batchGetTaskInstances`         | `instanceIds!, userId`                                                                                                         | `[TaskInstanceLookupResult!]!` · batch-reads up to **100** instances from the resolved user's partition. Omitted/null `userId` ⇒ caller; non-self requires effective SupportPerson delegation. Returns one entry per id **in request order**, with `item: null` for missing ids. `status` derived. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `listTaskInstanceSteps`         | `userId!, instanceId!, limit, nextToken`                                                                                       | `TaskInstanceStepConnection!` · one instance's step snapshots, sorted by `order`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 > **`getTaskInstanceViews` is the calendar feed.** For `[startDate, endDate]` it (1) queries
@@ -1078,26 +1089,28 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 > }
 > ```
 
-> **Self-scoped instance reads (`getTaskInstance` / `listTaskInstances` / `batchGetTaskInstances`).**
-> These three return **only real, materialized `TaskInstance` rows** and are **self-scoped**: the
-> owner is always the authenticated caller's Cognito identity, so — unlike the `userId`-argument
-> operations above — they take **no `userId`** and a caller can only ever read their **own**
-> instances (SupportPerson/delegated access is not wired for them yet). An unauthenticated caller
-> gets `NOT_AUTHORIZED`. Unlike `getTaskInstanceViews`, they **never synthesize virtual
-> occurrences** — use `getTaskInstanceViews` for the virtual + real calendar feed. `status` is
-> derived identically (`OVERDUE` surfaced for a past-due non-terminal instance; never written back).
+> **Materialized-instance reads (`getTaskInstance` / `listTaskInstances` /
+> `batchGetTaskInstances`).** These three return **only real `TaskInstance` rows**. Their optional
+> `userId` is backward compatible: omitted/null resolves to the authenticated caller, while a
+> supplied non-self id is authorized by the same currently-effective SupportPerson delegation
+> predicate as the rest of scheduling. An unauthenticated caller, stale/revoked relationship, or
+> non-SupportPerson cross-user caller gets `NOT_AUTHORIZED`. Unlike `getTaskInstanceViews`, these
+> queries **never synthesize virtual occurrences**. `status` is derived identically (`OVERDUE`
+> surfaced for a past-due non-terminal instance; never written back).
 >
-> - `getTaskInstance(instanceId)` → the instance, or `null` if it doesn't exist for you. An
->   invalid `instanceId` is a `VALIDATION` error.
-> - `listTaskInstances(startDate, endDate, limit, nextToken)` → your real instances whose
->   `scheduledDate` falls in the window (date-sorted SK `BETWEEN`), paged by an opaque `nextToken`.
-> - `batchGetTaskInstances(instanceIds)` → one `TaskInstanceLookupResult { instanceId, item }` per
->   requested id, **in the same order**, with `item: null` for ids missing for you. Requires a
->   non-empty list of **≤ 100** ids; an empty list, > 100 ids, or any invalid id is a `VALIDATION` error.
+> - `getTaskInstance(instanceId, userId?)` → the instance, or `null` if it doesn't exist for the
+>   resolved user. An invalid `instanceId` is a `VALIDATION` error.
+> - `listTaskInstances(userId?, startDate, endDate, limit, nextToken)` → real instances for the
+>   resolved user whose `scheduledDate` falls in the window (date-sorted SK `BETWEEN`), paged by
+>   an opaque `nextToken`.
+> - `batchGetTaskInstances(instanceIds, userId?)` → one
+>   `TaskInstanceLookupResult { instanceId, item }` per requested id, **in the same order**, with
+>   `item: null` for ids missing for the resolved user. Requires a non-empty list of **≤ 100**
+>   ids; an empty list, > 100 ids, or any invalid id is a `VALIDATION` error.
 >
 > ```graphql
-> query MyInstances($startDate: String!, $endDate: String!, $ids: [ID!]!) {
->   listTaskInstances(startDate: $startDate, endDate: $endDate) {
+> query Instances($userId: ID, $startDate: String!, $endDate: String!, $ids: [ID!]!) {
+>   listTaskInstances(userId: $userId, startDate: $startDate, endDate: $endDate) {
 >     items {
 >       instanceId
 >       assignmentId
@@ -1108,7 +1121,7 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 >     }
 >     nextToken
 >   }
->   batchGetTaskInstances(instanceIds: $ids) {
+>   batchGetTaskInstances(instanceIds: $ids, userId: $userId) {
 >     instanceId
 >     item {
 >       instanceId
@@ -1694,7 +1707,7 @@ mutation CreateAiTask($input: CreateAiTaskInput!) {
 
 ---
 
-### AI progress reports — two-step generate → save
+### AI progress reports — generate, save, browse, and download
 
 Producing a report is a **two-step flow** so the frontend can show a preview and let the user
 decide before anything is stored:
@@ -1710,13 +1723,28 @@ Every number is **computed in code** from the user's task data; the AI (Bedrock)
 **narrative** prose over those pre-computed stats — it is instructed not to invent numbers and
 not to give medical/clinical/behavioral advice.
 
-| Operation                      | Input                                                                          | Returns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| ------------------------------ | ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `generateReport` (mutation)    | `input: { userId!, from!, to! }`                                               | `GeneratedReport!` · **synchronous, non-persisting preview**: gathers the user's instances in `[from, to]`, computes the stats, and has the AI write the narrative — all in memory. Writes **nothing** to S3 or DynamoDB. Returns `{ draftToken, scope, dateRange, generatedAt, narrative, stats }`: the content to render, plus a server-signed `draftToken` to hand to `saveReport`. `from`/`to` are plain `YYYY-MM-DD` (inclusive); `from ≤ to` and the span is capped at **366 days** — violations are `VALIDATION` errors. Expect a few seconds of latency (one Bedrock call).                       |
-| `saveReport` (mutation)        | `input: { draftToken!, scope!, dateRange!, generatedAt!, narrative!, stats! }` | `Report!` · persists a report previously produced by `generateReport`. Re-submit the **exact** content plus its `draftToken`; the server verifies the token against the content (below), then writes the full JSON to S3 (`reports/<userId>/<reportId>.json` in the private media bucket) plus a DynamoDB index row, sets `s3Key`, and stamps `createdBy` (the caller) + `createdAt` + a fresh `reportId`. **Recomputes no stats and calls no model.** A stale, expired, or tampered draft is rejected before any write. The result echoes `narrative`/`stats` inline so no follow-up download is needed. |
-| `listReports` (query)          | `userId!, limit, nextToken`                                                    | `ReportConnection!` · the user's saved report metadata rows, **newest-first**, paginated like every other list. (Index rows carry no `narrative`/`stats` — those are null here.)                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `getReportDownloadUrl` (query) | `userId!, reportId!`                                                           | `MediaDownloadTarget!` · short-lived presigned **GET** for a saved report's JSON document (same `{ downloadUrl, s3Key, expiresIn }` shape and TTL as media downloads). Only signs reports that actually exist for that user — an unknown `reportId` is a not-found error, never an arbitrary-key signature.                                                                                                                                                                                                                                                                                               |
-| `deleteReport` (mutation)      | `userId!, reportId!`                                                           | `Boolean!` · deletes a saved report — the DynamoDB index row first, then the S3 JSON object (so the index never points at a missing object). Returns `true`; an unknown `reportId` is a not-found error.                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Operation                            | Input                                                                          | Returns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------------------------------------ | ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `generateReport` (mutation)          | `input: { userId!, from!, to! }`                                               | `GeneratedReport!` · **synchronous, non-persisting preview**: gathers the user's instances in `[from, to]`, computes the stats, and has the AI write the narrative — all in memory. Writes **nothing** to S3 or DynamoDB. Returns `{ draftToken, scope, dateRange, generatedAt, narrative, stats }`: the content to render, plus a server-signed `draftToken` to hand to `saveReport`. `from`/`to` are plain `YYYY-MM-DD` (inclusive); `from ≤ to` and the span is capped at **366 days** — violations are `VALIDATION` errors. Expect a few seconds of latency (one Bedrock call).                       |
+| `saveReport` (mutation)              | `input: { draftToken!, scope!, dateRange!, generatedAt!, narrative!, stats! }` | `Report!` · persists a report previously produced by `generateReport`. Re-submit the **exact** content plus its `draftToken`; the server verifies the token against the content (below), then writes the full JSON to S3 (`reports/<userId>/<reportId>.json` in the private media bucket) plus a DynamoDB index row, sets `s3Key`, and stamps `createdBy` (the caller) + `createdAt` + a fresh `reportId`. **Recomputes no stats and calls no model.** A stale, expired, or tampered draft is rejected before any write. The result echoes `narrative`/`stats` inline so no follow-up download is needed. |
+| `listReports` (query)                | `userId!, limit, nextToken`                                                    | `ReportConnection!` · one user's saved report metadata rows, **newest saved first**. This remains useful on a primary-user detail page. Index rows carry no `narrative`/`stats`; fetch the saved JSON to render the full report.                                                                                                                                                                                                                                                                                                                                                                          |
+| `listMySupportedUserReports` (query) | `filter: { userId?, createdFrom?, createdTo? }, limit, nextToken`              | `ReportConnection!` · one globally ordered directory across every primary user the caller **currently supports**, **newest saved first**. Omit `filter` for all recent reports. `userId` narrows to one currently supported user. `createdFrom`/`createdTo` are inclusive `AWSDateTime` bounds on `Report.createdAt` (when it was saved), not its task-history `dateRange`. The opaque cursor is bound to the normalized filter; discard it whenever a filter changes. Default page size is 20, maximum 100. Rows are metadata-only, like `listReports`.                                                  |
+| `getReportDownloadUrl` (query)       | `userId!, reportId!`                                                           | `MediaDownloadTarget!` · short-lived presigned **GET** for a saved report's JSON document (same `{ downloadUrl, s3Key, expiresIn }` shape and TTL as media downloads). Only signs reports that actually exist for that user — an unknown `reportId` is a not-found error, never an arbitrary-key signature. Fetch this document to render the saved report detail page.                                                                                                                                                                                                                                   |
+| `getReportPdfDownloadUrl` (query)    | `userId!, reportId!`                                                           | `MediaDownloadTarget!` · generates a private PDF attachment from the authoritative saved JSON, stores/overwrites the deterministic cache object `report-pdf-cache/<userId>/<reportId>.pdf`, and returns a **15-minute** presigned GET. The object is `application/pdf`, attachment-only, private, and `no-store`; requesting it again regenerates the PDF.                                                                                                                                                                                                                                                |
+| `deleteReport` (mutation)            | `userId!, reportId!`                                                           | `Boolean!` · removes the DynamoDB index row, authoritative S3 JSON document, and deterministic cached PDF. A private cleanup journal makes the operation safe to retry after a partial S3 failure, even when the visible report row is already gone. Returns `true` after cleanup completes; a `reportId` with neither a report nor unfinished cleanup is a not-found error.                                                                                                                                                                                                                              |
+
+`listMySupportedUserReports` applies the same live delegation test as every other report read.
+It is not merely “reports created by me”: if another support person saved a report for a primary
+user whom the caller also currently supports, that report is visible. Conversely, a report
+disappears from this directory as soon as that caller's SupportLink is revoked or becomes stale.
+The backend queries only currently authorized user partitions and merges them deterministically;
+there is no cross-tenant report scan and no reports GSI.
+
+For date-picker filters, convert each local calendar boundary to an exact UTC instant before
+calling the directory. For example, a Vancouver selection for July 1–2 can be sent as
+`createdFrom: "2026-07-01T07:00:00.000Z"` and
+`createdTo: "2026-07-03T06:59:59.999Z"`. Filtering by the period summarized by a report is a
+different concern: parse and inspect the returned `dateRange` metadata.
 
 > **`draftToken` — anti-tamper contract.** `generateReport` signs an HMAC-SHA256 token
 > (backend-only secret, `REPORT_DRAFT_SIGNING_SECRET`) that binds a **canonical hash** of the
@@ -1731,15 +1759,17 @@ not to give medical/clinical/behavioral advice.
 > is exactly and only what `saveReport` does.
 
 > **Authorization — SupportPerson only.** Every report operation (`generateReport`, `saveReport`,
-> `listReports`, `getReportDownloadUrl`, `deleteReport`) requires the caller to be a
-> `SUPPORT_PERSON` with a **currently effective** `SupportLink` to the target `PRIMARY_USER` —
-> ACTIVE, both currently in the same organization, and the link's selection snapshot matching
-> both live membership sessions. This is the identical delegation rule enforced everywhere else (see the
-> **Authorization model** section at the top). A **primary user may not access their own reports** (self-access
-> is denied): reports are produced _for_ a supporter. Anyone else — unauthenticated, non-supporter,
-> revoked/absent link, non-primary target, or cross-org — gets `NOT_AUTHORIZED`. For `saveReport`
-> the target user is taken from the **signed** draft token, so the caller cannot redirect a save to
-> a different user.
+> `listReports`, `listMySupportedUserReports`, `getReportDownloadUrl`,
+> `getReportPdfDownloadUrl`, `deleteReport`) requires the caller to be a `SUPPORT_PERSON` with a
+> **currently effective** `SupportLink` to each target `PRIMARY_USER` — ACTIVE, both currently in
+> the same organization, and the link's selection snapshot matching both live membership
+> sessions. This is the identical delegation rule enforced everywhere else (see the
+> **Authorization model** section at the top). A **primary user may not access their own reports**
+> (self-access is denied): reports are produced _for_ a supporter. Anyone else —
+> unauthenticated, non-supporter, revoked/absent link, non-primary target, or cross-org — gets
+> `NOT_AUTHORIZED`. For `saveReport` the target user is taken from the **signed** draft token, so
+> the caller cannot redirect a save to a different user. The cross-user directory re-evaluates
+> the caller's effective links on every page; a supplied `filter.userId` is authorized directly.
 
 > **`GeneratedReport` (generateReport output).** `{ draftToken, scope, dateRange, generatedAt,
 narrative, stats }`. `scope`, `dateRange`, and `stats` are `AWSJSON`, so they arrive as JSON
@@ -1755,9 +1785,10 @@ narrative, stats }` — the same shape you received from `generateReport`. `scop
 
 > **`Report` (GraphQL) — a saved report.** `{ reportId, scope, dateRange, s3Key, createdBy,
 createdAt, narrative, stats }`. Only `saveReport` produces one, so `s3Key` is always set. The
-> `saveReport` response echoes `narrative`/`stats` inline (the content you just saved); `listReports`
-> rows leave both null (fetch the saved JSON via `getReportDownloadUrl`). `scope`, `dateRange`, and
-> `stats` are `AWSJSON` output strings, same as above.
+> `saveReport` response echoes `narrative`/`stats` inline (the content you just saved);
+> `listReports` and `listMySupportedUserReports` rows leave both null (fetch the saved JSON via
+> `getReportDownloadUrl`). `scope`, `dateRange`, and `stats` are `AWSJSON` output strings, same as
+> above.
 >
 > A saved report's downloadable S3 document has the same content (here `scope`/`dateRange`
 > are plain nested objects — it's a raw S3 object, not a GraphQL response):
@@ -1863,12 +1894,51 @@ query ReadReports($userId: ID!, $reportId: ID!) {
     downloadUrl # GET this URL → the full JSON document (stats + narrative)
     expiresIn
   }
+  getReportPdfDownloadUrl(userId: $userId, reportId: $reportId) {
+    downloadUrl # GET this URL → a private application/pdf attachment
+    s3Key
+    expiresIn # 900 seconds
+  }
+}
+
+# Top-level SupportPerson report directory. Omit filter for every currently supported user,
+# newest saved first. These are saved-at timestamps, not the report's summarized dateRange.
+query ReportDirectory($filter: SupportedReportFilterInput, $limit: Int, $nextToken: String) {
+  listMySupportedUserReports(filter: $filter, limit: $limit, nextToken: $nextToken) {
+    items {
+      reportId
+      scope # AWSJSON → { userId }
+      dateRange # AWSJSON → the task-history period summarized
+      createdBy
+      createdAt
+    }
+    nextToken
+  }
 }
 
 mutation DeleteReport($userId: ID!, $reportId: ID!) {
-  deleteReport(userId: $userId, reportId: $reportId) # → true
+  # → true; removes the metadata row, authoritative JSON, and cached PDF
+  deleteReport(userId: $userId, reportId: $reportId)
 }
 ```
+
+Example directory variables:
+
+```json
+{
+  "filter": {
+    "userId": "8cfdc5a8-f0b1-7092-a9b2-83f84f85136e",
+    "createdFrom": "2026-07-01T07:00:00.000Z",
+    "createdTo": "2026-07-03T06:59:59.999Z"
+  },
+  "limit": 20,
+  "nextToken": null
+}
+```
+
+When changing any of the three filters, set `nextToken` back to `null`. The PDF and JSON URLs are
+private, temporary capabilities: request them only when the user opens or downloads a report,
+use them immediately, and request a fresh URL after expiry.
 
 ---
 
@@ -2037,9 +2107,9 @@ model: `TaskAssignment` (schedule rule), `TaskInstance` (one occurrence with sta
 - Operations: `startTaskInstance`, `updateTaskInstanceStatus`, `cancelTaskInstance`,
   `setTaskInstanceStepCompletion`, `startTaskInstanceStep`, `pauseTaskInstanceTimer`
   (server-calculated active-step timing), `getTaskInstanceViews` (the calendar feed),
-  `listTaskInstanceSteps`, and the **self-scoped** materialized-instance reads
-  `getTaskInstance`, `listTaskInstances`, `batchGetTaskInstances` (owner derived from the
-  Cognito identity — no `userId` — real rows only, `OVERDUE` derived on read).
+  `listTaskInstanceSteps`, and the materialized-instance reads `getTaskInstance`,
+  `listTaskInstances`, `batchGetTaskInstances` (optional `userId`: omitted/null means the caller;
+  non-self requires effective SupportPerson delegation; real rows only, `OVERDUE` derived on read).
 - Each `TaskInstance` and `TaskInstanceStep` also carries server-calculated active timing
   (`activeDurationSeconds`, plus `elapsedSeconds` on the instance and `firstStartedAt`/
   `lastStartedAt` on the step); see the **Active-step timing** note in the scheduling section.

@@ -1,4 +1,13 @@
-import { createContext, useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import {
+  createContext,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import {
   confirmSignIn,
   fetchAuthSession,
@@ -11,6 +20,7 @@ import {
   type AuthUser,
   type IdTokenPayload,
   type SignInStatus,
+  SUPPORT_PERSON_GROUP,
   SYSTEM_ADMIN_GROUP,
 } from './authTypes';
 
@@ -40,14 +50,29 @@ function statusFromStep(step: string | undefined, isSignedIn: boolean): SignInSt
  * which is the source of truth for SystemAdmin authorization.
  */
 export function AuthProvider({ children }: { children: ReactNode }) {
+  const queryClient = useQueryClient();
   const [session, setSession] = useState<SessionState>(EMPTY_SESSION);
   const [loading, setLoading] = useState(true);
+  const previousPrincipalRef = useRef<string | null>(null);
+
+  // Query keys are resource-scoped rather than Cognito-principal-scoped. Clear before exposing a
+  // changed session so a later account in this SPA cannot receive the prior account's data.
+  const clearCacheForPrincipalChange = useCallback(
+    (nextPrincipalId: string | null) => {
+      if (nextPrincipalId !== previousPrincipalRef.current) {
+        queryClient.clear();
+        previousPrincipalRef.current = nextPrincipalId;
+      }
+    },
+    [queryClient],
+  );
 
   const refreshSession = useCallback(async () => {
     try {
       const authSession = await fetchAuthSession();
       const idToken = authSession.tokens?.idToken;
       if (!idToken) {
+        clearCacheForPrincipalChange(null);
         setSession(EMPTY_SESSION);
         return;
       }
@@ -62,16 +87,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         username = (payload.email as string | undefined) ?? '';
       }
 
+      const userId = payload.sub ?? '';
+      clearCacheForPrincipalChange(userId);
       setSession({
-        user: { userId: payload.sub ?? '', username, email: payload.email },
+        user: { userId, username, email: payload.email },
         idToken: idToken.toString(),
         groups,
       });
     } catch {
       // No valid session (signed out / expired) — treat as logged out.
+      clearCacheForPrincipalChange(null);
       setSession(EMPTY_SESSION);
     }
-  }, []);
+  }, [clearCacheForPrincipalChange]);
 
   // Bootstrap the session once on mount.
   useEffect(() => {
@@ -107,8 +135,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signOut = useCallback(async () => {
     await amplifySignOut();
+    queryClient.clear();
+    previousPrincipalRef.current = null;
     setSession(EMPTY_SESSION);
-  }, []);
+  }, [queryClient]);
 
   const value = useMemo<AuthContextValue>(
     () => ({
@@ -116,6 +146,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       idToken: session.idToken,
       groups: session.groups,
       isSystemAdmin: session.groups.includes(SYSTEM_ADMIN_GROUP),
+      isSupportPerson: session.groups.includes(SUPPORT_PERSON_GROUP),
       loading,
       signIn,
       completeNewPassword,

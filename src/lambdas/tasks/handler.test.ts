@@ -615,6 +615,33 @@ describe('tasks handler — createTaskStep', () => {
     expect(tx()).toBeUndefined();
   });
 
+  it('appends at order 1 to an EMPTIED task, resetting a stale nextStepOrder left by deletes', async () => {
+    // Deleting a task's last step leaves stepCount 0 but nextStepOrder untouched (here 7).
+    // The empty task must accept order 1 again and reset the counter to 2 in the same
+    // versioned transaction — the pre-fix behavior demanded the unreadable order 7.
+    stub({ stepCount: 0, nextStepOrder: 7, stepVersion: 4 });
+    const result = (await handler(
+      event('createTaskStep', { input: { taskId: 't1', order: 1, text: 'Start over' } }),
+    )) as TaskStep;
+
+    const metaUpd = txMetaUpdate();
+    expect(metaUpd.UpdateExpression).toContain('nextStepOrder = :two');
+    expect(metaUpd.UpdateExpression).not.toContain('nextStepOrder = nextStepOrder + :one');
+    expect(metaUpd.ExpressionAttributeValues[':two']).toBe(2);
+    expect(metaUpd.ExpressionAttributeValues[':expectedVersion']).toBe(4);
+
+    expect(txStepPut().Item.order).toBe(1);
+    expect(result.order).toBe(1);
+  });
+
+  it('on an empty task the required order is 1 — the stale counter is never demanded', async () => {
+    stub({ stepCount: 0, nextStepOrder: 7, stepVersion: 4 });
+    await expect(
+      handler(event('createTaskStep', { input: { taskId: 't1', order: 7, text: 'x' } })),
+    ).rejects.toThrow('order must be 1 (the next available position)');
+    expect(tx()).toBeUndefined();
+  });
+
   it('enforces the 99-step cap before writing', async () => {
     stub({ stepCount: 99, nextStepOrder: 100 });
     await expect(

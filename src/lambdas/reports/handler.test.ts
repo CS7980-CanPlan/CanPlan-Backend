@@ -3,33 +3,43 @@
 process.env.REPORT_DRAFT_SIGNING_SECRET = 'handler-test-secret';
 
 import { handler } from './handler';
-import { assertCanAccessUserReports } from '../../shared/reportAuthz';
+import { assertCanAccessUserReports, listAccessibleReportUserIds } from '../../shared/reportAuthz';
 import { buildReportStats } from '../../shared/reportMetrics';
 import { generateReportNarrative } from '../../shared/reportNarrative';
 import {
   writeReport,
   listReports,
+  listMySupportedUserReports,
   getReportDownloadUrl,
+  getReportPdfDownloadUrl,
   deleteReport,
 } from '../../shared/reportStorage';
 import type { GeneratedReport, Report, SaveReportInput } from '../../shared/types';
 
-jest.mock('../../shared/reportAuthz', () => ({ assertCanAccessUserReports: jest.fn() }));
+jest.mock('../../shared/reportAuthz', () => ({
+  assertCanAccessUserReports: jest.fn(),
+  listAccessibleReportUserIds: jest.fn(),
+}));
 jest.mock('../../shared/reportMetrics', () => ({ buildReportStats: jest.fn() }));
 jest.mock('../../shared/reportNarrative', () => ({ generateReportNarrative: jest.fn() }));
 jest.mock('../../shared/reportStorage', () => ({
   writeReport: jest.fn(),
   listReports: jest.fn(),
+  listMySupportedUserReports: jest.fn(),
   getReportDownloadUrl: jest.fn(),
+  getReportPdfDownloadUrl: jest.fn(),
   deleteReport: jest.fn(),
 }));
 
 const mockAuthz = assertCanAccessUserReports as jest.Mock;
+const mockAccessibleUserIds = listAccessibleReportUserIds as jest.Mock;
 const mockStats = buildReportStats as jest.Mock;
 const mockNarrative = generateReportNarrative as jest.Mock;
 const mockWrite = writeReport as jest.Mock;
 const mockList = listReports as jest.Mock;
+const mockListSupported = listMySupportedUserReports as jest.Mock;
 const mockDownload = getReportDownloadUrl as jest.Mock;
+const mockPdfDownload = getReportPdfDownloadUrl as jest.Mock;
 const mockDelete = deleteReport as jest.Mock;
 
 const STATS = { meta: { totalInstances: 2 }, completion: { completionRate: 0.5 } };
@@ -64,6 +74,7 @@ async function generate(): Promise<GeneratedReport> {
 
 beforeEach(() => {
   mockAuthz.mockResolvedValue('sup-1');
+  mockAccessibleUserIds.mockResolvedValue(['u1', 'u2']);
   mockStats.mockResolvedValue(STATS);
   mockNarrative.mockResolvedValue('A summary.');
   mockWrite.mockImplementation(async (doc) => ({
@@ -101,8 +112,35 @@ describe('generateReport', () => {
 
   it('rejects from > to', async () => {
     await expect(
-      handler(event('generateReport', { input: { userId: 'u1', from: '2026-06-30', to: '2026-06-01' } })),
+      handler(
+        event('generateReport', { input: { userId: 'u1', from: '2026-06-30', to: '2026-06-01' } }),
+      ),
     ).rejects.toThrow('from');
+    expect(mockStats).not.toHaveBeenCalled();
+  });
+
+  it('accepts a report range of exactly 366 inclusive calendar days', async () => {
+    await expect(
+      handler(
+        event('generateReport', {
+          input: { userId: 'u1', from: '2026-01-01', to: '2027-01-01' },
+        }),
+      ),
+    ).resolves.toMatchObject({
+      scope: { userId: 'u1' },
+      dateRange: { from: '2026-01-01', to: '2027-01-01' },
+    });
+    expect(mockStats).toHaveBeenCalledWith('u1', '2026-01-01', '2027-01-01');
+  });
+
+  it('rejects a report range of 367 inclusive calendar days', async () => {
+    await expect(
+      handler(
+        event('generateReport', {
+          input: { userId: 'u1', from: '2026-01-01', to: '2027-01-02' },
+        }),
+      ),
+    ).rejects.toThrow('at most 366 days');
     expect(mockStats).not.toHaveBeenCalled();
   });
 
@@ -150,7 +188,10 @@ describe('saveReport', () => {
   it.each([
     ['narrative', (s: SaveReportInput) => ({ ...s, narrative: 'tampered summary' })],
     ['stats', (s: SaveReportInput) => ({ ...s, stats: { meta: { totalInstances: 999 } } })],
-    ['dateRange', (s: SaveReportInput) => ({ ...s, dateRange: { from: '2020-01-01', to: '2020-12-31' } })],
+    [
+      'dateRange',
+      (s: SaveReportInput) => ({ ...s, dateRange: { from: '2020-01-01', to: '2020-12-31' } }),
+    ],
     ['userId', (s: SaveReportInput) => ({ ...s, scope: { userId: 'attacker' } })],
   ])('rejects a tampered %s and writes nothing', async (_field, tamper) => {
     const gen = await generate();
@@ -182,7 +223,9 @@ describe('saveReport', () => {
     delete noToken.draftToken;
     mockAuthz.mockClear();
     mockWrite.mockClear();
-    await expect(handler(event('saveReport', { input: noToken as SaveReportInput }))).rejects.toThrow('draftToken');
+    await expect(
+      handler(event('saveReport', { input: noToken as SaveReportInput })),
+    ).rejects.toThrow('draftToken');
     expect(mockWrite).not.toHaveBeenCalled();
     expect(mockAuthz).not.toHaveBeenCalled();
   });
@@ -219,11 +262,120 @@ describe('listReports', () => {
   });
 });
 
+describe('listMySupportedUserReports', () => {
+  it('lists every currently accessible user with newest-first pagination arguments', async () => {
+    mockListSupported.mockResolvedValue({ items: [], nextToken: null });
+    await handler(event('listMySupportedUserReports', { limit: 25, nextToken: 'opaque-token' }));
+
+    expect(mockAccessibleUserIds).toHaveBeenCalledWith({ sub: 'sup-1' });
+    expect(mockAuthz).not.toHaveBeenCalled();
+    expect(mockListSupported).toHaveBeenCalledWith(
+      ['u1', 'u2'],
+      { userId: undefined, createdFrom: undefined, createdTo: undefined },
+      { limit: 25, nextToken: 'opaque-token' },
+    );
+  });
+
+  it('authorizes a selected user directly and canonicalizes saved-at timestamps', async () => {
+    mockListSupported.mockResolvedValue({ items: [], nextToken: null });
+    await handler(
+      event('listMySupportedUserReports', {
+        filter: {
+          userId: '  u2  ',
+          createdFrom: '2026-07-01T00:00:00-07:00',
+          createdTo: '2026-07-02T23:59:59-07:00',
+        },
+      }),
+    );
+
+    expect(mockAuthz).toHaveBeenCalledWith({ sub: 'sup-1' }, 'u2');
+    expect(mockAccessibleUserIds).not.toHaveBeenCalled();
+    expect(mockListSupported).toHaveBeenCalledWith(
+      ['u2'],
+      {
+        userId: 'u2',
+        createdFrom: '2026-07-01T07:00:00.000Z',
+        createdTo: '2026-07-03T06:59:59.000Z',
+      },
+      { limit: undefined, nextToken: undefined },
+    );
+  });
+
+  it('treats explicit null filter fields as omitted', async () => {
+    mockListSupported.mockResolvedValue({ items: [], nextToken: null });
+    await handler(
+      event('listMySupportedUserReports', {
+        filter: { userId: null, createdFrom: null, createdTo: null },
+      }),
+    );
+
+    expect(mockAccessibleUserIds).toHaveBeenCalledWith({ sub: 'sup-1' });
+    expect(mockAuthz).not.toHaveBeenCalled();
+    expect(mockListSupported).toHaveBeenCalledWith(
+      ['u1', 'u2'],
+      { userId: undefined, createdFrom: undefined, createdTo: undefined },
+      { limit: undefined, nextToken: undefined },
+    );
+  });
+
+  it.each([
+    ['an invalid createdFrom', { createdFrom: 'not-a-date' }, 'filter.createdFrom'],
+    [
+      'an inverted date range',
+      {
+        createdFrom: '2026-07-03T00:00:00.000Z',
+        createdTo: '2026-07-02T00:00:00.000Z',
+      },
+      'on or before',
+    ],
+    ['an empty userId', { userId: '  ' }, 'filter.userId'],
+  ])('rejects %s before authorization or storage', async (_case, filter, message) => {
+    await expect(handler(event('listMySupportedUserReports', { filter }))).rejects.toThrow(message);
+    expect(mockAuthz).not.toHaveBeenCalled();
+    expect(mockAccessibleUserIds).not.toHaveBeenCalled();
+    expect(mockListSupported).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unauthenticated caller before resolving support links', async () => {
+    await expect(handler(event('listMySupportedUserReports', {}, null))).rejects.toThrow(
+      'Unauthorized',
+    );
+    expect(mockAccessibleUserIds).not.toHaveBeenCalled();
+    expect(mockListSupported).not.toHaveBeenCalled();
+  });
+});
+
 describe('getReportDownloadUrl', () => {
   it('authorizes then signs', async () => {
     mockDownload.mockResolvedValue({ downloadUrl: 'x', s3Key: 'k', expiresIn: 900 });
     await handler(event('getReportDownloadUrl', { userId: 'u1', reportId: 'r-1' }));
     expect(mockAuthz).toHaveBeenCalledWith({ sub: 'sup-1' }, 'u1');
     expect(mockDownload).toHaveBeenCalledWith('u1', 'r-1');
+  });
+});
+
+describe('getReportPdfDownloadUrl', () => {
+  it('authorizes the current support relationship before generating and signing the PDF', async () => {
+    mockPdfDownload.mockResolvedValue({
+      downloadUrl: 'https://pdf',
+      s3Key: 'report-pdf-cache/u1/r-1.pdf',
+      expiresIn: 900,
+    });
+
+    const result = await handler(
+      event('getReportPdfDownloadUrl', { userId: '  u1  ', reportId: '  r-1  ' }),
+    );
+
+    expect(mockAuthz).toHaveBeenCalledWith({ sub: 'sup-1' }, 'u1');
+    expect(mockPdfDownload).toHaveBeenCalledWith('u1', 'r-1');
+    expect(result).toMatchObject({ downloadUrl: 'https://pdf', expiresIn: 900 });
+  });
+
+  it('rejects missing identifiers before authorization or storage work', async () => {
+    await expect(
+      handler(event('getReportPdfDownloadUrl', { userId: 'u1', reportId: '  ' })),
+    ).rejects.toThrow('reportId');
+    expect(mockAuthz).not.toHaveBeenCalled();
+    expect(mockPdfDownload).not.toHaveBeenCalled();
   });
 });

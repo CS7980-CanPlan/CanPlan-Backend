@@ -14,6 +14,10 @@ describe('Auth construct — Post Confirmation group assignment', () => {
   it('creates a public frontend client with USER_PASSWORD_AUTH and SRP enabled', () => {
     synth().hasResourceProperties('AWS::Cognito::UserPoolClient', {
       GenerateSecret: false,
+      RefreshTokenValidity: 5 * 24 * 60,
+      TokenValidityUnits: {
+        RefreshToken: 'minutes',
+      },
       ExplicitAuthFlows: Match.arrayWith([
         'ALLOW_USER_PASSWORD_AUTH',
         'ALLOW_USER_SRP_AUTH',
