@@ -9,6 +9,7 @@ import SupportHomePage from '../features/support/SupportHomePage';
 import SupportManagePage from '../features/support/SupportManagePage';
 import SupportProfilePage from '../features/support/SupportProfilePage';
 import SupportUserDetailPage from '../features/support/SupportUserDetailPage';
+import SupportTaskInstanceDetailPage from '../features/support/instances/SupportTaskInstanceDetailPage';
 import SupportTasksPage from '../features/support/tasks/SupportTasksPage';
 import SupportTaskCreatePage from '../features/support/tasks/SupportTaskCreatePage';
 import SupportTaskDetailPage from '../features/support/tasks/SupportTaskDetailPage';
@@ -66,6 +67,10 @@ export function AppRoutes() {
         <Route path="/support/tasks/:taskId" element={<SupportTaskDetailPage />} />
         <Route path="/support/profile" element={<SupportProfilePage />} />
         <Route path="/support/users/:userId" element={<SupportUserDetailPage />} />
+        <Route
+          path="/support/users/:userId/task-instances/:instanceId"
+          element={<SupportTaskInstanceDetailPage />}
+        />
       </Route>
 
       <Route path="*" element={<Navigate to="/" replace />} />

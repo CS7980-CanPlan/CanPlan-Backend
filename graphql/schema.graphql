@@ -931,7 +931,7 @@ type TaskInstanceConnection {
 }
 
 # One entry of a batchGetTaskInstances result: the requested instanceId paired with the
-# materialized TaskInstance, or `item: null` when that instance does not exist for the caller.
+# materialized TaskInstance, or `item: null` when it does not exist for the resolved user.
 # Results are returned in the same order as the requested ids.
 type TaskInstanceLookupResult {
   instanceId: ID!
@@ -1027,27 +1027,28 @@ type Query {
     endDate: String!
   ): TaskInstanceViewConnection!
 
-  # Read ONE of the caller's own materialized TaskInstances by instanceId. The owner is derived
-  # from the Cognito identity — there is no userId argument — so a caller can only ever read their
-  # own instances. Returns null when no such instance exists (or it isn't the caller's). `status`
-  # is derived like getTaskInstanceViews: a past-due non-terminal instance surfaces as OVERDUE.
-  getTaskInstance(instanceId: ID!): TaskInstance
-  # List the caller's own real/materialized TaskInstances whose scheduledDate falls in
-  # [startDate, endDate] (both YYYY-MM-DD, same max span as getTaskInstanceViews). The owner is
-  # derived from the Cognito identity — there is no userId argument. This returns ONLY real rows;
+  # Read ONE materialized TaskInstance by instanceId. Omitted/null userId means the authenticated
+  # caller's own partition; a non-self userId requires effective SupportPerson delegation to that
+  # primary user. Returns null when no such instance exists. `status` is derived like
+  # getTaskInstanceViews: a past-due non-terminal instance surfaces as OVERDUE.
+  getTaskInstance(instanceId: ID!, userId: ID): TaskInstance
+  # List real/materialized TaskInstances whose scheduledDate falls in [startDate, endDate] (both
+  # YYYY-MM-DD, same max span as getTaskInstanceViews). Omitted/null userId means the caller;
+  # a non-self userId requires effective SupportPerson delegation. This returns ONLY real rows;
   # it never synthesizes virtual occurrences (use getTaskInstanceViews for the virtual+real
   # calendar feed). Paginated by a DynamoDB nextToken. `status` is derived (OVERDUE surfaced).
   listTaskInstances(
+    userId: ID
     startDate: String!
     endDate: String!
     limit: Int
     nextToken: String
   ): TaskInstanceConnection!
-  # Batch-read up to 100 of the caller's own materialized TaskInstances by id. The owner is
-  # derived from the Cognito identity — there is no userId argument. Returns one result per
-  # requested id, in the SAME order, with `item: null` for ids that don't exist for the caller.
+  # Batch-read up to 100 materialized TaskInstances by id. Omitted/null userId means the caller;
+  # a non-self userId requires effective SupportPerson delegation. Returns one result per requested
+  # id, in the SAME order, with `item: null` for ids that don't exist for the resolved user.
   # `status` is derived (OVERDUE surfaced) just like getTaskInstance.
-  batchGetTaskInstances(instanceIds: [ID!]!): [TaskInstanceLookupResult!]!
+  batchGetTaskInstances(instanceIds: [ID!]!, userId: ID): [TaskInstanceLookupResult!]!
 
   # One instance's step snapshots, sorted by `order`.
   listTaskInstanceSteps(

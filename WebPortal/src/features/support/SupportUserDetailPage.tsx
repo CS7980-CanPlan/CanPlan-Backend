@@ -1,4 +1,5 @@
 import { useEffect, type ReactNode } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, ClipboardList, FolderTree, ListChecks, RefreshCw } from 'lucide-react';
 import { Link, useLocation, useParams } from 'react-router-dom';
 import {
@@ -6,6 +7,7 @@ import {
   useUserCategories,
   useUserProfile,
   useTasksByOwner,
+  supportKeys,
 } from '../../api/supportHooks';
 import { authErrorMessage } from '../../auth/authError';
 import { Alert } from '../../components/ui/Alert';
@@ -16,6 +18,7 @@ import { MetricStrip } from '../admin/components/MetricStrip';
 import { Panel } from '../admin/components/Panel';
 import { formatDate, IdCell, RoleBadge } from '../admin/components/display';
 import { SupportedUserCalendar } from './calendar/SupportedUserCalendar';
+import { SupportedUserTaskInstances } from './instances/SupportedUserTaskInstances';
 import { SupportedUserAssignments } from './tasks/SupportedUserAssignments';
 import styles from '../admin/admin.module.css';
 
@@ -27,6 +30,7 @@ import styles from '../admin/admin.module.css';
 export default function SupportUserDetailPage() {
   const { userId = '' } = useParams<{ userId: string }>();
   const location = useLocation();
+  const queryClient = useQueryClient();
 
   const profileQuery = useUserProfile(userId);
   const tasksQuery = useTasksByOwner(userId);
@@ -49,9 +53,11 @@ export default function SupportUserDetailPage() {
     const targetId =
       location.hash === '#calendar'
         ? 'calendar'
-        : location.hash === '#assignments'
-          ? 'assignments'
-          : '';
+        : location.hash === '#task-instances'
+          ? 'task-instances'
+          : location.hash === '#assignments'
+            ? 'assignments'
+            : '';
     if (targetId) {
       document.getElementById(targetId)?.scrollIntoView({ block: 'start' });
     }
@@ -62,6 +68,8 @@ export default function SupportUserDetailPage() {
     tasksQuery.refetch();
     categoriesQuery.refetch();
     assignmentsQuery.refetch();
+    queryClient.invalidateQueries({ queryKey: supportKeys.taskInstances(userId) });
+    queryClient.invalidateQueries({ queryKey: supportKeys.calendar(userId) });
   }
 
   return (
@@ -125,6 +133,8 @@ export default function SupportUserDetailPage() {
           <Alert variant="warning">This user does not have a profile record yet.</Alert>
         )}
       </Panel>
+
+      <SupportedUserTaskInstances key={userId} userId={userId} displayName={displayName} />
 
       <SupportedUserCalendar userId={userId} displayName={displayName} />
 

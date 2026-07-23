@@ -21,6 +21,10 @@ import type {
   TaskAssignment,
   TaskAssignmentConnection,
   TaskConnection,
+  TaskInstance,
+  TaskInstanceConnection,
+  TaskInstanceStep,
+  TaskInstanceStepConnection,
   TaskInstanceViewConnection,
   TaskStep,
   TaskStepConnection,
@@ -41,6 +45,7 @@ import {
   DELETE_TASK_ASSIGNMENT,
   DELETE_TASK_STEP,
   END_TASK_ASSIGNMENT,
+  GET_TASK_INSTANCE,
   GET_TASK_INSTANCE_VIEWS,
   GET_TASK,
   GET_USER_PROFILE,
@@ -48,6 +53,8 @@ import {
   LIST_MY_ORGANIZATION_USERS,
   LIST_MY_SUPPORT_LIST,
   LIST_TASK_ASSIGNMENTS_FOR_USER,
+  LIST_TASK_INSTANCES,
+  LIST_TASK_INSTANCE_STEPS,
   LIST_TASK_STEPS,
   LIST_TASKS_BY_OWNER,
   REORDER_TASK_STEPS,
@@ -164,6 +171,102 @@ export async function getTaskInstanceViews(
 }
 
 /**
+ * Read one materialized instance. Supplying `userId` invokes delegated access; omitting it asks
+ * the backend to resolve the authenticated caller's own partition.
+ */
+export async function getTaskInstance(
+  userId: string | undefined,
+  instanceId: string,
+): Promise<TaskInstance | null> {
+  const data = await gqlRequest<{ getTaskInstance: TaskInstance | null }>(GET_TASK_INSTANCE, {
+    instanceId,
+    userId: userId?.trim() || null,
+  });
+  return data.getTaskInstance;
+}
+
+/** One cursor page of real/materialized instances in an inclusive date range. */
+export async function listTaskInstances(
+  userId: string | undefined,
+  startDate: string,
+  endDate: string,
+  args: PageArgs = {},
+): Promise<TaskInstanceConnection> {
+  const data = await gqlRequest<{ listTaskInstances: TaskInstanceConnection }>(
+    LIST_TASK_INSTANCES,
+    {
+      userId: userId?.trim() || null,
+      startDate,
+      endDate,
+      limit: args.limit,
+      nextToken: args.nextToken ?? null,
+    },
+  );
+  return data.listTaskInstances;
+}
+
+/**
+ * Drain every materialized-instance page in the selected range. The backend caps each range at
+ * 370 days; callers choose that bounded range before invoking this helper.
+ */
+export async function listAllTaskInstancesForUser(
+  userId: string,
+  startDate: string,
+  endDate: string,
+): Promise<TaskInstance[]> {
+  const instances: TaskInstance[] = [];
+  const seenTokens = new Set<string>();
+  let nextToken: string | null = null;
+
+  do {
+    const page = await listTaskInstances(userId, startDate, endDate, {
+      limit: 100,
+      nextToken,
+    });
+    instances.push(...page.items);
+    nextToken = checkedNextToken('listTaskInstances', page.nextToken, seenTokens);
+  } while (nextToken);
+
+  return instances;
+}
+
+/** One cursor page of immutable step snapshots for a materialized instance. */
+export async function listTaskInstanceSteps(
+  userId: string,
+  instanceId: string,
+  args: PageArgs = {},
+): Promise<TaskInstanceStepConnection> {
+  const data = await gqlRequest<{ listTaskInstanceSteps: TaskInstanceStepConnection }>(
+    LIST_TASK_INSTANCE_STEPS,
+    {
+      userId,
+      instanceId,
+      limit: args.limit,
+      nextToken: args.nextToken ?? null,
+    },
+  );
+  return data.listTaskInstanceSteps;
+}
+
+/** Drain every step-snapshot page and preserve the backend's numeric step order. */
+export async function listAllTaskInstanceSteps(
+  userId: string,
+  instanceId: string,
+): Promise<TaskInstanceStep[]> {
+  const steps: TaskInstanceStep[] = [];
+  const seenTokens = new Set<string>();
+  let nextToken: string | null = null;
+
+  do {
+    const page = await listTaskInstanceSteps(userId, instanceId, { limit: 100, nextToken });
+    steps.push(...page.items);
+    nextToken = checkedNextToken('listTaskInstanceSteps', page.nextToken, seenTokens);
+  } while (nextToken);
+
+  return steps.sort((left, right) => left.order - right.order);
+}
+
+/**
  * Drain EVERY page of one user's assignments. User-centered schedule management must include
  * active and ended rules beyond the first DynamoDB/AppSync page.
  */
@@ -179,6 +282,20 @@ export async function listAllTaskAssignmentsForUser(userId: string): Promise<Tas
     nextToken = page.nextToken;
   } while (nextToken);
   return assignments;
+}
+
+/** Reject a malformed/cyclic pagination response instead of issuing an unbounded request loop. */
+function checkedNextToken(
+  operation: string,
+  nextToken: string | null,
+  seenTokens: Set<string>,
+): string | null {
+  if (!nextToken) return null;
+  if (seenTokens.has(nextToken)) {
+    throw new Error(`${operation} returned a repeated pagination token.`);
+  }
+  seenTokens.add(nextToken);
+  return nextToken;
 }
 
 export async function getTask(taskId: string): Promise<Task | null> {

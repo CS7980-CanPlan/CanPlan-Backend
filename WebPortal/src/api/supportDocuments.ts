@@ -93,6 +93,45 @@ const TASK_INSTANCE_VIEW_FIELDS = `
   isException
 `;
 
+const TASK_INSTANCE_FIELDS = `
+  instanceId
+  assignmentId
+  taskId
+  userId
+  scheduledDate
+  scheduledTime
+  scheduledFor
+  timezone
+  status
+  startedAt
+  completedAt
+  skippedAt
+  cancelledAt
+  activeStepId
+  activeStepStartedAt
+  activeDurationSeconds
+  elapsedSeconds
+  isException
+  createdAt
+  updatedAt
+`;
+
+const TASK_INSTANCE_STEP_FIELDS = `
+  instanceId
+  assignmentId
+  taskId
+  stepId
+  order
+  text
+  completed
+  completedAt
+  firstStartedAt
+  lastStartedAt
+  activeDurationSeconds
+  createdAt
+  updatedAt
+`;
+
 // ── Queries ──────────────────────────────────────────────────────────────────────
 export const GET_USER_PROFILE = /* GraphQL */ `
   query GetUserProfile($userId: ID!) {
@@ -188,6 +227,64 @@ export const GET_TASK_INSTANCE_VIEWS = /* GraphQL */ `
     getTaskInstanceViews(userId: $userId, startDate: $startDate, endDate: $endDate) {
       items {
         ${TASK_INSTANCE_VIEW_FIELDS}
+      }
+      nextToken
+    }
+  }
+`;
+
+/**
+ * One real/materialized TaskInstance. `userId` is omitted for a self-read and supplied when a
+ * SupportPerson reads a primary user through an effective delegated relationship.
+ */
+export const GET_TASK_INSTANCE = /* GraphQL */ `
+  query GetTaskInstance($instanceId: ID!, $userId: ID) {
+    getTaskInstance(instanceId: $instanceId, userId: $userId) {
+      ${TASK_INSTANCE_FIELDS}
+    }
+  }
+`;
+
+/** Materialized instances only (never virtual occurrences), cursor-paginated by date. */
+export const LIST_TASK_INSTANCES = /* GraphQL */ `
+  query ListTaskInstances(
+    $startDate: String!
+    $endDate: String!
+    $userId: ID
+    $limit: Int
+    $nextToken: String
+  ) {
+    listTaskInstances(
+      startDate: $startDate
+      endDate: $endDate
+      userId: $userId
+      limit: $limit
+      nextToken: $nextToken
+    ) {
+      items {
+        ${TASK_INSTANCE_FIELDS}
+      }
+      nextToken
+    }
+  }
+`;
+
+/** Immutable step snapshots and their per-occurrence completion/timing details. */
+export const LIST_TASK_INSTANCE_STEPS = /* GraphQL */ `
+  query ListTaskInstanceSteps(
+    $userId: ID!
+    $instanceId: ID!
+    $limit: Int
+    $nextToken: String
+  ) {
+    listTaskInstanceSteps(
+      userId: $userId
+      instanceId: $instanceId
+      limit: $limit
+      nextToken: $nextToken
+    ) {
+      items {
+        ${TASK_INSTANCE_STEP_FIELDS}
       }
       nextToken
     }

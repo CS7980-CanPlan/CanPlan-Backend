@@ -57,10 +57,11 @@ human-readable companion.
 > **not** access their own reports. See
 > [AI progress reports](#ai-progress-reports--two-step-generate--save).
 >
-> **Self-scoped TaskInstance reads.** `getTaskInstance`, `listTaskInstances`, and
-> `batchGetTaskInstances` take **no `userId`** — they derive the owner from the caller's `sub`
-> and return `NOT_AUTHORIZED` for an unauthenticated caller, so a caller can only ever read
-> their own instances.
+> **TaskInstance reads.** `getTaskInstance`, `listTaskInstances`, and
+> `batchGetTaskInstances` keep their original self-scoped behavior when `userId` is omitted/null:
+> the partition owner is derived from the caller's `sub`. A supplied non-self `userId` requires
+> currently effective SupportPerson delegation to that primary user. Unauthenticated callers and
+> callers without that relationship get `NOT_AUTHORIZED`.
 >
 > **SupportPerson delegated access.** A `SUPPORT_PERSON` may act on a `PRIMARY_USER`
 > they have **selected** — `selectPrimaryUser` writes an **ACTIVE** `SupportLink` carrying an
@@ -80,8 +81,9 @@ human-readable companion.
 > **every assignment / instance operation** for the selected user (`createTaskAssignment`,
 > `startTaskInstance`, `setTaskInstanceStepCompletion`, `updateTaskInstanceStatus`,
 > `cancelTaskInstance`, `endTaskAssignment`, `deleteTaskAssignment`,
-> `listTaskAssignmentsForUser`, `getTaskInstanceViews`, `listTaskInstanceSteps`), **manage that
-> user's categories**, and **fully manage that user's own task templates** — create tasks under
+> `listTaskAssignmentsForUser`, `getTaskInstanceViews`, `getTaskInstance`, `listTaskInstances`,
+> `batchGetTaskInstances`, `listTaskInstanceSteps`), **manage that user's categories**, and
+> **fully manage that user's own task templates** — create tasks under
 > them, edit/delete their tasks, add/edit/delete/reorder their task steps, manage their task
 > media, and list their tasks (`createTask` with `userId`, `updateTask`, `deleteTask`,
 > `createTaskStep`, `updateTaskStep`, `deleteTaskStep`, `reorderTaskSteps`, `updateTaskOrder`,
@@ -107,9 +109,9 @@ human-readable companion.
 > **Profile APIs:** profile reads (`getUserProfile`) remain readable by any authenticated caller.
 > `updateMyUserProfile` only ever edits the caller's own profile.
 >
-> **Do not bake "the server lets me, so it's allowed" into the client.** Always pass the
-> caller's own id for self-scoped operations, and treat a `NOT_AUTHORIZED` denial as a normal,
-> handleable outcome.
+> **Do not bake "the server lets me, so it's allowed" into the client.** Omit `userId` (or pass
+> the caller's own id) for self-scoped operations, and treat a `NOT_AUTHORIZED` denial as a
+> normal, handleable outcome.
 
 ---
 
@@ -127,12 +129,12 @@ authorization model above). It is also load-bearing in how data is keyed and rea
 - `createUserProfile` ignores any client-supplied id and uses your `sub` from the
   session (see below), so your profile always lands at `USER#<sub>`.
 - The `userId`/`ownerId`-argument operations (`createTaskAssignment`, `startTaskInstance`,
-  `getTaskInstanceViews`, `listTaskInstanceSteps`, and the Task/category/media writes) are
+  `getTaskInstanceViews`, `getTaskInstance`, `listTaskInstances`, `batchGetTaskInstances`,
+  `listTaskInstanceSteps`, and the Task/category/media writes) are
   authorized against that id: it must be your own, or one you may act for as a delegated
   SupportPerson. A non-self id you have no effective delegation for is rejected — it will
-  **not** silently write to another partition. (The newer `getTaskInstance` /
-  `listTaskInstances` / `batchGetTaskInstances` reads take **no `userId`** and always
-  resolve the owner from your identity.)
+  **not** silently read or write another partition. For the three materialized-instance reads,
+  omitted/null `userId` remains shorthand for the authenticated caller.
 - **The exception is `getUserProfile(userId)`**, which is still readable by any
   authenticated caller (per-relationship gating isn't implemented — see
   [Not available yet](#not-available-yet)); passing another user's id returns their
@@ -1053,9 +1055,9 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 | `deleteTaskAssignment`          | `input: { userId!, assignmentId! }`                                                                                            | `TaskAssignment!` · **soft delete** — `active: false`, `endedAt` set, `activeTaskAssignmentTaskId` removed (unblocking `deleteTask`). 404s if missing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `listTaskAssignmentsForUser`    | `userId!, limit, nextToken`                                                                                                    | `TaskAssignmentConnection!` · a user's schedule rules (active + ended).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `getTaskInstanceViews`          | `userId!, startDate!, endDate!`                                                                                                | `TaskInstanceViewConnection!` · the calendar feed (both dates `YYYY-MM-DD`, **max 370-day** span). See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `getTaskInstance`               | `instanceId!`                                                                                                                  | `TaskInstance` · **self-scoped** — reads one of your **own** materialized instances; the owner is the Cognito identity (**no `userId` argument**). `null` when it doesn't exist for you. `status` is derived (`OVERDUE` surfaced). See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `listTaskInstances`             | `startDate!, endDate!, limit, nextToken`                                                                                       | `TaskInstanceConnection!` · **self-scoped** — your **own** real/materialized instances in `[startDate, endDate]` (`YYYY-MM-DD`, same **max 370-day** span). **Only real rows** — never virtual occurrences. Truly paginated. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `batchGetTaskInstances`         | `instanceIds!`                                                                                                                 | `[TaskInstanceLookupResult!]!` · **self-scoped** — batch-reads up to **100** of your **own** instances by id; returns one entry per id **in request order**, with `item: null` for ids that don't exist for you. `status` derived. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `getTaskInstance`               | `instanceId!, userId`                                                                                                          | `TaskInstance` · reads one materialized instance. Omitted/null `userId` ⇒ caller's own partition; non-self `userId` requires effective SupportPerson delegation. `null` when it doesn't exist for the resolved user. `status` is derived (`OVERDUE` surfaced). See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `listTaskInstances`             | `userId, startDate!, endDate!, limit, nextToken`                                                                               | `TaskInstanceConnection!` · real/materialized instances in `[startDate, endDate]` (`YYYY-MM-DD`, same **max 370-day** span). Omitted/null `userId` ⇒ caller; non-self requires effective SupportPerson delegation. **Only real rows** — never virtual occurrences. Truly paginated. See below.                                                                                                                                                                                                                                                                                                                                                                                 |
+| `batchGetTaskInstances`         | `instanceIds!, userId`                                                                                                         | `[TaskInstanceLookupResult!]!` · batch-reads up to **100** instances from the resolved user's partition. Omitted/null `userId` ⇒ caller; non-self requires effective SupportPerson delegation. Returns one entry per id **in request order**, with `item: null` for missing ids. `status` derived. See below.                                                                                                                                                                                                                                                                                                                                                                    |
 | `listTaskInstanceSteps`         | `userId!, instanceId!, limit, nextToken`                                                                                       | `TaskInstanceStepConnection!` · one instance's step snapshots, sorted by `order`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 > **`getTaskInstanceViews` is the calendar feed.** For `[startDate, endDate]` it (1) queries
@@ -1086,26 +1088,28 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 > }
 > ```
 
-> **Self-scoped instance reads (`getTaskInstance` / `listTaskInstances` / `batchGetTaskInstances`).**
-> These three return **only real, materialized `TaskInstance` rows** and are **self-scoped**: the
-> owner is always the authenticated caller's Cognito identity, so — unlike the `userId`-argument
-> operations above — they take **no `userId`** and a caller can only ever read their **own**
-> instances (SupportPerson/delegated access is not wired for them yet). An unauthenticated caller
-> gets `NOT_AUTHORIZED`. Unlike `getTaskInstanceViews`, they **never synthesize virtual
-> occurrences** — use `getTaskInstanceViews` for the virtual + real calendar feed. `status` is
-> derived identically (`OVERDUE` surfaced for a past-due non-terminal instance; never written back).
+> **Materialized-instance reads (`getTaskInstance` / `listTaskInstances` /
+> `batchGetTaskInstances`).** These three return **only real `TaskInstance` rows**. Their optional
+> `userId` is backward compatible: omitted/null resolves to the authenticated caller, while a
+> supplied non-self id is authorized by the same currently-effective SupportPerson delegation
+> predicate as the rest of scheduling. An unauthenticated caller, stale/revoked relationship, or
+> non-SupportPerson cross-user caller gets `NOT_AUTHORIZED`. Unlike `getTaskInstanceViews`, these
+> queries **never synthesize virtual occurrences**. `status` is derived identically (`OVERDUE`
+> surfaced for a past-due non-terminal instance; never written back).
 >
-> - `getTaskInstance(instanceId)` → the instance, or `null` if it doesn't exist for you. An
->   invalid `instanceId` is a `VALIDATION` error.
-> - `listTaskInstances(startDate, endDate, limit, nextToken)` → your real instances whose
->   `scheduledDate` falls in the window (date-sorted SK `BETWEEN`), paged by an opaque `nextToken`.
-> - `batchGetTaskInstances(instanceIds)` → one `TaskInstanceLookupResult { instanceId, item }` per
->   requested id, **in the same order**, with `item: null` for ids missing for you. Requires a
->   non-empty list of **≤ 100** ids; an empty list, > 100 ids, or any invalid id is a `VALIDATION` error.
+> - `getTaskInstance(instanceId, userId?)` → the instance, or `null` if it doesn't exist for the
+>   resolved user. An invalid `instanceId` is a `VALIDATION` error.
+> - `listTaskInstances(userId?, startDate, endDate, limit, nextToken)` → real instances for the
+>   resolved user whose `scheduledDate` falls in the window (date-sorted SK `BETWEEN`), paged by
+>   an opaque `nextToken`.
+> - `batchGetTaskInstances(instanceIds, userId?)` → one
+>   `TaskInstanceLookupResult { instanceId, item }` per requested id, **in the same order**, with
+>   `item: null` for ids missing for the resolved user. Requires a non-empty list of **≤ 100**
+>   ids; an empty list, > 100 ids, or any invalid id is a `VALIDATION` error.
 >
 > ```graphql
-> query MyInstances($startDate: String!, $endDate: String!, $ids: [ID!]!) {
->   listTaskInstances(startDate: $startDate, endDate: $endDate) {
+> query Instances($userId: ID, $startDate: String!, $endDate: String!, $ids: [ID!]!) {
+>   listTaskInstances(userId: $userId, startDate: $startDate, endDate: $endDate) {
 >     items {
 >       instanceId
 >       assignmentId
@@ -1116,7 +1120,7 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 >     }
 >     nextToken
 >   }
->   batchGetTaskInstances(instanceIds: $ids) {
+>   batchGetTaskInstances(instanceIds: $ids, userId: $userId) {
 >     instanceId
 >     item {
 >       instanceId
@@ -2045,9 +2049,9 @@ model: `TaskAssignment` (schedule rule), `TaskInstance` (one occurrence with sta
 - Operations: `startTaskInstance`, `updateTaskInstanceStatus`, `cancelTaskInstance`,
   `setTaskInstanceStepCompletion`, `startTaskInstanceStep`, `pauseTaskInstanceTimer`
   (server-calculated active-step timing), `getTaskInstanceViews` (the calendar feed),
-  `listTaskInstanceSteps`, and the **self-scoped** materialized-instance reads
-  `getTaskInstance`, `listTaskInstances`, `batchGetTaskInstances` (owner derived from the
-  Cognito identity — no `userId` — real rows only, `OVERDUE` derived on read).
+  `listTaskInstanceSteps`, and the materialized-instance reads `getTaskInstance`,
+  `listTaskInstances`, `batchGetTaskInstances` (optional `userId`: omitted/null means the caller;
+  non-self requires effective SupportPerson delegation; real rows only, `OVERDUE` derived on read).
 - Each `TaskInstance` and `TaskInstanceStep` also carries server-calculated active timing
   (`activeDurationSeconds`, plus `elapsedSeconds` on the instance and `firstStartedAt`/
   `lastStartedAt` on the step); see the **Active-step timing** note in the scheduling section.

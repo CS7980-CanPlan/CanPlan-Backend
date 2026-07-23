@@ -1143,7 +1143,7 @@ describe('listTaskAssignmentsForUser', () => {
   });
 });
 
-// ── getTaskInstance / listTaskInstances / batchGetTaskInstances (self-scoped reads) ──
+// ── getTaskInstance / listTaskInstances / batchGetTaskInstances (self/delegated reads) ──
 /** A stored TaskInstance row (with PK/SK/entityType), overridable per test. */
 const storedInstance = (over: Rec = {}): Rec => ({
   instanceId: 'a1#2099-07-02#09:00',
@@ -1180,6 +1180,8 @@ describe('getTaskInstance', () => {
     expect((result as Rec).PK).toBeUndefined();
     expect((result as Rec).SK).toBeUndefined();
     expect((result as Rec).entityType).toBeUndefined();
+    // Backward-compatible omission stays self-scoped and needs no delegated-access lookup.
+    expect(mockAssertCanAct).not.toHaveBeenCalled();
   });
 
   it('returns null when the instance does not exist', async () => {
@@ -1202,13 +1204,34 @@ describe('getTaskInstance', () => {
     expect(mockSend).not.toHaveBeenCalled();
   });
 
-  it('uses the caller sub, never a client-provided userId', async () => {
-    db.instance = storedInstance();
+  it('uses an explicitly supplied delegated userId after authorizing it', async () => {
+    db.instance = storedInstance({ userId: 'primary-1', PK: 'USER#primary-1' });
     await handler(
-      event('getTaskInstance', { instanceId: 'a1#2099-07-02#09:00', userId: 'attacker' }, 'u1'),
+      event(
+        'getTaskInstance',
+        { instanceId: 'a1#2099-07-02#09:00', userId: 'primary-1' },
+        'support-1',
+      ),
     );
-    // The row is read from the CALLER's partition, not the injected userId.
-    expect(inputs()[0].Key.PK).toBe('USER#u1');
+    expect(mockAssertCanAct).toHaveBeenCalledWith(
+      expect.objectContaining({ sub: 'support-1' }),
+      'primary-1',
+    );
+    expect(inputs()[0].Key.PK).toBe('USER#primary-1');
+  });
+
+  it('blocks an explicitly supplied userId when delegation is denied', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
+    await expect(
+      handler(
+        event(
+          'getTaskInstance',
+          { instanceId: 'a1#2099-07-02#09:00', userId: 'primary-1' },
+          'support-1',
+        ),
+      ),
+    ).rejects.toThrow('no active support link');
+    expect(mockSend).not.toHaveBeenCalled();
   });
 });
 
@@ -1227,6 +1250,38 @@ describe('listTaskInstances', () => {
     expect(result.items).toHaveLength(1);
     expect(result.items[0].instanceId).toBe('a1#2099-07-02#09:00');
     expect((result.items[0] as Rec).PK).toBeUndefined();
+    expect(mockAssertCanAct).not.toHaveBeenCalled();
+  });
+
+  it('queries a delegated primary user partition after authorization', async () => {
+    db.instancesInRange = [storedInstance({ userId: 'primary-1', PK: 'USER#primary-1' })];
+    await handler(
+      event(
+        'listTaskInstances',
+        { userId: 'primary-1', startDate: '2099-07-01', endDate: '2099-07-03' },
+        'support-1',
+      ),
+    );
+
+    expect(mockAssertCanAct).toHaveBeenCalledWith(
+      expect.objectContaining({ sub: 'support-1' }),
+      'primary-1',
+    );
+    expect(inputs()[0].ExpressionAttributeValues[':pk']).toBe('USER#primary-1');
+  });
+
+  it('does not query instances when delegated access is denied', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
+    await expect(
+      handler(
+        event(
+          'listTaskInstances',
+          { userId: 'primary-1', startDate: '2099-07-01', endDate: '2099-07-03' },
+          'support-1',
+        ),
+      ),
+    ).rejects.toThrow('no active support link');
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
   it('supports limit and round-trips an opaque nextToken', async () => {
@@ -1325,6 +1380,39 @@ describe('batchGetTaskInstances', () => {
     await handler(event('batchGetTaskInstances', { instanceIds: [A, B] }, 'u1'));
     const keys: Rec[] = byCommand('BatchGetCommand')[0].RequestItems['CanPlan-test'].Keys;
     expect(keys.every((k) => k.PK === 'USER#u1')).toBe(true);
+    expect(mockAssertCanAct).not.toHaveBeenCalled();
+  });
+
+  it('reads only from an authorized delegated primary user partition', async () => {
+    withStore({ [skA]: storedInstance({ userId: 'primary-1', PK: 'USER#primary-1' }) });
+    await handler(
+      event(
+        'batchGetTaskInstances',
+        { userId: 'primary-1', instanceIds: [A] },
+        'support-1',
+      ),
+    );
+
+    expect(mockAssertCanAct).toHaveBeenCalledWith(
+      expect.objectContaining({ sub: 'support-1' }),
+      'primary-1',
+    );
+    const keys: Rec[] = byCommand('BatchGetCommand')[0].RequestItems['CanPlan-test'].Keys;
+    expect(keys.every((k) => k.PK === 'USER#primary-1')).toBe(true);
+  });
+
+  it('does not batch-read when delegated access is denied', async () => {
+    mockAssertCanAct.mockRejectedValueOnce(new UnauthorizedError('no active support link'));
+    await expect(
+      handler(
+        event(
+          'batchGetTaskInstances',
+          { userId: 'primary-1', instanceIds: [A] },
+          'support-1',
+        ),
+      ),
+    ).rejects.toThrow('no active support link');
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
   it('rejects an empty instanceIds list without any read', async () => {

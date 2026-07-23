@@ -39,7 +39,7 @@ export interface SupportedUserCalendarProps {
 
 /**
  * Read-only month calendar for a delegated primary user. It deliberately uses
- * getTaskInstanceViews rather than the self-scoped TaskInstance reads: the response overlays
+ * getTaskInstanceViews rather than the materialized-instance history reads: the response overlays
  * real TaskInstances onto virtual occurrences generated from active schedule rules.
  */
 export function SupportedUserCalendar({ userId, displayName }: SupportedUserCalendarProps) {
@@ -57,7 +57,8 @@ export function SupportedUserCalendar({ userId, displayName }: SupportedUserCale
     [calendarQuery.data],
   );
   const visibleMonthOccurrences = useMemo(
-    () => occurrences.filter((occurrence) => isIsoDateInMonth(occurrence.scheduledDate, visibleMonth)),
+    () =>
+      occurrences.filter((occurrence) => isIsoDateInMonth(occurrence.scheduledDate, visibleMonth)),
     [occurrences, visibleMonth],
   );
   const occurrencesByDate = useMemo(() => groupOccurrencesByDate(occurrences), [occurrences]);
@@ -332,7 +333,9 @@ function SelectedDayDetails({
       aria-live="polite"
     >
       <div className={styles.dayDetailsHead}>
-        <h3 id="selected-calendar-date" tabIndex={-1}>{formatLongDate(date)}</h3>
+        <h3 id="selected-calendar-date" tabIndex={-1}>
+          {formatLongDate(date)}
+        </h3>
         <span>
           {occurrences.length} task{occurrences.length === 1 ? '' : 's'}
         </span>

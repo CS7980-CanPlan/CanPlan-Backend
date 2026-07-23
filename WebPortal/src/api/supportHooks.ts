@@ -16,12 +16,15 @@ import {
   deleteTaskAssignment,
   deleteTaskStep,
   endTaskAssignment,
+  getTaskInstance,
   getTaskInstanceViews,
   getTask,
   getUserProfile,
   listAllMyOrganizationUsers,
   listAllMySupportList,
   listAllTaskAssignmentsForUser,
+  listAllTaskInstancesForUser,
+  listAllTaskInstanceSteps,
   listAllTaskSteps,
   listMyCategories,
   listTaskAssignmentsForUser,
@@ -53,6 +56,7 @@ const LIST_PAGE_SIZE = 100;
 /** Owned-template pages are small so "Load more" is visible well before the 50-task cap. */
 const OWNED_TASKS_PAGE_SIZE = 25;
 const SUPPORT_CALENDAR_KEY = ['support', 'calendar'] as const;
+const SUPPORT_TASK_INSTANCES_KEY = ['support', 'taskInstances'] as const;
 
 /** Centralized query keys so hooks and invalidation can't drift apart. */
 export const supportKeys = {
@@ -64,6 +68,13 @@ export const supportKeys = {
   assignments: (userId: string) => ['support', 'assignments', userId] as const,
   calendars: SUPPORT_CALENDAR_KEY,
   calendar: (userId: string) => [...SUPPORT_CALENDAR_KEY, userId] as const,
+  taskInstances: (userId: string) => [...SUPPORT_TASK_INSTANCES_KEY, userId] as const,
+  taskInstancesRange: (userId: string, startDate: string, endDate: string) =>
+    [...supportKeys.taskInstances(userId), 'range', startDate, endDate] as const,
+  taskInstance: (userId: string, instanceId: string) =>
+    [...supportKeys.taskInstances(userId), 'detail', instanceId] as const,
+  taskInstanceSteps: (userId: string, instanceId: string) =>
+    [...supportKeys.taskInstance(userId, instanceId), 'steps'] as const,
   ownedTasks: (ownerId: string) => ['support', 'ownedTasks', ownerId] as const,
   task: (taskId: string) => ['support', 'task', taskId] as const,
   taskSteps: (taskId: string) => ['support', 'taskSteps', taskId] as const,
@@ -139,6 +150,43 @@ export function useUserCalendar(userId: string | undefined, startDate: string, e
 }
 
 /**
+ * ALL real/materialized instances for a supported user in one inclusive, backend-bounded date
+ * range. Virtual schedule occurrences are intentionally excluded.
+ */
+export function useUserTaskInstances(
+  userId: string | undefined,
+  startDate: string,
+  endDate: string,
+) {
+  return useQuery({
+    queryKey: supportKeys.taskInstancesRange(userId ?? '', startDate, endDate),
+    queryFn: () => listAllTaskInstancesForUser(userId as string, startDate, endDate),
+    enabled: Boolean(userId && startDate && endDate),
+  });
+}
+
+/** One full materialized instance, including lifecycle completion and timing fields. */
+export function useUserTaskInstance(userId: string | undefined, instanceId: string | undefined) {
+  return useQuery({
+    queryKey: supportKeys.taskInstance(userId ?? '', instanceId ?? ''),
+    queryFn: () => getTaskInstance(userId as string, instanceId as string),
+    enabled: Boolean(userId && instanceId),
+  });
+}
+
+/** Every immutable step snapshot for one instance, sorted by numeric order. */
+export function useUserTaskInstanceSteps(
+  userId: string | undefined,
+  instanceId: string | undefined,
+) {
+  return useQuery({
+    queryKey: supportKeys.taskInstanceSteps(userId ?? '', instanceId ?? ''),
+    queryFn: () => listAllTaskInstanceSteps(userId as string, instanceId as string),
+    enabled: Boolean(userId && instanceId),
+  });
+}
+
+/**
  * ALL of one user's assignments, every page drained for the user-centered management panel.
  * Its key extends
  * `supportKeys.assignments(userId)`, so the assignment-mutation hooks' prefix invalidation
@@ -166,6 +214,9 @@ export function useUpdateMyUserProfile(userId: string | undefined) {
       qc.invalidateQueries({ queryKey: supportKeys.orgUsers });
       qc.invalidateQueries({ queryKey: supportKeys.supportList });
       qc.invalidateQueries({ queryKey: supportKeys.calendars });
+      // An organization change can revoke every delegated relationship immediately. Remove
+      // lifecycle/step details so stale supported-user data cannot remain visible from cache.
+      qc.removeQueries({ queryKey: SUPPORT_TASK_INSTANCES_KEY });
     },
   });
 }
@@ -185,6 +236,7 @@ export function useUnselectPrimaryUser() {
     onSuccess: (link) => {
       qc.invalidateQueries({ queryKey: supportKeys.supportList });
       qc.removeQueries({ queryKey: supportKeys.calendar(link.primaryUserId) });
+      qc.removeQueries({ queryKey: supportKeys.taskInstances(link.primaryUserId) });
     },
   });
 }

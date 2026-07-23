@@ -115,6 +115,50 @@ export type TaskInstanceStatus =
   | 'CANCELLED';
 
 /**
+ * One real/materialized occurrence of a TaskAssignment. Unlike TaskInstanceView, this carries
+ * lifecycle and timing details and is never a virtual schedule occurrence.
+ */
+export interface TaskInstance {
+  instanceId: string;
+  assignmentId: string;
+  taskId: string;
+  userId: string;
+  scheduledDate: string;
+  scheduledTime: string;
+  scheduledFor: string;
+  timezone: string;
+  status: TaskInstanceStatus;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  skippedAt?: string | null;
+  cancelledAt?: string | null;
+  activeStepId?: string | null;
+  activeStepStartedAt?: string | null;
+  activeDurationSeconds: number;
+  elapsedSeconds?: number | null;
+  isException?: boolean | null;
+  createdAt: string;
+  updatedAt?: string | null;
+}
+
+/** An immutable TaskStep snapshot plus completion/timing state for one materialized instance. */
+export interface TaskInstanceStep {
+  instanceId: string;
+  assignmentId: string;
+  taskId: string;
+  stepId: string;
+  order: number;
+  text: string;
+  completed: boolean;
+  completedAt?: string | null;
+  firstStartedAt?: string | null;
+  lastStartedAt?: string | null;
+  activeDurationSeconds: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
  * One calendar occurrence returned by getTaskInstanceViews. A virtual occurrence comes from
  * an active schedule rule and has no persisted TaskInstance yet (`instanceId: null`).
  */
@@ -195,6 +239,17 @@ export interface TaskAssignmentConnection {
 /** getTaskInstanceViews always returns the complete requested window (`nextToken: null`). */
 export interface TaskInstanceViewConnection {
   items: TaskInstanceView[];
+  nextToken: string | null;
+}
+
+/** A page of real/materialized TaskInstance rows (never virtual schedule occurrences). */
+export interface TaskInstanceConnection {
+  items: TaskInstance[];
+  nextToken: string | null;
+}
+
+export interface TaskInstanceStepConnection {
+  items: TaskInstanceStep[];
   nextToken: string | null;
 }
 

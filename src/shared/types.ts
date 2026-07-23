@@ -376,7 +376,7 @@ export interface TaskInstanceView {
 
 /**
  * One entry of a batchGetTaskInstances result: the requested instanceId paired with the
- * materialized TaskInstance, or `item: null` when no such instance exists for the caller.
+ * materialized TaskInstance, or `item: null` when no such instance exists for the resolved user.
  * Entries are returned in the same order as the requested ids.
  */
 export interface TaskInstanceLookupResult {
