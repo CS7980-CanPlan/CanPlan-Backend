@@ -523,7 +523,8 @@ export interface UpdateTaskInput {
    * owned, non-deleting Category belonging to the task's owner.
    */
   categoryId?: string;
-  description?: string;
+  /** Omitted or null ⇒ unchanged; otherwise trimmed and stored (including an empty string). */
+  description?: string | null;
   /**
    * Optional new cover image: the pending s3Key from createTaskCoverImageUploadUrl.
    * Supplied ⇒ replace the cover image (old one is cleaned up after the new one is
@@ -898,7 +899,8 @@ export interface QueryContext {
 }
 
 export interface GenerateTaskStepsInput {
-  userId: string;
+  /** @deprecated Ignored. The audit user id is derived from the authenticated caller. */
+  userId?: string;
   query: string;
   context?: QueryContext;
 }

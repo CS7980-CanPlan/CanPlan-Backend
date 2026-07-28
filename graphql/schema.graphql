@@ -549,8 +549,8 @@ input CreateAiTaskInput {
   stepCount: Int
 }
 
-# Partial edit of an existing task. Only fields you include are changed; omitted
-# fields keep their current value. `ownerId` and the task's steps are not editable
+# Partial edit of an existing task. Only non-null fields you include are changed; omitted or
+# explicit-null fields keep their current value. `ownerId` and the task's steps are not editable
 # here (steps have their own createTaskStep). Errors if the task doesn't exist.
 input UpdateTaskInput {
   taskId: ID!
@@ -558,6 +558,8 @@ input UpdateTaskInput {
   # Omitted ⇒ unchanged. A blank string is rejected; a supplied id must be a real, owned,
   # non-deleting Category belonging to the task's owner.
   categoryId: ID
+  # Omitted or explicit null ⇒ unchanged; otherwise trimmed and stored. A whitespace-only
+  # value is stored as an empty string (unlike TaskStep.description, null does not clear it).
   description: String
   # Optional new cover image: the pending s3Key from createTaskCoverImageUploadUrl.
   # Supplied ⇒ replace the cover (old asset/binary cleaned up after the new one is
@@ -845,8 +847,11 @@ input QueryContext {
 }
 
 input GenerateTaskStepsInput {
-  userId: String!
+  # DEPRECATED/IGNORED — the audit user id is derived from the caller's Cognito identity.
+  # Retained as optional input compatibility for older clients.
+  userId: String
   query: String!
+  # Optional client-supplied diagnostic metadata; never used for authorization.
   context: QueryContext
 }
 
@@ -1232,6 +1237,7 @@ type Mutation {
   deleteMediaAsset(input: DeleteMediaAssetInput!): MediaAsset
 
   # Break a daily-living task into ordered, source-cited steps via Bedrock KB + RAG.
+  # Authenticated caller identity is used for audit logging; legacy input.userId is ignored.
   generateTaskSteps(input: GenerateTaskStepsInput!): TaskStepsResponse!
 
   # Generate an AI progress report PREVIEW for a cared-for user over a date range. Computes the
