@@ -21,6 +21,7 @@ jest.mock('../../shared/bedrock', () => ({
 
 const mockKbSend = kb.send as jest.Mock;
 const mockBedrockSend = bedrock.send as jest.Mock;
+let logSpy: jest.SpyInstance;
 
 function retrieveResult() {
   return {
@@ -51,6 +52,7 @@ function converseResult(text: string) {
 const goodSteps = '{"steps":[{"text":"Wet your hands.","citations":["hlbc-85-handwash-steps"]}]}';
 
 beforeEach(() => {
+  logSpy = jest.spyOn(console, 'log').mockImplementation();
   mockKbSend.mockImplementation((command) =>
     Promise.resolve(
       command.constructor.name === 'RerankCommand' ? rerankResult() : retrieveResult(),
@@ -59,10 +61,16 @@ beforeEach(() => {
   mockBedrockSend.mockResolvedValue(converseResult(goodSteps));
 });
 
-afterEach(() => jest.clearAllMocks());
+afterEach(() => {
+  logSpy.mockRestore();
+  jest.clearAllMocks();
+});
 
-function makeEvent(input: Record<string, unknown>) {
-  return { arguments: { input } } as unknown as Parameters<typeof handler>[0];
+function makeEvent(input: Record<string, unknown>, sub: string | null = 'u1') {
+  return {
+    arguments: { input },
+    identity: sub ? { sub } : undefined,
+  } as unknown as Parameters<typeof handler>[0];
 }
 
 describe('generateTaskSteps handler', () => {
@@ -114,8 +122,22 @@ describe('generateTaskSteps handler', () => {
     expect(mockBedrockSend).toHaveBeenCalledTimes(2);
   });
 
-  it('throws ValidationError when userId is missing', async () => {
-    await expect(handler(makeEvent({ query: 'wash my hands' }))).rejects.toThrow('userId');
+  it('derives the audit userId from identity and ignores the legacy client value', async () => {
+    await handler(makeEvent({ userId: 'spoofed-user', query: 'wash my hands' }, 'real-caller'));
+    const log = JSON.parse(logSpy.mock.calls[0][0] as string) as { userId: string };
+    expect(log.userId).toBe('real-caller');
+  });
+
+  it('accepts an omitted legacy userId', async () => {
+    await expect(handler(makeEvent({ query: 'wash my hands' }, 'real-caller'))).resolves.toEqual(
+      expect.objectContaining({ steps: expect.any(Array) }),
+    );
+  });
+
+  it('rejects an unauthenticated caller', async () => {
+    await expect(handler(makeEvent({ query: 'wash my hands' }, null))).rejects.toThrow(
+      'authenticated user is required',
+    );
     expect(mockKbSend).not.toHaveBeenCalled();
   });
 

@@ -412,6 +412,15 @@ describe('tasks handler — updateTask', () => {
     expect(result.title).toBe('New title');
   });
 
+  it('treats an explicit null description as unchanged', async () => {
+    withExisting();
+    const result = (await handler(
+      event('updateTask', { input: { taskId: 't1', description: null } }),
+    )) as Task;
+    expect(putInput().Item.description).toBe('old desc');
+    expect(result.description).toBe('old desc');
+  });
+
   it('lets a delegated SupportPerson edit a primary user’s task (authorized against the task owner)', async () => {
     // Task is owned by primary user "pu-1"; the caller is their SupportPerson.
     const puTask = meta({ ownerId: 'pu-1', title: 'Old', createdAt: 'c', updatedAt: 'c' });

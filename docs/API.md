@@ -1,6 +1,6 @@
 # CanPlan 2.0 — Frontend API Reference
 
-_Last updated: 2026-07-22. Version: SupportPerson delegation (schedules, categories, task templates) + organization management, membership-session-bound SupportLink lifecycle, the PrimaryUser/SupportPerson organization directory, and SupportPerson-only AI progress reports (generate → save → directory/download)._
+_Last updated: 2026-07-28. Version: SupportPerson delegation (schedules, categories, task templates) + organization management, membership-session-bound SupportLink lifecycle, the PrimaryUser/SupportPerson organization directory, and SupportPerson-only AI progress reports (generate → save → directory/download)._
 
 > ## 🚨 Breaking change — categories, default category, Task status, TaskStep keys
 >
@@ -80,8 +80,9 @@ human-readable companion.
 > restores it (see [SupportLink lifecycle](#supportlink-lifecycle--organization-membership-sessions)).
 > With effective delegation, a SupportPerson may use
 > **every assignment / instance operation** for the selected user (`createTaskAssignment`,
-> `startTaskInstance`, `setTaskInstanceStepCompletion`, `updateTaskInstanceStatus`,
-> `cancelTaskInstance`, `endTaskAssignment`, `deleteTaskAssignment`,
+> `startTaskInstance`, `setTaskInstanceStepCompletion`, `startTaskInstanceStep`,
+> `pauseTaskInstanceTimer`, `updateTaskInstanceStatus`, `cancelTaskInstance`,
+> `endTaskAssignment`, `deleteTaskAssignment`,
 > `listTaskAssignmentsForUser`, `getTaskInstanceViews`, `getTaskInstance`, `listTaskInstances`,
 > `batchGetTaskInstances`, `listTaskInstanceSteps`), **manage that user's categories**, and
 > **fully manage that user's own task templates** — create tasks under
@@ -118,11 +119,11 @@ human-readable companion.
 
 ## Identity & the `userId` field
 
-**Invariant: for any operation that takes a `userId`/`ownerId`, the id you pass is either
-your own Cognito `sub` or the id of a user you may act for through effective delegation.** For Task,
-category, scheduling, and media operations this is now **enforced** — passing an id you
-neither own nor hold effective SupportPerson delegation for returns `NOT_AUTHORIZED` (see the
-authorization model above). It is also load-bearing in how data is keyed and read back:
+**Default rule for owner-scoped Task, category, scheduling, and media operations:** a
+`userId`/`ownerId` target is either your own Cognito `sub` or the id of a user you may act for
+through effective delegation. Passing an id you neither own nor hold effective SupportPerson
+delegation for returns `NOT_AUTHORIZED` (see the authorization model above). This rule is also
+load-bearing in how owner-scoped data is keyed and read back:
 
 - A user's profile is stored at the key derived from their Cognito `sub`
   (`USER#<sub>`), and `getUserProfile(userId)` looks it up by **exactly that
@@ -130,21 +131,28 @@ authorization model above). It is also load-bearing in how data is keyed and rea
 - `createUserProfile` ignores any client-supplied id and uses your `sub` from the
   session (see below), so your profile always lands at `USER#<sub>`.
 - The `userId`/`ownerId`-argument operations (`createTaskAssignment`, `startTaskInstance`,
-  `getTaskInstanceViews`, `getTaskInstance`, `listTaskInstances`, `batchGetTaskInstances`,
-  `listTaskInstanceSteps`, and the Task/category/media writes) are
+  `setTaskInstanceStepCompletion`, `startTaskInstanceStep`, `pauseTaskInstanceTimer`,
+  `updateTaskInstanceStatus`, `cancelTaskInstance`, `endTaskAssignment`,
+  `deleteTaskAssignment`, `getTaskInstanceViews`, `getTaskInstance`, `listTaskInstances`,
+  `batchGetTaskInstances`, `listTaskInstanceSteps`, and the Task/category/media writes) are
   authorized against that id: it must be your own, or one you may act for as a delegated
   SupportPerson. A non-self id you have no effective delegation for is rejected — it will
   **not** silently read or write another partition. For the three materialized-instance reads,
   omitted/null `userId` remains shorthand for the authenticated caller.
-- **The exception is `getUserProfile(userId)`**, which is still readable by any
-  authenticated caller (per-relationship gating isn't implemented — see
-  [Not available yet](#not-available-yet)); passing another user's id returns their
-  profile rather than an error.
+- `getUserProfile(userId)` is still readable by any authenticated caller
+  (per-relationship gating isn't implemented — see [Not available yet](#not-available-yet));
+  passing another user's id returns their profile rather than an error.
+- Report operations use a stricter rule: only an effectively delegated SupportPerson may
+  target the primary user; **self-access is rejected**. SystemAdmin operations separately
+  authorize the caller's group and may target arbitrary users.
+- The deprecated optional `generateTaskSteps.input.userId` is ignored. Its audit user id is
+  derived from the caller's JWT; its optional `context` is client-supplied diagnostic metadata
+  and is never authorization input.
 
-**Rule of thumb:** decode the `sub` claim from your Cognito ID token once at sign-in
-and use it as the `userId`/`ownerId` for everything that is "about me." Treat ids
-that come from a list response (e.g. a supporter acting on a primary user) as the
-only legitimate source of _someone else's_ id.
+**Rule of thumb:** decode the `sub` claim from your Cognito ID token once at sign-in and use it
+for self-targeting owner-scoped `userId`/`ownerId` fields. Treat ids that come from a list
+response (e.g. a supporter acting on a primary user) as the only legitimate source of
+_someone else's_ id.
 
 ---
 
@@ -390,10 +398,11 @@ ids don't exist until `createTask` returns.
 **Category behavior.** Every task belongs to a **real** Category. If you omit `categoryId`
 (or send `null`), the task is filed under the owner's **default category** (`No Category`,
 `isDefault: true`). A **blank string** is rejected — omit the field instead. A supplied id
-is validated: it must exist, belong to you, and not be mid-deletion (otherwise `NOT_FOUND`
-/ `VALIDATION`). The write atomically increments the category's task count (conditioned on
-the category existing and not deleting), so a concurrent `deleteCategory` can't slip a task
-onto a category being removed. The returned `Task.categoryId` is always a real category id
+is validated: it must exist, belong to the **target owner**, and not be mid-deletion
+(otherwise `NOT_FOUND` / `VALIDATION`). The write atomically increments the category's task
+count (conditioned on the category existing and not deleting), so a concurrent
+`deleteCategory` can't slip a task onto a category being removed. The returned
+`Task.categoryId` is always a real category id
 (never `null`). Before using the default, the server strongly reads and verifies the profile
 pointer and referenced Category: correct owner, exact `No Category` name, `isDefault: true`,
 and no deletion in progress. A bad legacy row fails with a migration-required validation error.
@@ -764,17 +773,19 @@ categories via the optional `userId` — see below)
 | `updateTaskOrder`     | `input: { userId, tasks: [{ taskId!, order! }] }`                     | `[Task!]!` — atomically reorders **all of a target owner's tasks** in one transaction; omitted/null `userId` ⇒ the caller, a non-self value requires delegated access; see below                                                             |
 | `deleteTask`          | `taskId!`                                                             | `Task` — the deleted template (minus internal fields); cascades to all its steps + media (owner or delegated SupportPerson); see below                                                                                                       |
 
-> **`updateTask` is a partial edit.** Only the fields you include change; omitted
-> fields keep their current value. `ownerId` is immutable and **steps are not edited
+> **`updateTask` is a partial edit.** Only non-null fields you include change; omitted or
+> explicit-null fields keep their current value. `description` is trimmed when supplied,
+> including to an empty string; unlike `TaskStep.description`, `null` does **not** clear it.
+> `ownerId` is immutable and **steps are not edited
 > here** (use `createTaskStep`/`reorderTaskSteps`; per-step content editing is
 > `updateTaskStep`). A missing `taskId` returns a not-found error rather than creating a
 > row. Changing `categoryId` recomputes the internal category key (so the task moves buckets
-> in `listTasksByCategory`). A supplied `categoryId` must be a real category **you own** and
-> not mid-deletion; moving the task decrements the old category's internal task count and
-> increments the new one's **in the same transaction** (so a concurrent `deleteCategory`
-> can't attach the task to a category being removed). A **blank string is rejected** (omit it
-> to leave the category unchanged). `title`, if supplied, must be non-empty. A `Task` has no
-> schedule fields to edit — scheduling lives on `TaskAssignment`.
+> in `listTasksByCategory`). A supplied `categoryId` must be a real category owned by the
+> **task's owner** and not mid-deletion; moving the task decrements the old category's internal
+> task count and increments the new one's **in the same transaction** (so a concurrent
+> `deleteCategory` can't attach the task to a category being removed). A **blank string is
+> rejected** (omit it to leave the category unchanged). `title`, if supplied, must be non-empty.
+> A `Task` has no schedule fields to edit — scheduling lives on `TaskAssignment`.
 >
 > ```graphql
 > mutation UpdateTask($input: UpdateTaskInput!) {
@@ -831,17 +842,18 @@ categories via the optional `userId` — see below)
 > }
 > ```
 
-> **`updateTaskOrder` atomically reorders all of the caller's tasks.** This sets the
+> **`updateTaskOrder` atomically reorders all of a target owner's tasks.** This sets the
 > per-owner `Task.order` across the owner's whole task list (the task-level analogue of
-> `reorderTaskSteps`, which orders steps _within_ one task). The owner is taken from the
-> Cognito identity — there is **no `ownerId` in the input**. Supply the **complete current
-> set** of your tasks as `[{ taskId, order }]` (not a partial patch):
+> `reorderTaskSteps`, which orders steps _within_ one task). Omitted/null `input.userId`
+> selects the caller; a non-self value selects a primary user for whom the caller has effective
+> SupportPerson delegation. There is **no `ownerId` in the input**. Supply the target owner's
+> **complete current task set** as `[{ taskId, order }]` (not a partial patch):
 >
 > - Every `order` must be a **positive integer** and **unique** across the list; values
 >   **need not be contiguous `1..N`** — gaps are allowed (the client decides the spacing).
-> - The list must match your tasks **exactly**: each owned `taskId` appears **once**, with no
->   missing or extra task. A wrong count is a `VALIDATION` error; an unknown/foreign `taskId`
->   is `NOT_FOUND`. The cap is the same 50 tasks per owner.
+> - The list must match the target owner's tasks **exactly**: each owned `taskId` appears
+>   **once**, with no missing or extra task. A wrong count is a `VALIDATION` error; an
+>   unknown/foreign `taskId` is `NOT_FOUND`. The cap is the same 50 tasks per owner.
 >
 > All tasks' `order` attributes are updated in **one DynamoDB transaction** (all-or-nothing);
 > task ids, steps, media, categories, and task assignments/instances are **never** touched. If the
@@ -863,6 +875,7 @@ categories via the optional `userId` — see below)
 > ```json
 > {
 >   "input": {
+>     "userId": "primary-user-sub",
 >     "tasks": [
 >       { "taskId": "task-c", "order": 1 },
 >       { "taskId": "task-a", "order": 2 },
@@ -872,8 +885,9 @@ categories via the optional `userId` — see below)
 > }
 > ```
 
-> **`createTaskStep` appends one step at the end.** The task must exist and be yours, and a
-> task may hold **at most 99 steps**. The new step is created at the server-maintained next
+> **`createTaskStep` appends one step at the end.** The task must exist and be manageable by
+> the caller (owned by the caller or by a primary user under effective delegation), and a task
+> may hold **at most 99 steps**. The new step is created at the server-maintained next
 > append position (monotonic between reorders; 1 for a new task); the `order` you pass **must
 > equal** that position — any other value (including one that duplicates an existing step) is
 > rejected. To insert in the middle or reorder, create at the end and then call
@@ -1059,7 +1073,7 @@ snapshots the task's current steps into `TaskInstanceStep` rows.
 | `getTaskInstance`               | `instanceId!, userId`                                                                                                          | `TaskInstance` · reads one materialized instance. Omitted/null `userId` ⇒ caller's own partition; non-self `userId` requires effective SupportPerson delegation. `null` when it doesn't exist for the resolved user. `status` is derived (`OVERDUE` surfaced). See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `listTaskInstances`             | `userId, startDate!, endDate!, limit, nextToken`                                                                               | `TaskInstanceConnection!` · real/materialized instances in `[startDate, endDate]` (`YYYY-MM-DD`, same **max 370-day** span). Omitted/null `userId` ⇒ caller; non-self requires effective SupportPerson delegation. **Only real rows** — never virtual occurrences. Truly paginated. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `batchGetTaskInstances`         | `instanceIds!, userId`                                                                                                         | `[TaskInstanceLookupResult!]!` · batch-reads up to **100** instances from the resolved user's partition. Omitted/null `userId` ⇒ caller; non-self requires effective SupportPerson delegation. Returns one entry per id **in request order**, with `item: null` for missing ids. `status` derived. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `listTaskInstanceSteps`         | `userId!, instanceId!, limit, nextToken`                                                                                       | `TaskInstanceStepConnection!` · one instance's step snapshots, sorted by `order`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `listTaskInstanceSteps`         | `userId!, instanceId!, limit, nextToken`                                                                                       | `TaskInstanceStepConnection!` · one instance's step snapshots, sorted by ascending `order` with order preserved across pages.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
 > **`getTaskInstanceViews` is the calendar feed.** For `[startDate, endDate]` it (1) queries
 > the user's `TaskAssignment`s, (2) expands **active** assignments' virtual occurrences within
@@ -1474,7 +1488,11 @@ otherwise — invites don't create a profile).
 
 1. If `deleteCognitoUser` and `disableFirst`, `AdminDisableUser` first (so an in-flight
    session can't race the cleanup).
-2. Delete every **owned task** via `taskOwnerIndex` → the shared cascade each.
+2. Find every **owned task** via `taskOwnerIndex`. Before cascading each task, delete every
+   **active** assignment that references it, including assignments stored in another user's
+   partition; this prevents a live schedule from pointing at a deleted template. Ended
+   assignments in other users' partitions remain as historical rows. Then run the shared task
+   cascade.
 3. Delete `USER#<userId>/#PROFILE` and the matching
    `ORG#<organizationId>/MEMBER#<userId>` row, if any, in **one TransactWrite**.
 4. Delete the remaining rows in the **`USER#<userId>` partition** (categories, task
@@ -1625,10 +1643,13 @@ mutation DeleteOrg($input: DeleteOrganizationInput!) {
 ### `generateTaskSteps` — mutation
 
 Breaks a daily-living task into ordered, **source-cited** steps via the Bedrock
-Knowledge Base + RAG. Unchanged from before.
+Knowledge Base + RAG.
 
-**Input — `GenerateTaskStepsInput`**: `userId: String!`, `query: String!`,
-`context: { role, organizationId }`.
+**Input — `GenerateTaskStepsInput`**: `query: String!`, optional deprecated
+`userId: String` (**ignored**), and optional `context: { role, organizationId }`.
+The audit user id is always derived from the authenticated caller's Cognito identity, so a
+client cannot impersonate another user in the structured log. `context` is client-supplied
+diagnostic metadata only and is never used for authorization.
 
 **Returns — `TaskStepsResponse`**: `steps: [GeneratedStep!]!` (each
 `{ text, citations { chunkId, title, url, snippet } }`), plus `model`, `inputTokens`,
@@ -2004,12 +2025,6 @@ Planned but not implemented — don't build against them:
   / `INTERNAL` (see [Error handling](#error-handling)) are the intended contract, but
   resolver errors currently surface as `Lambda:Unhandled` with the cause only in
   `message`. Branch defensively until the codes are wired through.
-- **Delete** exists for categories (`deleteCategory`, non-default only), tasks
-  (`deleteTask`), task steps (`deleteTaskStep`), task assignments (`deleteTaskAssignment`,
-  soft delete), and media assets (`deleteMediaAsset`). **Update** exists for categories
-  (`updateCategory`), tasks (`updateTask`), task steps (`updateTaskStep`), task-step ordering
-  (`reorderTaskSteps`), whole-owner task ordering (`updateTaskOrder`), and task-instance
-  status (`updateTaskInstanceStatus`); other entities have no update yet.
 - **Streaming AI responses** — `generateTaskSteps` is request/response only.
 
 ---

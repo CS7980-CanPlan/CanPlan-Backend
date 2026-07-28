@@ -29,7 +29,13 @@ import {
   taskPk,
   userPk,
 } from '../../shared/keys';
-import { pageArgs, type PageArgs, queryPage } from '../../shared/pagination';
+import {
+  decodeNextToken,
+  encodeNextToken,
+  pageArgs,
+  type PageArgs,
+  queryPage,
+} from '../../shared/pagination';
 import {
   expandOccurrences,
   normalizeSchedule,
@@ -1432,21 +1438,39 @@ async function listTaskInstanceSteps(
   if (!instanceId?.trim()) throw new ValidationError('instanceId is required');
   await assertCanActForUser(identity, userId.trim());
 
-  const result = await queryPage<TaskInstanceStep>(
-    {
-      TableName: TABLE_NAME,
-      KeyConditionExpression: 'PK = :pk AND begins_with(SK, :prefix)',
-      ExpressionAttributeValues: {
-        ':pk': userPk(userId.trim()),
-        ':prefix': taskInstanceStepPrefix(instanceId.trim()),
-      },
-    },
-    page,
-  );
-  result.items = result.items
-    .map((s) => presentStep(s as unknown as Record<string, unknown>))
-    .sort((a, b) => a.order - b.order);
-  return result;
+  // Step snapshot keys end in the stable stepId rather than their display order. Read the
+  // bounded set (at most 99), sort it globally, then apply an offset cursor so order is
+  // preserved across pages rather than merely within each DynamoDB key-ordered page.
+  const all = (
+    await queryAllItems<TaskInstanceStep>(
+      userPk(userId.trim()),
+      taskInstanceStepPrefix(instanceId.trim()),
+    )
+  )
+    .map((step) => presentStep(step as unknown as Record<string, unknown>))
+    .sort(
+      (a, b) =>
+        a.order - b.order ||
+        (a.stepId < b.stepId ? -1 : a.stepId > b.stepId ? 1 : 0),
+    );
+
+  const decoded = decodeNextToken(page.nextToken);
+  const offset = decoded ? (decoded as { offset?: unknown }).offset : 0;
+  if (
+    typeof offset !== 'number' ||
+    !Number.isInteger(offset) ||
+    offset < 0 ||
+    offset > all.length
+  ) {
+    throw new ValidationError('invalid nextToken');
+  }
+  const limit = typeof page.limit === 'number' && page.limit > 0 ? page.limit : all.length;
+  const items = all.slice(offset, offset + limit);
+  const nextOffset = offset + items.length;
+  return {
+    items,
+    nextToken: nextOffset < all.length ? encodeNextToken({ offset: nextOffset }) : null,
+  };
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────--

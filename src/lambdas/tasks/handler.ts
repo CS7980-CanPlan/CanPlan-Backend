@@ -507,7 +507,8 @@ async function createTaskStep(
     throw new ValidationError('createTaskStep media entries require a non-null assetId');
   }
 
-  // The task must exist and belong to the caller before we add a step (no orphan steps).
+  // The task must exist and be manageable by the caller (owner or delegated SupportPerson)
+  // before we add a step, so no orphan or unauthorized step can be created.
   const task = await loadManageableTask(identity, taskId);
 
   // Step metadata is required (createTask sets it; the migration backfills legacy rows).

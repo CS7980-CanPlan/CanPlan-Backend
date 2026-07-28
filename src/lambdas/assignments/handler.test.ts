@@ -1492,16 +1492,61 @@ describe('legacy rows missing activeDurationSeconds default to 0', () => {
   });
 
   it('listTaskInstanceSteps returns activeDurationSeconds: 0 for legacy step snapshots', async () => {
-    mockSend.mockImplementation((command: { constructor: { name: string }; input: Rec }) => {
-      if (command.constructor.name === 'QueryCommand') {
-        return Promise.resolve({ Items: [{ stepId: 's1', order: 1, text: 'x', completed: false }] });
-      }
-      return Promise.resolve({});
-    });
+    mockQueryAllItems.mockResolvedValue([
+      { stepId: 's1', order: 1, text: 'x', completed: false },
+    ]);
     const result = (await handler(
       event('listTaskInstanceSteps', { userId: 'u1', instanceId: 'a1#2099-07-02#09:00' }),
     )) as Connection<TaskInstanceStep>;
     expect(result.items[0].activeDurationSeconds).toBe(0);
+  });
+});
+
+describe('listTaskInstanceSteps ordering and pagination', () => {
+  const instanceId = 'a1#2099-07-02#09:00';
+  const snapshots = [
+    { instanceId, stepId: 'step-c', order: 3, text: 'third', completed: false },
+    { instanceId, stepId: 'step-a', order: 1, text: 'first', completed: false },
+    { instanceId, stepId: 'step-b', order: 2, text: 'second', completed: false },
+  ];
+
+  it('sorts the complete bounded snapshot set before applying the page cursor', async () => {
+    mockQueryAllItems.mockResolvedValue(snapshots);
+
+    const first = (await handler(
+      event('listTaskInstanceSteps', { userId: 'u1', instanceId, limit: 2 }, 'u1'),
+    )) as Connection<TaskInstanceStep>;
+    expect(first.items.map((step) => step.order)).toEqual([1, 2]);
+    expect(first.nextToken).not.toBeNull();
+
+    const second = (await handler(
+      event(
+        'listTaskInstanceSteps',
+        { userId: 'u1', instanceId, limit: 2, nextToken: first.nextToken },
+        'u1',
+      ),
+    )) as Connection<TaskInstanceStep>;
+    expect(second.items.map((step) => step.order)).toEqual([3]);
+    expect(second.nextToken).toBeNull();
+    expect(mockQueryAllItems).toHaveBeenCalledWith(
+      'USER#u1',
+      `TASK_INSTANCE_STEP#${instanceId}#STEP#`,
+    );
+  });
+
+  it('rejects a cursor that is not an integer offset into the sorted set', async () => {
+    mockQueryAllItems.mockResolvedValue(snapshots);
+    const invalidToken = Buffer.from(JSON.stringify({ offset: '1' }), 'utf8').toString('base64');
+
+    await expect(
+      handler(
+        event(
+          'listTaskInstanceSteps',
+          { userId: 'u1', instanceId, nextToken: invalidToken },
+          'u1',
+        ),
+      ),
+    ).rejects.toThrow('invalid nextToken');
   });
 });
 
